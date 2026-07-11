@@ -1,0 +1,16 @@
+schema_version = 1
+rcon_poll_interval_seconds = 60
+rcon_idle_timeout_seconds = 600
+rcon_startup_timeout_seconds = 600
+rcon_retry_interval_seconds = 2
+rcon_command_timeout_seconds = 10
+shutdown_timeout_seconds = 30
+handshake_timeout_seconds = 5
+proxy_connect_timeout_seconds = 10
+max_connections = 512
+motd_text = "Napping... Join to start server"
+motd_color = "aqua"
+motd_bold = true
+connection_msg_text = "Server is starting. Please wait a moment, then reconnect."
+connection_msg_color = "light_purple"
+connection_msg_bold = true
