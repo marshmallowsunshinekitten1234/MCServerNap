@@ -1,485 +1,451 @@
-use anyhow::Result;
-use clap::{Parser, Subcommand};
-use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand};
+use mcservernap::config::{self, Config};
+use mcservernap::minecraft::{ClientRequest, MinecraftResponder};
+use mcservernap::rcon::RconClient;
+use mcservernap::supervisor::{self, ServerPhase, SupervisorCommand, SupervisorConfig};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
-use tokio::time::Duration;
+use tokio::sync::{Semaphore, TryAcquireError, mpsc, watch};
+use tokio::task::JoinSet;
+use tokio::time::{Instant, sleep, sleep_until, timeout};
 
-// Import core functions from the library crate
-use mcservernap::config;
-use mcservernap::{
-    ServerState, idle_watchdog_rcon, kill_server_process, launch_server,
-    preserialized_packets::PreserializedPackets, send_stop_command, verify_handshake_packet,
-};
-
-/// "Serverless" Minecraft Server Watcher
 #[derive(Parser)]
-#[command(name = "mcservernap")]
+#[command(
+    name = "mcservernap",
+    version,
+    about = "Wake a Minecraft Java server on demand and stop it when idle"
+)]
 struct Cli {
+    /// Configuration file used by the listener.
+    #[arg(
+        long,
+        global = true,
+        default_value = "config/cfg.toml",
+        env = "MCSERVERNAP_CONFIG"
+    )]
+    config: PathBuf,
+
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Listen on port and start server on first actual join
+    /// Listen for Minecraft clients and manage the backend server.
     Listen {
-        /// Host/IP to bind
+        /// Host or IP on which the public Minecraft proxy listens.
         host: String,
-        /// Port to listen on
+        /// Public Minecraft proxy port.
         port: u16,
-        /// Command to launch (e.g. 'java' or path to start script)
-        cmd: String,
-        /// Arguments for the command (pass all Java/batch args here)
-        #[arg(num_args(0..))]
-        args: Vec<String>,
-        /// Minecraft server port (use --server-port)
+        /// Command or script used to launch the Minecraft server.
+        command: String,
+        /// Host or IP of the actual Minecraft server.
+        #[arg(long, default_value = "127.0.0.1")]
+        server_host: String,
+        /// Port of the actual Minecraft server.
         #[arg(long)]
         server_port: u16,
-        /// RCON port (use --rcon-port)
+        /// Host or IP of the Minecraft RCON endpoint.
+        #[arg(long, default_value = "127.0.0.1")]
+        rcon_host: String,
+        /// Minecraft RCON port.
         #[arg(long)]
         rcon_port: u16,
-        /// RCON password (use --rcon-pass)
-        #[arg(long)]
+        /// Minecraft RCON password. Prefer the `MCSERVERNAP_RCON_PASSWORD` environment variable.
+        #[arg(long, env = "MCSERVERNAP_RCON_PASSWORD", hide_env_values = true)]
         rcon_pass: String,
+        /// Arguments passed verbatim to the server command, after `--`.
+        #[arg(last = true, allow_hyphen_values = true)]
+        arguments: Vec<String>,
     },
-    /// Immediately stop the Minecraft server via RCON
+    /// Send `stop` to an already-running Minecraft server via RCON.
     Stop {
-        /// RCON port
+        /// Host or IP of the Minecraft RCON endpoint.
+        #[arg(long, default_value = "127.0.0.1")]
+        rcon_host: String,
+        /// Minecraft RCON port.
         #[arg(long)]
         rcon_port: u16,
-        /// RCON password
-        #[arg(long)]
+        /// Minecraft RCON password. Prefer the `MCSERVERNAP_RCON_PASSWORD` environment variable.
+        #[arg(long, env = "MCSERVERNAP_RCON_PASSWORD", hide_env_values = true)]
         rcon_pass: String,
     },
 }
 
+struct ListenOptions {
+    bind_host: String,
+    bind_port: u16,
+    server_host: String,
+    server_port: u16,
+    rcon_address: String,
+    rcon_password: String,
+    command: String,
+    arguments: Vec<String>,
+    config_path: PathBuf,
+}
+
+#[derive(Clone)]
+struct ClientContext {
+    phase: watch::Receiver<ServerPhase>,
+    commands: mpsc::Sender<SupervisorCommand>,
+    responder: Arc<MinecraftResponder>,
+    server_host: Arc<str>,
+    server_port: u16,
+    handshake_timeout: Duration,
+    proxy_connect_timeout: Duration,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialise logger
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Debug) // !!! CHANGE THIS BACK TO INFO BEFORE RELEASE !!!
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
         .init();
 
     let cli = Cli::parse();
-
     match cli.command {
         Commands::Listen {
             host,
             port,
-            cmd,
-            args,
+            command,
+            server_host,
             server_port,
+            rcon_host,
             rcon_port,
             rcon_pass,
+            arguments,
         } => {
-            let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
-            let rcon_addr = Arc::new(format!("127.0.0.1:{}", rcon_port));
-            let rcon_pass = Arc::new(rcon_pass);
+            run_listener(ListenOptions {
+                bind_host: host,
+                bind_port: port,
+                server_host,
+                server_port,
+                rcon_address: socket_address(&rcon_host, rcon_port),
+                rcon_password: rcon_pass,
+                command,
+                arguments,
+                config_path: cli.config,
+            })
+            .await
+        }
+        Commands::Stop {
+            rcon_host,
+            rcon_port,
+            rcon_pass,
+        } => stop_via_rcon(&socket_address(&rcon_host, rcon_port), &rcon_pass).await,
+    }
+}
 
-            let server_state = Arc::new(Mutex::new(ServerState::Stopped));
-            let app_config: config::Config = config::get_config();
-            let preserialized_packets = PreserializedPackets::new(&app_config);
-            let listener = TcpListener::bind(addr).await?;
+async fn run_listener(options: ListenOptions) -> Result<()> {
+    let loaded = config::load_or_create(&options.config_path)?;
+    let settings = loaded.settings;
+    let responder = Arc::new(MinecraftResponder::new(
+        &settings,
+        loaded.server_icon.as_deref(),
+    )?);
+    let listener = TcpListener::bind((options.bind_host.as_str(), options.bind_port))
+        .await
+        .with_context(|| {
+            format!(
+                "failed to listen on {}:{}",
+                options.bind_host, options.bind_port
+            )
+        })?;
+    log::info!(
+        "Listening for Minecraft clients on {}:{}",
+        options.bind_host,
+        options.bind_port
+    );
 
-            log::info!("Listening for login on {}", addr);
+    let (command_sender, command_receiver) = mpsc::channel(16);
+    let (phase_sender, phase_receiver) = watch::channel(ServerPhase::Stopped);
+    let supervisor_config = supervisor_config(&options, &settings);
+    let mut supervisor = tokio::spawn(supervisor::run(
+        command_receiver,
+        phase_sender,
+        supervisor_config,
+    ));
 
-            // Clone handles for shutdown handler
-            let rcon_addr_shutdown = rcon_addr.clone();
-            let rcon_pass_shutdown = rcon_pass.clone();
-            let server_state_shutdown = server_state.clone();
+    let connection_limit = Arc::new(Semaphore::new(settings.max_connections));
+    let client_context = ClientContext {
+        phase: phase_receiver,
+        commands: command_sender.clone(),
+        responder,
+        server_host: Arc::from(options.server_host.as_str()),
+        server_port: options.server_port,
+        handshake_timeout: Duration::from_secs(settings.handshake_timeout_seconds),
+        proxy_connect_timeout: Duration::from_secs(settings.proxy_connect_timeout_seconds),
+    };
+    let mut connections = JoinSet::new();
+    let shutdown_signal = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown_signal);
 
-            tokio::select! {
-                _ = main_loop(
-                    listener,
-                    cmd,
-                    args,
-                    server_port,
-                    rcon_addr,
-                    rcon_pass,
-                    server_state,
-                    app_config,
-                    preserialized_packets
-                ) => {},
-                _ = tokio::signal::ctrl_c() => {
-                    log::info!("Shutdown signal received (Ctrl+C)");
-
-                    // Check if server is running and send stop command
-                    let mut state_guard = match tokio::time::timeout(Duration::from_secs(5), server_state_shutdown.lock()).await {
-                        Ok(guard) => guard,
-                        Err(_) => {
-                            log::error!("Deadlock detected! Failed to acquire state lock");
-                            // Panicking here since we can't safely proceed
-                            panic!("State lock timeout - possible deadlock");
-                        }
-                    };
-
-                    // Extract child process and kill based on state
-                    match std::mem::replace(&mut *state_guard, ServerState::Stopped) {
-                        ServerState::Starting { child } => {
-                            log::info!("Killing starting server...");
-
-                            kill_server_process(child).await;
-                        }
-                        ServerState::Running { mut child, rcon_watchdog_handle } => {
-                            log::info!("Stopping running server...");
-                            drop(state_guard); // Release lock for RCON call
-
-                            if let Err(e) = send_stop_command(&rcon_addr_shutdown, &rcon_pass_shutdown).await {
-                                log::warn!("RCON stop failed: {}, force killing", e);
-                                kill_server_process(child).await;
-                            } else {
-                                // Wait for graceful shutdown
-                                match tokio::time::timeout(Duration::from_secs(30), child.wait()).await {
-                                    Ok(Ok(_)) => log::info!("Server stopped gracefully"),
-                                    Ok(Err(e)) => log::error!("Wait error: {}", e),
-                                    Err(_) => {
-                                        log::warn!("Graceful stop timeout, force killing");
-                                        let _ = child.kill().await;
-                                    }
-                                }
-                            }
-
-                            // Stop watchdog
-                            rcon_watchdog_handle.abort();
-                        }
-                        ServerState::Stopped => {
-                            log::debug!("CtrlC: Server already stopped");
-                        }
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (socket, peer) = match accepted {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        log::warn!("Failed to accept a client connection: {error}");
+                        sleep(Duration::from_millis(100)).await;
+                        continue;
                     }
+                };
+
+                let permit = match Arc::clone(&connection_limit).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(TryAcquireError::NoPermits) => {
+                        log::warn!("Dropping connection from {peer}: connection limit reached");
+                        continue;
+                    }
+                    Err(TryAcquireError::Closed) => bail!("connection limiter unexpectedly closed"),
+                };
+
+                let context = client_context.clone();
+                connections.spawn(async move {
+                    let _permit = permit;
+                    if let Err(error) = handle_client(socket, peer, context).await {
+                        log::debug!("Connection from {peer} ended: {error:#}");
+                    }
+                });
+            }
+            signal = &mut shutdown_signal => {
+                signal.context("failed to listen for Ctrl+C")?;
+                log::info!("Shutdown signal received");
+                let _ = command_sender.send(SupervisorCommand::Shutdown).await;
+                break;
+            }
+            result = &mut supervisor => {
+                result.context("server supervisor task failed")??;
+                bail!("server supervisor stopped unexpectedly");
+            }
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    log::warn!("Client task failed: {error}");
                 }
             }
         }
-        Commands::Stop {
-            rcon_port,
-            rcon_pass,
-        } => {
-            let rcon_addr = format!("127.0.0.1:{}", rcon_port);
-            send_stop_command(&rcon_addr, &rcon_pass).await?;
+    }
+
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
+
+    await_supervisor_shutdown(&mut supervisor, settings.shutdown_timeout_seconds).await
+}
+
+async fn await_supervisor_shutdown(
+    supervisor: &mut tokio::task::JoinHandle<Result<()>>,
+    shutdown_timeout_seconds: u64,
+) -> Result<()> {
+    let wait_limit = Duration::from_secs(shutdown_timeout_seconds) + Duration::from_secs(10);
+    if let Ok(result) = timeout(wait_limit, &mut *supervisor).await {
+        result.context("server supervisor task failed")??;
+        return Ok(());
+    }
+
+    supervisor.abort();
+    bail!("server supervisor did not stop within {wait_limit:?}")
+}
+
+async fn handle_client(
+    mut socket: TcpStream,
+    peer: std::net::SocketAddr,
+    context: ClientContext,
+) -> Result<()> {
+    socket
+        .set_nodelay(true)
+        .context("failed to enable TCP_NODELAY for client")?;
+    let current_phase = *context.phase.borrow();
+
+    if current_phase == ServerPhase::Running {
+        return proxy_connection(
+            socket,
+            peer,
+            &context.server_host,
+            context.server_port,
+            context.proxy_connect_timeout,
+        )
+        .await;
+    }
+
+    let operation_timeout = context.handshake_timeout;
+    let request = timeout(
+        operation_timeout,
+        mcservernap::minecraft::read_client_request(&mut socket),
+    )
+    .await
+    .context("initial Minecraft exchange timed out")??;
+
+    match request {
+        ClientRequest::Status => {
+            context
+                .responder
+                .serve_status(&mut socket, operation_timeout)
+                .await?;
+        }
+        ClientRequest::UnsupportedProtocol { protocol_version } => {
+            log::info!("Rejected login from {peer}: protocol {protocol_version} is not supported");
+            context
+                .responder
+                .send_incompatible_disconnect(&mut socket, operation_timeout)
+                .await?;
+        }
+        ClientRequest::Login { intent } => {
+            log::info!("Minecraft {intent:?} request from {peer}");
+            if matches!(current_phase, ServerPhase::Stopped | ServerPhase::Stopping) {
+                match context.commands.try_send(SupervisorCommand::Start) {
+                    Ok(()) => log::info!("Queued server wake-up request from {peer}"),
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        log::debug!("Wake-up request already queued");
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        bail!("server supervisor command channel is closed");
+                    }
+                }
+            }
+            context
+                .responder
+                .send_login_disconnect(&mut socket, operation_timeout)
+                .await?;
         }
     }
 
     Ok(())
 }
 
-async fn main_loop(
-    listener: TcpListener,
-    cmd: String,
-    args: Vec<String>,
+async fn proxy_connection(
+    mut client: TcpStream,
+    peer: std::net::SocketAddr,
+    server_host: &str,
     server_port: u16,
-    rcon_addr: Arc<String>,
-    rcon_pass: Arc<String>,
-    server_state: Arc<Mutex<ServerState>>,
-    app_config: config::Config,
-    preserialized_packets: PreserializedPackets,
+    connect_timeout: Duration,
 ) -> Result<()> {
-    let arg_slices: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut backend = connect_backend(server_host, server_port, connect_timeout).await?;
+    backend
+        .set_nodelay(true)
+        .context("failed to enable TCP_NODELAY for backend")?;
+    log::debug!("Proxying {peer} to {server_host}:{server_port}");
+
+    let (client_to_server, server_to_client) =
+        tokio::io::copy_bidirectional(&mut client, &mut backend)
+            .await
+            .with_context(|| format!("proxy I/O failed for {peer}"))?;
+    log::debug!(
+        "Proxy for {peer} closed ({client_to_server} bytes upstream, {server_to_client} downstream)"
+    );
+    Ok(())
+}
+
+async fn connect_backend(host: &str, port: u16, connect_timeout: Duration) -> Result<TcpStream> {
+    let deadline = Instant::now() + connect_timeout;
+    let mut last_error = None;
 
     loop {
-        log::info!("Listening...");
-
-        match listener.accept().await {
-            Ok((mut client_socket, peer)) => {
-                client_socket.set_nodelay(true)?;
-                log::info!("Incoming TCP connection from {}", peer);
-
-                let client_handled = {
-                    // Scoped to hold the Mutex lock only while checking and possibly updating state
-
-                    let mut state_guard =
-                        match tokio::time::timeout(Duration::from_secs(5), server_state.lock())
-                            .await
-                        {
-                            Ok(guard) => guard,
-                            Err(_) => {
-                                log::error!("Deadlock detected! Failed to acquire state lock");
-                                panic!("State lock timeout - possible deadlock");
-                            }
-                        };
-
-                    match *state_guard {
-                        ServerState::Stopped => {
-                            // Start the server and RCON watchdog
-                            match verify_handshake_packet(
-                                &mut client_socket,
-                                peer,
-                                &preserialized_packets,
-                            )
-                            .await
-                            {
-                                Ok(true) => {
-                                    if let Err(e) = mcservernap::send_starting_message(
-                                        client_socket,
-                                        &preserialized_packets,
-                                    )
-                                    .await
-                                    {
-                                        log::warn!("Failed to notify {}: {}", peer, e);
-                                    }
-
-                                    let child = launch_server(&cmd, &arg_slices)?;
-
-                                    // Transition to starting state
-                                    match state_guard.switch_to(ServerState::Starting { child }) {
-                                        Ok(_) => (),
-                                        Err(e) => log::error!("{}", e),
-                                    }
-
-                                    let (ready_tx, ready_rx) =
-                                        tokio::sync::oneshot::channel::<()>();
-                                    let rcon_addr_clone = rcon_addr.clone();
-                                    let rcon_pass_clone = rcon_pass.clone();
-                                    let server_state_for_rcon_watchdog = server_state.clone();
-                                    let rcon_watchdog_handle = tokio::spawn(async move {
-                                        match idle_watchdog_rcon(
-                                            &rcon_addr_clone,
-                                            &rcon_pass_clone,
-                                            Duration::from_secs(app_config.rcon_poll_interval), // check interval
-                                            Duration::from_secs(app_config.rcon_idle_timeout), // idle timeout
-                                            ready_tx,
-                                        )
-                                        .await
-                                        .inspect_err(|e| log::error!("Idle watchdog error: {}", e))
-                                        {
-                                            Ok(()) | Err(_) => {
-                                                // Exclusively scoping all Mutex locks, even if it's not strictly necessary
-                                                let mut state = match tokio::time::timeout(
-                                                    Duration::from_secs(5),
-                                                    server_state_for_rcon_watchdog.lock(),
-                                                )
-                                                .await
-                                                {
-                                                    Ok(guard) => guard,
-                                                    Err(_) => {
-                                                        log::error!(
-                                                            "Deadlock detected! Failed to acquire state lock"
-                                                        );
-                                                        panic!(
-                                                            "State lock timeout - possible deadlock"
-                                                        );
-                                                    }
-                                                };
-                                                match std::mem::replace(
-                                                    &mut *state,
-                                                    ServerState::Stopped,
-                                                ) {
-                                                    ServerState::Running {
-                                                        mut child,
-                                                        rcon_watchdog_handle: _,
-                                                    } => {
-                                                        // Kill server process if it can't stop gracefully
-                                                        match tokio::time::timeout(
-                                                            Duration::from_secs(30),
-                                                            child.wait(),
-                                                        )
-                                                        .await
-                                                        {
-                                                            Ok(Ok(status)) => log::info!(
-                                                                "Server exited: {:?}",
-                                                                status
-                                                            ),
-                                                            _ => kill_server_process(child).await,
-                                                        }
-                                                    }
-                                                    // If the state was still "Starting", it means the RCON watchdog failed
-                                                    ServerState::Starting { child } => {
-                                                        log::warn!(
-                                                            "RCON Watchdog failed during startup. Killing server process."
-                                                        );
-                                                        kill_server_process(child).await;
-                                                    }
-                                                    _ => {}
-                                                }
-                                            }
-                                        }
-                                    });
-
-                                    let server_state_for_rcon_signal = server_state.clone();
-                                    tokio::spawn(async move {
-                                        match ready_rx.await {
-                                            Ok(_) => {
-                                                let mut state = match tokio::time::timeout(
-                                                    Duration::from_secs(5),
-                                                    server_state_for_rcon_signal.lock(),
-                                                )
-                                                .await
-                                                {
-                                                    Ok(guard) => guard,
-                                                    Err(_) => {
-                                                        log::error!(
-                                                            "Deadlock detected! Failed to acquire state lock"
-                                                        );
-                                                        panic!(
-                                                            "State lock timeout - possible deadlock"
-                                                        );
-                                                    }
-                                                };
-
-                                                *state = match std::mem::replace(
-                                                    &mut *state,
-                                                    ServerState::Stopped,
-                                                ) {
-                                                    ServerState::Starting { child } => {
-                                                        ServerState::Running {
-                                                            child,
-                                                            rcon_watchdog_handle,
-                                                        }
-                                                    }
-                                                    _ => {
-                                                        log::error!(
-                                                            "Expected to be in Starting state! Switching to Stopped."
-                                                        );
-                                                        ServerState::Stopped
-                                                    }
-                                                };
-                                            }
-                                            Err(e) => {
-                                                log::warn!(
-                                                    "Failed to receive RCON ready signal: {:?}",
-                                                    e
-                                                );
-
-                                                let mut state = match tokio::time::timeout(
-                                                    Duration::from_secs(5),
-                                                    server_state_for_rcon_signal.lock(),
-                                                )
-                                                .await
-                                                {
-                                                    Ok(guard) => guard,
-                                                    Err(_) => {
-                                                        log::error!(
-                                                            "Deadlock detected! Failed to acquire state lock"
-                                                        );
-                                                        panic!(
-                                                            "State lock timeout - possible deadlock"
-                                                        );
-                                                    }
-                                                };
-
-                                                match std::mem::replace(
-                                                    &mut *state,
-                                                    ServerState::Stopped,
-                                                ) {
-                                                    ServerState::Running {
-                                                        child,
-                                                        rcon_watchdog_handle: _,
-                                                    }
-                                                    | ServerState::Starting { child } => {
-                                                        kill_server_process(child).await
-                                                    }
-                                                    _ => {}
-                                                }
-                                            }
-                                        }
-                                    });
-
-                                    true
-                                }
-                                Ok(false) => false, // Not a login handshake, ignore
-                                Err(_) => false,    // Wait for next connection
-                            }
-                        }
-                        ServerState::Starting { .. } => {
-                            // Keep notifying the player client that the server is starting
-                            match verify_handshake_packet(
-                                &mut client_socket,
-                                peer,
-                                &preserialized_packets,
-                            )
-                            .await
-                            {
-                                Ok(true) => {
-                                    if let Err(e) = mcservernap::send_starting_message(
-                                        client_socket,
-                                        &preserialized_packets,
-                                    )
-                                    .await
-                                    {
-                                        log::warn!(
-                                            "Failed to notify {} while starting server: {}",
-                                            peer,
-                                            e
-                                        );
-                                    }
-
-                                    true
-                                }
-                                Ok(false) => false,
-                                Err(_) => false,
-                            }
-                        }
-                        ServerState::Running { .. } => {
-                            // Server is running: proxy connection to actual Minecraft server
-                            log::info!("Proxying connection for {}", peer);
-                            tokio::spawn(async move {
-                                let server_addr = format!("127.0.0.1:{}", server_port);
-                                match TcpStream::connect(server_addr).await {
-                                    Ok(mut server_socket) => {
-                                        server_socket.set_nodelay(true).unwrap();
-                                        match tokio::io::copy_bidirectional(
-                                            &mut client_socket,
-                                            &mut server_socket,
-                                        )
-                                        .await
-                                        {
-                                            Ok((read, written)) => {
-                                                log::debug!(
-                                                    "Proxy successful for {}: read {} bytes, wrote {}",
-                                                    peer,
-                                                    read,
-                                                    written
-                                                );
-                                            }
-                                            Err(e) => {
-                                                log::error!("Proxy error for {}: {:?}", peer, e);
-                                            }
-                                        }
-
-                                        // Attempt graceful shutdown of sockets
-                                        if let Err(e) = client_socket.shutdown().await {
-                                            log::warn!(
-                                                "Failed to shutdown client socket for {}: {:?}",
-                                                peer,
-                                                e
-                                            );
-                                        }
-                                        if let Err(e) = server_socket.shutdown().await {
-                                            log::warn!(
-                                                "Failed to shutdown server socket for {}: {:?}",
-                                                peer,
-                                                e
-                                            );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        log::error!(
-                                            "Failed to connect to Minecraft server for {}: {:?}",
-                                            peer,
-                                            e
-                                        );
-                                    }
-                                }
-                            });
-                            true
-                        }
-                    }
-                };
-
-                if !client_handled {
-                    // Connection ignored, just drop socket and continue accepting
-                    log::debug!(
-                        "Connection from {} ignored (not login handshake or not handled)",
-                        peer
-                    );
-                }
-            }
-            Err(e) => {
-                log::error!("Failed to accept connection: {:?}", e);
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
         }
+        let attempt_timeout = remaining.min(Duration::from_secs(1));
+        match timeout(attempt_timeout, TcpStream::connect((host, port))).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(error)) => last_error = Some(error.to_string()),
+            Err(_) => last_error = Some("connection attempt timed out".to_owned()),
+        }
+        let retry_at = (Instant::now() + Duration::from_millis(100)).min(deadline);
+        sleep_until(retry_at).await;
+    }
+
+    let detail = last_error.unwrap_or_else(|| "timeout elapsed".to_owned());
+    bail!("could not connect to Minecraft backend {host}:{port}: {detail}")
+}
+
+async fn stop_via_rcon(address: &str, password: &str) -> Result<()> {
+    let mut client = timeout(
+        Duration::from_secs(10),
+        RconClient::connect(address, password),
+    )
+    .await
+    .context("RCON connection timed out")??;
+    timeout(Duration::from_secs(5), client.stop())
+        .await
+        .context("RCON stop command timed out")??;
+    log::info!("Sent stop command to RCON at {address}");
+    Ok(())
+}
+
+fn supervisor_config(options: &ListenOptions, settings: &Config) -> SupervisorConfig {
+    SupervisorConfig {
+        command: options.command.clone(),
+        arguments: options.arguments.clone(),
+        rcon_address: options.rcon_address.clone(),
+        rcon_password: options.rcon_password.clone(),
+        poll_interval: Duration::from_secs(settings.rcon_poll_interval_seconds),
+        idle_timeout: Duration::from_secs(settings.rcon_idle_timeout_seconds),
+        startup_timeout: Duration::from_secs(settings.rcon_startup_timeout_seconds),
+        retry_interval: Duration::from_secs(settings.rcon_retry_interval_seconds),
+        command_timeout: Duration::from_secs(settings.rcon_command_timeout_seconds),
+        shutdown_timeout: Duration::from_secs(settings.shutdown_timeout_seconds),
+    }
+}
+
+fn socket_address(host: &str, port: u16) -> String {
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_ipv4_hostnames_and_ipv6_addresses() {
+        assert_eq!(socket_address("127.0.0.1", 25575), "127.0.0.1:25575");
+        assert_eq!(socket_address("localhost", 25575), "localhost:25575");
+        assert_eq!(socket_address("::1", 25575), "[::1]:25575");
+        assert_eq!(socket_address("[::1]", 25575), "[::1]:25575");
+    }
+
+    #[test]
+    fn parses_documented_listener_invocation() {
+        let cli = Cli::try_parse_from([
+            "mcservernap",
+            "listen",
+            "0.0.0.0",
+            "25565",
+            "--server-port",
+            "25566",
+            "--rcon-port",
+            "25575",
+            "--rcon-pass",
+            "secret",
+            "java",
+            "--",
+            "-Xmx5G",
+            "-jar",
+            "server.jar",
+            "nogui",
+        ])
+        .expect("documented command should parse");
+
+        let Commands::Listen {
+            host,
+            port,
+            command,
+            arguments,
+            ..
+        } = cli.command
+        else {
+            panic!("expected listen command");
+        };
+        assert_eq!(host, "0.0.0.0");
+        assert_eq!(port, 25565);
+        assert_eq!(command, "java");
+        assert_eq!(arguments, ["-Xmx5G", "-jar", "server.jar", "nogui"]);
     }
 }
