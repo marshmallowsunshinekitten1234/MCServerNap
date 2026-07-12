@@ -4,14 +4,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, TryAcquireError, mpsc, watch};
+use tokio::sync::{Semaphore, TryAcquireError, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, sleep, sleep_until, timeout};
 
 use crate::minecraft::{ClientRequest, MinecraftResponder};
-use crate::supervisor::{self, ServerPhase, SupervisorCommand, SupervisorConfig};
+use crate::supervisor::{self, LifecycleState, ServerPhase, SupervisorConfig, WakeRequest};
 
-const SUPERVISOR_COMMAND_CAPACITY: usize = 16;
+const PENDING_WAKE_CAPACITY: usize = 1;
 const SUPERVISOR_SHUTDOWN_MARGIN: Duration = Duration::from_secs(10);
 
 pub struct ServerRuntimeConfig {
@@ -31,13 +31,14 @@ pub struct ServerRuntime {
     connection_limit: Arc<Semaphore>,
     connections: JoinSet<()>,
     supervisor: JoinHandle<Result<()>>,
+    supervisor_shutdown: oneshot::Sender<()>,
     supervisor_wait_limit: Duration,
 }
 
 #[derive(Clone)]
 struct ClientContext {
-    phase: watch::Receiver<ServerPhase>,
-    commands: mpsc::Sender<SupervisorCommand>,
+    lifecycle: watch::Receiver<LifecycleState>,
+    wake_requests: mpsc::Sender<WakeRequest>,
     responder: Arc<MinecraftResponder>,
     server_host: Arc<str>,
     server_port: u16,
@@ -67,17 +68,19 @@ impl ServerRuntime {
             .with_context(|| format!("failed to listen on {bind_host}:{bind_port}"))?;
         log::info!("Listening for Minecraft clients on {bind_host}:{bind_port}");
 
-        let (commands, command_receiver) = mpsc::channel(SUPERVISOR_COMMAND_CAPACITY);
-        let (phase_sender, phase) = watch::channel(ServerPhase::Stopped);
+        let (wake_requests, wake_receiver) = mpsc::channel(PENDING_WAKE_CAPACITY);
+        let (supervisor_shutdown, shutdown_receiver) = oneshot::channel();
+        let (lifecycle_sender, lifecycle) = watch::channel(LifecycleState::stopped());
         let supervisor_wait_limit = supervisor_config.shutdown_timeout + SUPERVISOR_SHUTDOWN_MARGIN;
         let supervisor = tokio::spawn(supervisor::run(
-            command_receiver,
-            phase_sender,
+            wake_receiver,
+            shutdown_receiver,
+            lifecycle_sender,
             supervisor_config,
         ));
         let client_context = ClientContext {
-            phase,
-            commands,
+            lifecycle,
+            wake_requests,
             responder: Arc::new(responder),
             server_host: Arc::from(server_host),
             server_port,
@@ -91,6 +94,7 @@ impl ServerRuntime {
             connection_limit: Arc::new(Semaphore::new(max_connections)),
             connections: JoinSet::new(),
             supervisor,
+            supervisor_shutdown,
             supervisor_wait_limit,
         })
     }
@@ -155,12 +159,7 @@ impl ServerRuntime {
                 bail!("server supervisor stopped unexpectedly")
             }
             RunExit::Shutdown(shutdown_result) => {
-                let shutdown_requested = self
-                    .client_context
-                    .commands
-                    .send(SupervisorCommand::Shutdown)
-                    .await
-                    .is_ok();
+                let shutdown_requested = self.supervisor_shutdown.send(()).is_ok();
                 let mut cleanup_result =
                     await_supervisor_shutdown(&mut self.supervisor, self.supervisor_wait_limit)
                         .await;
@@ -203,7 +202,8 @@ async fn handle_client(
     socket
         .set_nodelay(true)
         .context("failed to enable TCP_NODELAY for client")?;
-    let current_phase = *context.phase.borrow();
+    let observed_lifecycle = *context.lifecycle.borrow();
+    let current_phase = observed_lifecycle.phase();
 
     if current_phase == ServerPhase::Running {
         return proxy_connection(
@@ -241,13 +241,16 @@ async fn handle_client(
         ClientRequest::Login { intent } => {
             log::info!("Minecraft {intent:?} request from {peer}");
             if matches!(current_phase, ServerPhase::Stopped | ServerPhase::Stopping) {
-                match context.commands.try_send(SupervisorCommand::Start) {
+                match context
+                    .wake_requests
+                    .try_send(WakeRequest::observed(observed_lifecycle))
+                {
                     Ok(()) => log::info!("Queued server wake-up request from {peer}"),
                     Err(mpsc::error::TrySendError::Full(_)) => {
-                        log::debug!("Wake-up request already queued");
+                        log::debug!("Wake-up request already pending");
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
-                        bail!("server supervisor command channel is closed");
+                        bail!("server supervisor wake channel is closed");
                     }
                 }
             }
@@ -449,6 +452,7 @@ mod tests {
                 .expect("client connection should close")
                 .is_err()
         );
+        drop(client);
         TcpListener::bind(address)
             .await
             .expect("runtime should release its listener");
@@ -458,6 +462,21 @@ mod tests {
     #[ignore = "launched as the runtime's test server process"]
     fn server_process_fixture() {
         std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn supervisor_timeout_aborts_stalled_cleanup() {
+        let mut supervisor = tokio::spawn(std::future::pending::<Result<()>>());
+
+        let error = timeout(
+            Duration::from_secs(1),
+            await_supervisor_shutdown(&mut supervisor, Duration::from_millis(1)),
+        )
+        .await
+        .expect("supervisor cleanup failure should be bounded")
+        .expect_err("stalled supervisor cleanup should fail");
+        assert!(error.to_string().contains("did not stop within"));
+        assert!(supervisor.is_finished());
     }
 
     #[tokio::test]
@@ -482,8 +501,8 @@ mod tests {
             rcon_address,
         ))
         .await;
-        let mut phase = runtime.client_context.phase.clone();
-        let commands = runtime.client_context.commands.clone();
+        let mut lifecycle = runtime.client_context.lifecycle.clone();
+        let wake_requests = runtime.client_context.wake_requests.clone();
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let mut runtime_task = tokio::spawn(runtime.run_until(async move {
             shutdown_receiver
@@ -492,14 +511,14 @@ mod tests {
             Err(anyhow!("test shutdown source failed"))
         }));
 
-        commands
-            .send(SupervisorCommand::Start)
+        wake_requests
+            .send(WakeRequest::observed(*lifecycle.borrow()))
             .await
             .expect("runtime supervisor should accept a start command");
-        drop(commands);
+        drop(wake_requests);
         timeout(
             Duration::from_secs(5),
-            phase.wait_for(|phase| *phase == ServerPhase::Starting),
+            lifecycle.wait_for(|state| state.phase() == ServerPhase::Starting),
         )
         .await
         .expect("server process should start")
@@ -514,6 +533,6 @@ mod tests {
             .expect("runtime task should not panic")
             .expect_err("caller shutdown failure should be returned");
         assert_eq!(error.to_string(), "test shutdown source failed");
-        assert_eq!(*phase.borrow(), ServerPhase::Stopped);
+        assert_eq!(lifecycle.borrow().phase(), ServerPhase::Stopped);
     }
 }
