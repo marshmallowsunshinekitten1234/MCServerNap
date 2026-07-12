@@ -10,14 +10,14 @@ use nix::errno::Errno;
 use nix::sys::signal::{Signal, killpg};
 #[cfg(unix)]
 use nix::unistd::Pid;
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", not(test)))]
 const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 
 pub fn launch(command: &str, arguments: &[String]) -> Result<Child> {
     let mut process = Command::new(command);
     process.args(arguments).kill_on_drop(true);
 
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", not(test)))]
     process.creation_flags(CREATE_NEW_CONSOLE);
 
     // A dedicated process group lets forced shutdown include launch scripts and descendants.
