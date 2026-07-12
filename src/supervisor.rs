@@ -194,7 +194,8 @@ impl SupervisorControl {
         let current = self.current_lifecycle();
         let failure_streak = current.failure_streak.saturating_add(1);
         let now = Instant::now();
-        let retry_at = now + failure_backoff(failure_streak);
+        let retry_delay = failure_backoff(failure_streak);
+        let retry_at = now + retry_delay;
         self.lifecycle.send_replace(LifecycleState {
             phase: ServerPhase::Cooldown,
             launch_generation: current.launch_generation.wrapping_add(1),
@@ -203,6 +204,7 @@ impl SupervisorControl {
             phase_started_at: now,
             retry_at: Some(retry_at),
         });
+        log_failure_cooldown(FailureCategory::LaunchFailed, failure_streak, retry_delay);
         retry_at
     }
 
@@ -210,7 +212,8 @@ impl SupervisorControl {
         let current = self.current_lifecycle();
         let failure_streak = current.failure_streak.saturating_add(1);
         let now = Instant::now();
-        let retry_at = now + failure_backoff(failure_streak);
+        let retry_delay = failure_backoff(failure_streak);
+        let retry_at = now + retry_delay;
         self.lifecycle.send_replace(LifecycleState {
             phase: ServerPhase::Cooldown,
             failure: Some(failure),
@@ -219,6 +222,7 @@ impl SupervisorControl {
             retry_at: Some(retry_at),
             ..current
         });
+        log_failure_cooldown(failure, failure_streak, retry_delay);
         retry_at
     }
 
@@ -246,6 +250,13 @@ impl SupervisorControl {
             retry_at: Some(retry_at),
             ..current
         });
+        log_failure_cooldown(
+            current
+                .failure
+                .expect("failed-process cleanup must have a failure category"),
+            current.failure_streak,
+            retry_delay,
+        );
         retry_at
     }
 
@@ -295,14 +306,18 @@ impl SupervisorControl {
                     self.set_phase(ServerPhase::Stopped);
                     return CooldownOutcome::Shutdown;
                 }
-                request = self.wake_requests.recv(), if !retry_pending => {
+                request = self.wake_requests.recv() => {
                     let Some(request) = request else {
                         self.set_phase(ServerPhase::Stopped);
                         return CooldownOutcome::Shutdown;
                     };
                     if request.requests_retry(self.current_lifecycle()) {
-                        retry_pending = true;
-                        log::info!("Latched one server retry for the end of the failure cooldown");
+                        if retry_pending {
+                            log::debug!("Coalescing additional demand into the pending server retry");
+                        } else {
+                            retry_pending = true;
+                            log::info!("Latched one server retry for the end of the failure cooldown");
+                        }
                     } else {
                         log::debug!("Ignoring stale server wake-up request during failure cooldown");
                     }
@@ -322,6 +337,12 @@ fn failure_backoff(failure_streak: u32) -> Duration {
         4 => 40,
         _ => 60,
     })
+}
+
+fn log_failure_cooldown(failure: FailureCategory, failure_streak: u32, retry_delay: Duration) {
+    log::warn!(
+        "Server entered a {retry_delay:?} cooldown after {failure:?} (failure streak {failure_streak})"
+    );
 }
 
 pub(crate) async fn run(
@@ -1504,6 +1525,43 @@ mod tests {
             .expect("supervisor shutdown should succeed");
         assert_eq!(lifecycle.borrow().phase, ServerPhase::Stopped);
         assert_eq!(lifecycle.borrow().launch_generation, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wake_channel_closure_interrupts_a_latched_cooldown() {
+        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let retry_at = Instant::now() + Duration::from_secs(60);
+        let mut cooldown = failed_lifecycle(ServerPhase::Cooldown, 5);
+        cooldown.retry_at = Some(retry_at);
+        let (lifecycle_sender, lifecycle) = watch::channel(cooldown);
+        let mut control = SupervisorControl {
+            wake_requests: wake_receiver,
+            shutdown: shutdown_receiver,
+            lifecycle: lifecycle_sender,
+        };
+        let (started_sender, started_receiver) = oneshot::channel();
+        let waiting = tokio::spawn(async move {
+            started_sender
+                .send(())
+                .expect("test should still await cooldown startup");
+            control.wait_for_cooldown(retry_at, true).await
+        });
+
+        started_receiver
+            .await
+            .expect("cooldown task should report startup");
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        drop(wake_sender);
+
+        assert_eq!(
+            waiting.await.expect("cooldown task should not panic"),
+            CooldownOutcome::Shutdown
+        );
+        assert_eq!(lifecycle.borrow().phase, ServerPhase::Stopped);
+        assert!(Instant::now() < retry_at);
+        drop(shutdown_sender);
     }
 
     #[tokio::test(start_paused = true)]
