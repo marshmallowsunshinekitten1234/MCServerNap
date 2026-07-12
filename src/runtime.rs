@@ -240,7 +240,10 @@ async fn handle_client(
         }
         ClientRequest::Login { intent } => {
             log::info!("Minecraft {intent:?} request from {peer}");
-            if matches!(current_phase, ServerPhase::Stopped | ServerPhase::Stopping) {
+            if matches!(
+                current_phase,
+                ServerPhase::Stopped | ServerPhase::Stopping | ServerPhase::Cooldown
+            ) {
                 match context
                     .wake_requests
                     .try_send(WakeRequest::observed(observed_lifecycle))
