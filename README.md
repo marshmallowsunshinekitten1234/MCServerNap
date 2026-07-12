@@ -61,6 +61,8 @@ Everything after `--` is passed to the server command. The backend and RCON host
 
 The first login attempt starts the server and receives the configured startup message. The player reconnects once the server is ready.
 
+If the server fails to start or later exits unexpectedly, MCServerNap does not keep restarting it on its own. A new login attempt schedules one more start after a cooldown; consecutive failures increase the cooldown through 5, 10, 20, 40, and at most 60 seconds.
+
 Launch commands inherit MCServerNap's working directory. A launch script should change to the server directory and remain attached to Java until it exits. On Unix, finish with `exec java ...`; on Windows, do not use `start` or `Start-Process`.
 
 ## Configuration
