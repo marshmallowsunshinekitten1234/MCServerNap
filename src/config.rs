@@ -11,6 +11,8 @@ use image::{GenericImageView as _, ImageFormat, ImageReader};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
+use crate::minecraft::MinecraftVersion;
+
 const MAX_ICON_FILE_SIZE: usize = 8 * 1024 * 1024;
 const MAX_ICON_DIMENSION: u32 = 4_096;
 const ICON_SIZE: u32 = 64;
@@ -20,6 +22,8 @@ const ICON_SIZE: u32 = 64;
 pub struct Config {
     /// Exact configuration schema understood by this release.
     pub schema_version: u32,
+    /// Minecraft Java release served by the backend.
+    pub minecraft_version: MinecraftVersion,
     /// Seconds between successful RCON player-count polls.
     pub rcon_poll_interval_seconds: u64,
     /// Continuous confirmed-empty seconds before the server is stopped.
@@ -49,7 +53,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
+            minecraft_version: MinecraftVersion::latest(),
             rcon_poll_interval_seconds: 60,
             rcon_idle_timeout_seconds: 600,
             rcon_startup_timeout_seconds: 600,
@@ -73,8 +78,8 @@ impl Default for Config {
 impl Config {
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            self.schema_version == 1,
-            "unsupported schema_version {}; expected 1",
+            self.schema_version == 2,
+            "unsupported schema_version {}; expected 2",
             self.schema_version
         );
         for (name, seconds) in [
@@ -301,7 +306,7 @@ mod tests {
         assert!(toml::from_str::<Config>(&with_obsolete_field).is_err());
 
         let unsupported = Config {
-            schema_version: 2,
+            schema_version: 1,
             ..Config::default()
         };
         assert!(unsupported.validate().is_err());

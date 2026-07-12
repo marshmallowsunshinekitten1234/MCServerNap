@@ -10,13 +10,15 @@ use tokio::time::timeout;
 
 use crate::config::Config;
 
+mod version;
+
+use version::InitialProtocol;
+pub use version::MinecraftVersion;
+
 const MAX_PACKET_LENGTH: usize = (1 << 21) - 1;
 const MAX_HANDSHAKE_PACKET_LENGTH: usize = 1_024;
 const MAX_LOGIN_START_PACKET_LENGTH: usize = 128;
 const MAX_STATUS_PACKET_LENGTH: usize = 32;
-
-pub const MINECRAFT_PROTOCOL_VERSION: i32 = 776;
-pub const MINECRAFT_VERSION_NAME: &str = "26.2";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LoginIntent {
@@ -33,6 +35,7 @@ pub enum ClientRequest {
 
 #[derive(Debug)]
 pub struct MinecraftResponder {
+    minecraft_version: MinecraftVersion,
     status_response: Vec<u8>,
     login_disconnect: Vec<u8>,
     incompatible_disconnect: Vec<u8>,
@@ -75,10 +78,11 @@ struct StatusDescription<'a> {
 
 impl MinecraftResponder {
     pub fn new(config: &Config, favicon: Option<&str>) -> Result<Self> {
+        let minecraft_version = config.minecraft_version;
         let status = StatusResponse {
             version: StatusVersion {
-                name: MINECRAFT_VERSION_NAME,
-                protocol: MINECRAFT_PROTOCOL_VERSION,
+                name: minecraft_version.name(),
+                protocol: minecraft_version.protocol(),
             },
             players: StatusPlayers {
                 max: 0,
@@ -106,7 +110,9 @@ impl MinecraftResponder {
         let login_disconnect = encode_string_packet(0, &disconnect_json)?;
         let incompatible_component = json!({
             "text": format!(
-                "This server requires Minecraft Java {MINECRAFT_VERSION_NAME} (protocol {MINECRAFT_PROTOCOL_VERSION})."
+                "This server requires Minecraft Java {} (protocol {}).",
+                minecraft_version.name(),
+                minecraft_version.protocol(),
             ),
             "color": "red",
             "bold": true,
@@ -116,10 +122,15 @@ impl MinecraftResponder {
         let incompatible_disconnect = encode_string_packet(0, &incompatible_json)?;
 
         Ok(Self {
+            minecraft_version,
             status_response,
             login_disconnect,
             incompatible_disconnect,
         })
+    }
+
+    pub async fn read_client_request(&self, socket: &mut TcpStream) -> Result<ClientRequest> {
+        read_client_request_for_version(socket, self.minecraft_version).await
     }
 
     pub async fn send_login_disconnect(
@@ -199,7 +210,10 @@ fn is_normal_client_close(error: &anyhow::Error) -> bool {
 
 /// Read and validate the initial protocol exchange while the backend is asleep.
 /// Login requests include a validated Login Start packet so a bare handshake does not wake the server.
-pub async fn read_client_request(socket: &mut TcpStream) -> Result<ClientRequest> {
+async fn read_client_request_for_version(
+    socket: &mut TcpStream,
+    minecraft_version: MinecraftVersion,
+) -> Result<ClientRequest> {
     let first = socket
         .read_u8()
         .await
@@ -224,18 +238,30 @@ pub async fn read_client_request(socket: &mut TcpStream) -> Result<ClientRequest
         HandshakeIntent::Transfer => LoginIntent::Transfer,
     };
 
-    if handshake.protocol_version != MINECRAFT_PROTOCOL_VERSION {
+    if handshake.protocol_version != minecraft_version.protocol() {
         return Ok(ClientRequest::UnsupportedProtocol {
             protocol_version: handshake.protocol_version,
         });
     }
 
+    validate_login_intent(minecraft_version, intent)?;
+
     let login_start = read_packet(socket, MAX_LOGIN_START_PACKET_LENGTH).await?;
-    parse_login_start(&login_start)?;
+    parse_login_start(&login_start, minecraft_version)?;
     Ok(ClientRequest::Login { intent })
 }
 
-fn parse_login_start(packet: &[u8]) -> Result<()> {
+fn validate_login_intent(minecraft_version: MinecraftVersion, intent: LoginIntent) -> Result<()> {
+    ensure!(
+        intent != LoginIntent::Transfer
+            || minecraft_version.initial_protocol() == InitialProtocol::RequiredUuidAndTransfer,
+        "transfer login is not supported by Minecraft Java {}",
+        minecraft_version.name()
+    );
+    Ok(())
+}
+
+fn parse_login_start(packet: &[u8], minecraft_version: MinecraftVersion) -> Result<()> {
     let mut cursor = PacketCursor::new(packet);
     ensure!(
         cursor.read_varint()? == 0,
@@ -243,7 +269,16 @@ fn parse_login_start(packet: &[u8]) -> Result<()> {
     );
     let username = cursor.read_string(16)?;
     ensure!(!username.is_empty(), "login username must not be empty");
-    cursor.read_bytes(16)?;
+    match minecraft_version.initial_protocol() {
+        InitialProtocol::OptionalUuid => {
+            if cursor.read_bool()? {
+                cursor.read_bytes(16)?;
+            }
+        }
+        InitialProtocol::RequiredUuid | InitialProtocol::RequiredUuidAndTransfer => {
+            cursor.read_bytes(16)?;
+        }
+    }
     cursor.ensure_finished()
 }
 
@@ -440,6 +475,14 @@ impl<'a> PacketCursor<'a> {
         Ok(u16::from_be_bytes(self.read_array()?))
     }
 
+    fn read_bool(&mut self) -> Result<bool> {
+        match self.read_array::<1>()?[0] {
+            0 => Ok(false),
+            1 => Ok(true),
+            value => bail!("invalid Boolean value {value}"),
+        }
+    }
+
     fn read_i64(&mut self) -> Result<i64> {
         Ok(i64::from_be_bytes(self.read_array()?))
     }
@@ -492,6 +535,12 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
+    fn version_named(name: &str) -> MinecraftVersion {
+        MinecraftVersion::supported()
+            .find(|version| version.name() == name)
+            .expect("test version should be in the catalogue")
+    }
+
     async fn socket_pair() -> (TcpStream, TcpStream) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -530,7 +579,7 @@ mod tests {
         packet
     }
 
-    fn encode_login_start(username: &str, uuid: [u8; 16]) -> Vec<u8> {
+    fn encode_login_start_prefix(username: &str) -> Vec<u8> {
         let mut packet = Vec::new();
         write_varint(0, &mut packet);
         write_varint(
@@ -538,7 +587,21 @@ mod tests {
             &mut packet,
         );
         packet.extend_from_slice(username.as_bytes());
+        packet
+    }
+
+    fn encode_required_uuid_login_start(username: &str, uuid: [u8; 16]) -> Vec<u8> {
+        let mut packet = encode_login_start_prefix(username);
         packet.extend_from_slice(&uuid);
+        packet
+    }
+
+    fn encode_optional_uuid_login_start(username: &str, uuid: Option<[u8; 16]>) -> Vec<u8> {
+        let mut packet = encode_login_start_prefix(username);
+        packet.push(u8::from(uuid.is_some()));
+        if let Some(uuid) = uuid {
+            packet.extend_from_slice(&uuid);
+        }
         packet
     }
 
@@ -564,23 +627,24 @@ mod tests {
     }
 
     #[test]
-    fn parses_current_login_and_transfer_handshakes() {
+    fn parses_login_and_transfer_handshakes() {
+        let minecraft_version = MinecraftVersion::latest();
         assert_eq!(
             parse_handshake(&encode_handshake(
-                MINECRAFT_PROTOCOL_VERSION,
+                minecraft_version.protocol(),
                 "localhost",
                 25565,
                 2,
             ))
             .expect("valid login handshake"),
             Handshake {
-                protocol_version: MINECRAFT_PROTOCOL_VERSION,
+                protocol_version: minecraft_version.protocol(),
                 intent: HandshakeIntent::Login,
             }
         );
         assert_eq!(
             parse_handshake(&encode_handshake(
-                MINECRAFT_PROTOCOL_VERSION,
+                minecraft_version.protocol(),
                 "localhost",
                 25565,
                 3,
@@ -593,32 +657,39 @@ mod tests {
 
     #[test]
     fn rejects_truncated_and_trailing_handshakes() {
-        let mut truncated = encode_handshake(MINECRAFT_PROTOCOL_VERSION, "localhost", 25565, 2);
+        let minecraft_version = MinecraftVersion::latest();
+        let mut truncated = encode_handshake(minecraft_version.protocol(), "localhost", 25565, 2);
         truncated.pop();
         assert!(parse_handshake(&truncated).is_err());
 
-        let mut trailing = encode_handshake(MINECRAFT_PROTOCOL_VERSION, "localhost", 25565, 2);
+        let mut trailing = encode_handshake(minecraft_version.protocol(), "localhost", 25565, 2);
         trailing.push(0);
         assert!(parse_handshake(&trailing).is_err());
     }
 
     #[test]
-    fn status_response_advertises_only_the_current_protocol() {
-        let responder = MinecraftResponder::new(&Config::default(), None)
-            .expect("responder should be constructed");
-        let framed = &responder.status_response;
-        let (frame_length, length_bytes) = decode_varint(framed).expect("frame length");
-        assert_eq!(
-            usize::try_from(frame_length).expect("positive frame length"),
-            framed.len() - length_bytes
-        );
+    fn status_response_advertises_the_configured_version() {
+        for minecraft_version in MinecraftVersion::supported() {
+            let config = Config {
+                minecraft_version,
+                ..Config::default()
+            };
+            let responder =
+                MinecraftResponder::new(&config, None).expect("responder should be constructed");
+            let framed = &responder.status_response;
+            let (frame_length, length_bytes) = decode_varint(framed).expect("frame length");
+            assert_eq!(
+                usize::try_from(frame_length).expect("positive frame length"),
+                framed.len() - length_bytes
+            );
 
-        let mut cursor = PacketCursor::new(&framed[length_bytes..]);
-        assert_eq!(cursor.read_varint().expect("packet ID"), 0);
-        let json = cursor.read_string(32_767).expect("status JSON");
-        let value: Value = serde_json::from_str(json).expect("valid status JSON");
-        assert_eq!(value["version"]["protocol"], MINECRAFT_PROTOCOL_VERSION);
-        assert_eq!(value["version"]["name"], MINECRAFT_VERSION_NAME);
+            let mut cursor = PacketCursor::new(&framed[length_bytes..]);
+            assert_eq!(cursor.read_varint().expect("packet ID"), 0);
+            let json = cursor.read_string(32_767).expect("status JSON");
+            let value: Value = serde_json::from_str(json).expect("valid status JSON");
+            assert_eq!(value["version"]["protocol"], minecraft_version.protocol());
+            assert_eq!(value["version"]["name"], minecraft_version.name());
+        }
     }
 
     #[tokio::test]
@@ -633,7 +704,7 @@ mod tests {
             .expect("client exchange should write");
 
         assert_eq!(
-            read_client_request(&mut server)
+            read_client_request_for_version(&mut server, MinecraftVersion::latest())
                 .await
                 .expect("coalesced exchange should parse"),
             ClientRequest::Status
@@ -643,16 +714,19 @@ mod tests {
     #[tokio::test]
     async fn login_request_requires_and_consumes_login_start() {
         let (mut client, mut server) = socket_pair().await;
-        let handshake = encode_handshake(MINECRAFT_PROTOCOL_VERSION, "localhost", 25565, 2);
+        let minecraft_version = MinecraftVersion::latest();
+        let handshake = encode_handshake(minecraft_version.protocol(), "localhost", 25565, 2);
         let mut exchange = frame_raw_packet(&handshake);
-        exchange.extend_from_slice(&frame_raw_packet(&encode_login_start("player", [7; 16])));
+        exchange.extend_from_slice(&frame_raw_packet(&encode_required_uuid_login_start(
+            "player", [7; 16],
+        )));
         client
             .write_all(&exchange)
             .await
             .expect("client exchange should write");
 
         assert_eq!(
-            read_client_request(&mut server)
+            read_client_request_for_version(&mut server, minecraft_version)
                 .await
                 .expect("login exchange should parse"),
             ClientRequest::Login {
@@ -662,20 +736,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_non_current_login_protocol_without_waking() {
+    async fn minecraft_1_20_1_login_request_accepts_absent_uuid() {
         let (mut client, mut server) = socket_pair().await;
-        let handshake = encode_handshake(MINECRAFT_PROTOCOL_VERSION - 1, "localhost", 25565, 2);
+        let minecraft_version = version_named("1.20.1");
+        let handshake = encode_handshake(minecraft_version.protocol(), "localhost", 25565, 2);
+        let mut exchange = frame_raw_packet(&handshake);
+        exchange.extend_from_slice(&frame_raw_packet(&encode_optional_uuid_login_start(
+            "player", None,
+        )));
+        client
+            .write_all(&exchange)
+            .await
+            .expect("client exchange should write");
+
+        assert_eq!(
+            read_client_request_for_version(&mut server, minecraft_version)
+                .await
+                .expect("1.20.1 login exchange should parse"),
+            ClientRequest::Login {
+                intent: LoginIntent::Login
+            }
+        );
+    }
+
+    #[test]
+    fn transfer_intent_follows_the_initial_protocol() {
+        for minecraft_version in MinecraftVersion::supported() {
+            let result = validate_login_intent(minecraft_version, LoginIntent::Transfer);
+            assert_eq!(
+                result.is_ok(),
+                minecraft_version.initial_protocol() == InitialProtocol::RequiredUuidAndTransfer,
+                "unexpected transfer support for {}",
+                minecraft_version.name()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_unconfigured_login_protocol_without_waking() {
+        let (mut client, mut server) = socket_pair().await;
+        let minecraft_version = MinecraftVersion::latest();
+        let unsupported_protocol = minecraft_version.protocol() - 1;
+        let handshake = encode_handshake(unsupported_protocol, "localhost", 25565, 2);
         client
             .write_all(&frame_raw_packet(&handshake))
             .await
             .expect("client handshake should write");
 
         assert_eq!(
-            read_client_request(&mut server)
+            read_client_request_for_version(&mut server, minecraft_version)
                 .await
                 .expect("handshake should parse"),
             ClientRequest::UnsupportedProtocol {
-                protocol_version: MINECRAFT_PROTOCOL_VERSION - 1
+                protocol_version: unsupported_protocol
             }
         );
     }
@@ -692,21 +805,61 @@ mod tests {
             .await
             .expect("legacy client write half should close");
 
-        assert!(read_client_request(&mut server).await.is_err());
+        assert!(
+            read_client_request_for_version(&mut server, MinecraftVersion::latest())
+                .await
+                .is_err()
+        );
     }
 
     #[test]
-    fn login_start_requires_current_uuid_layout_and_no_trailing_data() {
-        let valid = encode_login_start("player", [9; 16]);
-        assert!(parse_login_start(&valid).is_ok());
+    fn accepts_forge_handshake_hostname_marker() {
+        let handshake = encode_handshake(
+            version_named("1.20.1").protocol(),
+            "localhost\0FORGE",
+            25565,
+            2,
+        );
+        assert_eq!(
+            parse_handshake(&handshake)
+                .expect("Forge handshake should parse")
+                .intent,
+            HandshakeIntent::Login
+        );
+    }
 
-        let mut missing_uuid = valid.clone();
-        missing_uuid.pop();
-        assert!(parse_login_start(&missing_uuid).is_err());
+    #[test]
+    fn required_uuid_login_start_rejects_missing_or_trailing_data() {
+        let valid = encode_required_uuid_login_start("player", [9; 16]);
+        for minecraft_version in MinecraftVersion::supported()
+            .filter(|version| version.initial_protocol() != InitialProtocol::OptionalUuid)
+        {
+            assert!(parse_login_start(&valid, minecraft_version).is_ok());
 
-        let mut trailing = valid;
-        trailing.push(0);
-        assert!(parse_login_start(&trailing).is_err());
+            let mut missing_uuid = valid.clone();
+            missing_uuid.pop();
+            assert!(parse_login_start(&missing_uuid, minecraft_version).is_err());
+
+            let mut trailing = valid.clone();
+            trailing.push(0);
+            assert!(parse_login_start(&trailing, minecraft_version).is_err());
+        }
+    }
+
+    #[test]
+    fn optional_uuid_login_start_accepts_present_or_absent_uuid() {
+        let minecraft_version = version_named("1.20.1");
+        let without_uuid = encode_optional_uuid_login_start("player", None);
+        let with_uuid = encode_optional_uuid_login_start("player", Some([9; 16]));
+        assert!(parse_login_start(&without_uuid, minecraft_version).is_ok());
+        assert!(parse_login_start(&with_uuid, minecraft_version).is_ok());
+
+        let mut invalid_boolean = without_uuid;
+        *invalid_boolean.last_mut().expect("packet contains Boolean") = 2;
+        assert!(parse_login_start(&invalid_boolean, minecraft_version).is_err());
+
+        let missing_optional_flag = encode_login_start_prefix("player");
+        assert!(parse_login_start(&missing_optional_flag, minecraft_version).is_err());
     }
 
     #[tokio::test]
@@ -729,7 +882,7 @@ mod tests {
         let status_value: Value = serde_json::from_str(status_json).expect("valid status JSON");
         assert_eq!(
             status_value["version"]["protocol"],
-            MINECRAFT_PROTOCOL_VERSION
+            MinecraftVersion::latest().protocol()
         );
 
         let timestamp = 1_234_567_890_i64;

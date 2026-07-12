@@ -274,7 +274,7 @@ async fn handle_client(
     let operation_timeout = context.handshake_timeout;
     let request = timeout(
         operation_timeout,
-        mcservernap::minecraft::read_client_request(&mut socket),
+        context.responder.read_client_request(&mut socket),
     )
     .await
     .context("initial Minecraft exchange timed out")??;
