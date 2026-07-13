@@ -59,11 +59,13 @@ target/release/mcservernap listen 0.0.0.0 25565 \
 
 Everything after `--` is passed to the server command. The backend and RCON hosts default to `127.0.0.1`; use `--server-host` or `--rcon-host` if needed.
 
-The first login attempt starts the server and receives the configured startup message. The player reconnects once the server is ready.
+When the backend is confirmed stopped, the first login attempt starts it and receives the configured startup message. The player reconnects once the server is ready.
 
 If the server fails to start or later exits unexpectedly, MCServerNap does not keep restarting it on its own. A new login attempt schedules one more start after a cooldown; consecutive failures increase the cooldown through 5, 10, 20, 40, and at most 60 seconds.
 
 Launch commands inherit MCServerNap's working directory. A launch script should change to the server directory and remain attached to Java until it exits. On Unix, finish with `exec java ...`; on Windows, do not use `start` or `Start-Process`.
+
+Start `mcservernap listen` only when the backend is fully stopped or ready, and do not start the same server another way while the listener is running. MCServerNap can proxy an already-running server, but it will not stop it. If the backend state is uncertain, it will not launch. Restarting the listener clears what it remembers, so do that only after confirming the backend is fully stopped or ready.
 
 ## Configuration
 
@@ -71,21 +73,21 @@ The first run creates `config/cfg.toml`. Use `--config <path>` or `MCSERVERNAP_C
 
 Existing configurations must set `schema_version = 2` and add the matching `minecraft_version`.
 
-| Setting | Default | Purpose |
-| --- | ---: | --- |
-| `schema_version` | `2` | Configuration format required by this release. |
-| `minecraft_version` | `"26.2"` | Exact backend release, from `"1.20.1"` through `"26.2"`. |
-| `rcon_poll_interval_seconds` | `60` | Time between successful player-count checks. |
-| `rcon_idle_timeout_seconds` | `600` | Confirmed-empty time before shutdown. |
-| `rcon_startup_timeout_seconds` | `600` | Maximum time to wait for RCON during startup. |
-| `rcon_retry_interval_seconds` | `2` | Delay between failed RCON connections. |
-| `rcon_command_timeout_seconds` | `10` | Timeout for an RCON connection or command. |
-| `shutdown_timeout_seconds` | `30` | Graceful shutdown time before forced termination. |
-| `handshake_timeout_seconds` | `5` | Timeout for a sleeping client's initial packets. |
-| `proxy_connect_timeout_seconds` | `10` | Time allowed to connect to the backend. |
-| `max_connections` | `512` | Maximum concurrent client tasks. |
-| `motd_*` | — | Sleeping server-list message and style. |
-| `connection_msg_*` | — | Message shown while starting the server. |
+| Setting                         |  Default | Purpose                                                  |
+| ------------------------------- | -------: | -------------------------------------------------------- |
+| `schema_version`                |      `2` | Configuration format required by this release.           |
+| `minecraft_version`             | `"26.2"` | Exact backend release, from `"1.20.1"` through `"26.2"`. |
+| `rcon_poll_interval_seconds`    |     `60` | Time between successful player-count checks.             |
+| `rcon_idle_timeout_seconds`     |    `600` | Confirmed-empty time before shutdown.                    |
+| `rcon_startup_timeout_seconds`  |    `600` | Maximum time to wait for RCON during startup.            |
+| `rcon_retry_interval_seconds`   |      `2` | Delay between failed RCON connections.                   |
+| `rcon_command_timeout_seconds`  |     `10` | Timeout for an RCON connection or command.               |
+| `shutdown_timeout_seconds`      |     `30` | Graceful shutdown time before forced termination.        |
+| `handshake_timeout_seconds`     |      `5` | Timeout for a sleeping client's initial packets.         |
+| `proxy_connect_timeout_seconds` |     `10` | Time allowed to connect to the backend.                  |
+| `max_connections`               |    `512` | Maximum concurrent client tasks.                         |
+| `motd_*`                        |        — | Sleeping server-list message and style.                  |
+| `connection_msg_*`              |        — | Message shown while starting the server.                 |
 
 Every duration must be greater than zero. Configuration is strict: missing fields, unknown fields, and unsupported schema versions are rejected instead of being guessed or migrated.
 
@@ -100,6 +102,8 @@ target/release/mcservernap stop --rcon-port 25575
 ```
 
 `MCSERVERNAP_RCON_PASSWORD` is used here as well.
+
+The `stop` command only sends the RCON stop request. It does not wait for the server to exit or reset a running listener.
 
 ## Logging
 
