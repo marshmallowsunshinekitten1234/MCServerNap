@@ -6,13 +6,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::net::TcpStream;
-use tokio::process::Child;
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio::sync::{OwnedRwLockWriteGuard, mpsc, oneshot, watch};
-use tokio::time::{Instant, sleep_until, timeout};
+use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 
 use crate::backend_use::{BackendCycle, BackendUseCoordinator, CurrentCycleActivity};
-use crate::process;
+use crate::process::{self, OwnedProcess};
 use crate::rcon::{self, RconClient, RconProbeClassification};
 
 const STABILITY_WINDOW: Duration = Duration::from_secs(60);
@@ -172,14 +171,18 @@ impl WakeRequest {
 pub struct SupervisorConfig {
     pub command: String,
     pub arguments: Vec<String>,
-    pub rcon_address: String,
-    pub rcon_password: String,
+    pub rcon: Option<RconConfig>,
     pub poll_interval: Duration,
     pub idle_timeout: Duration,
     pub startup_timeout: Duration,
     pub retry_interval: Duration,
     pub command_timeout: Duration,
     pub shutdown_timeout: Duration,
+}
+
+pub struct RconConfig {
+    pub endpoint: String,
+    pub password: String,
 }
 
 pub(crate) struct BackendEndpoint {
@@ -214,7 +217,7 @@ enum CycleOutcome {
 }
 
 enum ReadinessOutcome {
-    Ready(RconClient),
+    Ready,
     StartupTimedOut,
     Exited(ExitStatus),
     ProcessWaitFailed(std::io::Error),
@@ -245,7 +248,7 @@ enum ReconciliationClassification {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ConflictClassification {
-    rcon: RconProbeClassification,
+    rcon: Option<RconProbeClassification>,
     backend: BackendProbeClassification,
     sticky_positive: bool,
 }
@@ -255,9 +258,12 @@ struct BackendProbeResult {
     detail: Option<anyhow::Error>,
 }
 
-struct ReconciliationResult {
-    rcon: rcon::RconProbeResult,
-    backend: BackendProbeResult,
+enum ReconciliationResult {
+    ConfiguredRcon {
+        rcon: rcon::RconProbeResult,
+        backend: BackendProbeResult,
+    },
+    BackendOnly(BackendProbeResult),
 }
 
 impl ReconciliationResult {
@@ -268,31 +274,50 @@ impl ReconciliationResult {
             Refused as RconRefused,
         };
 
-        match (self.rcon.classification, self.backend.classification) {
-            (Authenticated, Connected) => ReconciliationClassification::FullyReady,
-            (Authenticated | AcceptedFailure, _) | (_, Connected) => {
-                ReconciliationClassification::Positive
+        match self {
+            Self::ConfiguredRcon { rcon, backend } => {
+                match (rcon.classification, backend.classification) {
+                    (Authenticated, Connected) => ReconciliationClassification::FullyReady,
+                    (Authenticated | AcceptedFailure, _) | (_, Connected) => {
+                        ReconciliationClassification::Positive
+                    }
+                    (RconRefused, Refused) => ReconciliationClassification::Clean,
+                    (RconRefused | RconInconclusive, Refused | BackendInconclusive) => {
+                        ReconciliationClassification::Inconclusive
+                    }
+                }
             }
-            (RconRefused, Refused) => ReconciliationClassification::Clean,
-            (RconRefused | RconInconclusive, Refused | BackendInconclusive) => {
-                ReconciliationClassification::Inconclusive
-            }
+            Self::BackendOnly(backend) => match backend.classification {
+                Connected => ReconciliationClassification::FullyReady,
+                Refused => ReconciliationClassification::Clean,
+                BackendInconclusive => ReconciliationClassification::Inconclusive,
+            },
         }
     }
 
     fn conflict_classification(&self, sticky_positive: bool) -> ConflictClassification {
+        let (rcon, backend) = match self {
+            Self::ConfiguredRcon { rcon, backend } => {
+                (Some(rcon.classification), backend.classification)
+            }
+            Self::BackendOnly(backend) => (None, backend.classification),
+        };
         ConflictClassification {
-            rcon: self.rcon.classification,
-            backend: self.backend.classification,
+            rcon,
+            backend,
             sticky_positive,
         }
     }
 
     fn log_details(&self) {
-        if let Some(error) = &self.rcon.detail {
+        let (rcon_detail, backend) = match self {
+            Self::ConfiguredRcon { rcon, backend } => (rcon.detail.as_ref(), backend),
+            Self::BackendOnly(backend) => (None, backend),
+        };
+        if let Some(error) = rcon_detail {
             log::debug!("RCON reconciliation detail: {error:#}");
         }
-        if let Some(error) = &self.backend.detail {
+        if let Some(error) = &backend.detail {
             log::debug!("Minecraft backend reconciliation detail: {error:#}");
         }
     }
@@ -744,15 +769,19 @@ async fn reconciliation_probe(
             .expect("test reconciliation script ended unexpectedly");
     }
 
-    let (rcon, backend) = tokio::join!(
-        rcon::probe(
-            &config.rcon_address,
-            &config.rcon_password,
-            config.command_timeout,
-        ),
-        probe_backend(backend),
-    );
-    ReconciliationResult { rcon, backend }
+    if let Some(rcon_config) = &config.rcon {
+        let (rcon, backend) = tokio::join!(
+            rcon::probe(
+                &rcon_config.endpoint,
+                &rcon_config.password,
+                config.command_timeout,
+            ),
+            probe_backend(backend),
+        );
+        ReconciliationResult::ConfiguredRcon { rcon, backend }
+    } else {
+        ReconciliationResult::BackendOnly(probe_backend(backend).await)
+    }
 }
 
 async fn wait_for_reconciliation(
@@ -816,11 +845,17 @@ fn publish_conflict_observation(
         } else {
             "another login may retry reconciliation"
         };
-        log::warn!(
-            "Backend conflict: RCON={:?}, backend-port={:?}, sticky-positive={sticky_positive}; {next_step}",
-            classification.rcon,
-            classification.backend,
-        );
+        if let Some(rcon) = classification.rcon {
+            log::warn!(
+                "Backend conflict: RCON={rcon:?}, backend-port={:?}, sticky-positive={sticky_positive}; {next_step}",
+                classification.backend,
+            );
+        } else {
+            log::warn!(
+                "Backend conflict: RCON=not-configured, backend-port={:?}, sticky-positive={sticky_positive}; {next_step}",
+                classification.backend,
+            );
+        }
     }
 }
 
@@ -1094,7 +1129,8 @@ pub(crate) async fn run(
             }
         };
 
-        let outcome = run_server_cycle(child, &mut control, &config, &backend_use).await?;
+        let outcome =
+            run_server_cycle(child, &mut control, &config, &backend, &backend_use).await?;
         match outcome {
             CycleOutcome::Stopped => {
                 control.set_phase(ServerPhase::Stopped);
@@ -1121,27 +1157,27 @@ pub(crate) async fn run(
 }
 
 async fn run_server_cycle(
-    mut child: Child,
+    mut child: OwnedProcess,
     control: &mut SupervisorControl,
     config: &SupervisorConfig,
+    backend: &BackendEndpoint,
     backend_use: &BackendUseCoordinator,
 ) -> Result<CycleOutcome> {
-    let readiness = wait_for_readiness(&mut child, control, config).await;
-    let rcon = match readiness {
-        ReadinessOutcome::Ready(rcon) => rcon,
+    let readiness = wait_for_readiness(&mut child, control, config, backend).await;
+    match readiness {
+        ReadinessOutcome::Ready => {}
         ReadinessOutcome::StartupTimedOut => {
+            let readiness_source = if config.rcon.is_some() {
+                "RCON"
+            } else {
+                "the Minecraft backend TCP port"
+            };
             log::error!(
-                "RCON did not become ready within {:?}; terminating the server",
+                "{readiness_source} did not become ready within {:?}; terminating the server",
                 config.startup_timeout
             );
-            return stop_failed_server(
-                child,
-                None,
-                control,
-                config.shutdown_timeout,
-                FailureCategory::StartupTimedOut,
-            )
-            .await;
+            return stop_failed_server(child, control, config, FailureCategory::StartupTimedOut)
+                .await;
         }
         ReadinessOutcome::Exited(status) => {
             return Ok(reaped_failure(
@@ -1151,26 +1187,38 @@ async fn run_server_cycle(
             ));
         }
         ReadinessOutcome::ProcessWaitFailed(error) => {
-            return reap_after_wait_error(child, None, control, config.shutdown_timeout, error)
-                .await;
+            return reap_after_wait_error(child, control, config, error).await;
         }
         ReadinessOutcome::Shutdown => {
-            return stop_for_shutdown(child, None, control, config.shutdown_timeout).await;
+            return stop_for_shutdown(child, control, config).await;
         }
-    };
+    }
 
     if control.shutdown_pending() {
-        return stop_for_shutdown(child, Some(rcon), control, config.shutdown_timeout).await;
+        return stop_for_shutdown(child, control, config).await;
     }
-    log::info!("RCON is ready at {}", config.rcon_address);
+    if let Some(rcon) = &config.rcon {
+        log::info!("RCON is ready at {}", rcon.endpoint);
+    } else {
+        log::info!("Minecraft backend TCP port is ready");
+    }
     let cycle = control.publish_running(backend_use);
-    monitor_running_server(child, rcon, control, config, backend_use, cycle).await
+    monitor_running_server(
+        child,
+        PlayerInspection::from_config(config),
+        control,
+        config,
+        backend_use,
+        cycle,
+    )
+    .await
 }
 
 async fn wait_for_readiness(
-    child: &mut Child,
+    child: &mut OwnedProcess,
     control: &mut SupervisorControl,
     config: &SupervisorConfig,
+    backend: &BackendEndpoint,
 ) -> ReadinessOutcome {
     let deadline = Instant::now() + config.startup_timeout;
     let mut failed_attempts = 0u64;
@@ -1185,11 +1233,29 @@ async fn wait_for_readiness(
         }
 
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let connect_timeout = config.command_timeout.min(remaining);
-        let connect = timeout(
-            connect_timeout,
-            RconClient::connect(&config.rcon_address, &config.rcon_password),
-        );
+        let connect_timeout = if config.rcon.is_some() {
+            config.command_timeout.min(remaining)
+        } else {
+            backend.connect_timeout.min(remaining)
+        };
+        let connect = async {
+            if let Some(rcon) = &config.rcon {
+                timeout(
+                    connect_timeout,
+                    RconClient::connect(&rcon.endpoint, &rcon.password),
+                )
+                .await
+                .context("RCON connection attempt timed out")??;
+            } else {
+                timeout(
+                    connect_timeout,
+                    TcpStream::connect((backend.host.as_ref(), backend.port)),
+                )
+                .await
+                .context("Minecraft backend TCP connection attempt timed out")??;
+            }
+            Result::<()>::Ok(())
+        };
 
         tokio::select! {
             biased;
@@ -1210,18 +1276,14 @@ async fn wait_for_readiness(
             }
             result = connect => {
                 match result {
-                    Ok(Ok(client)) => return ReadinessOutcome::Ready(client),
-                    Ok(Err(error)) => {
+                    Ok(()) => return ReadinessOutcome::Ready,
+                    Err(error) => {
                         failed_attempts += 1;
                         if failed_attempts == 1 || failed_attempts.is_multiple_of(30) {
-                            log::warn!("RCON is not ready yet: {error:#}");
+                            log::warn!("Backend is not ready yet: {error:#}");
                         } else {
-                            log::debug!("RCON is not ready yet: {error:#}");
+                            log::debug!("Backend is not ready yet: {error:#}");
                         }
-                    }
-                    Err(_) => {
-                        failed_attempts += 1;
-                        log::debug!("RCON connection attempt timed out");
                     }
                 }
             }
@@ -1257,57 +1319,85 @@ enum IdleExclusiveOutcome {
 }
 
 enum FinalRconCheck {
-    Zero(RconClient),
+    Zero,
     Veto(Option<RconClient>),
+    Shutdown,
+    ChildWait(std::io::Result<ExitStatus>),
+}
+
+enum IdlePlayerCheck {
+    Confirmed,
+    Veto,
     Shutdown,
     ChildWait(std::io::Result<ExitStatus>),
 }
 
 struct RunningMonitorState {
     cycle: BackendCycle,
-    rcon: Option<RconClient>,
-    next_poll: Instant,
-    rcon_zero_anchor: Option<Instant>,
+    player_inspection: PlayerInspection,
     stable_at: Instant,
     stability_pending: bool,
 }
 
+enum PlayerInspection {
+    ProxyOnly,
+    ConfiguredRcon {
+        client: Option<RconClient>,
+        next_poll: Instant,
+        zero_anchor: Option<Instant>,
+    },
+}
+
+impl PlayerInspection {
+    fn from_config(config: &SupervisorConfig) -> Self {
+        if config.rcon.is_some() {
+            Self::ConfiguredRcon {
+                client: None,
+                next_poll: Instant::now(),
+                zero_anchor: None,
+            }
+        } else {
+            Self::ProxyOnly
+        }
+    }
+}
+
 impl RunningMonitorState {
-    fn new(cycle: BackendCycle, initial_rcon: RconClient, lifecycle: LifecycleState) -> Self {
+    fn new(
+        cycle: BackendCycle,
+        player_inspection: PlayerInspection,
+        lifecycle: LifecycleState,
+    ) -> Self {
         assert_eq!(lifecycle.owned_running_cycle(), Some(cycle));
         Self {
             cycle,
-            rcon: Some(initial_rcon),
-            next_poll: Instant::now(),
-            rcon_zero_anchor: None,
+            player_inspection,
             stable_at: lifecycle.phase_started_at + STABILITY_WINDOW,
             stability_pending: lifecycle.failure_streak > 0,
+        }
+    }
+
+    fn effective_idle_anchor(&self, activity: Option<CurrentCycleActivity>) -> Option<Instant> {
+        let activity = activity.filter(|snapshot| snapshot.cycle() == self.cycle)?;
+        let proxy_anchor = activity.proxy_idle_anchor()?;
+        match &self.player_inspection {
+            PlayerInspection::ProxyOnly => Some(proxy_anchor),
+            PlayerInspection::ConfiguredRcon { zero_anchor, .. } => {
+                Some(proxy_anchor.max((*zero_anchor)?))
+            }
         }
     }
 }
 
 enum RunningMonitorOutcome {
     Continue,
-    Committed(RconClient),
-    Shutdown(Option<RconClient>),
-    ChildWait {
-        status: std::io::Result<ExitStatus>,
-        rcon: Option<RconClient>,
-    },
-}
-
-fn effective_idle_anchor(
-    activity: Option<CurrentCycleActivity>,
-    cycle: BackendCycle,
-    rcon_zero_anchor: Option<Instant>,
-) -> Option<Instant> {
-    let activity = activity.filter(|snapshot| snapshot.cycle() == cycle)?;
-    let proxy_anchor = activity.proxy_idle_anchor()?;
-    Some(proxy_anchor.max(rcon_zero_anchor?))
+    Committed,
+    Shutdown,
+    ChildWait(std::io::Result<ExitStatus>),
 }
 
 fn complete_stability_window(
-    child: &mut Child,
+    child: &mut OwnedProcess,
     control: &SupervisorControl,
     stability_pending: &mut bool,
 ) -> std::io::Result<Option<ExitStatus>> {
@@ -1323,7 +1413,7 @@ fn complete_stability_window(
 }
 
 async fn acquire_idle_exclusive(
-    child: &mut Child,
+    child: &mut OwnedProcess,
     control: &mut SupervisorControl,
     backend_use: &BackendUseCoordinator,
     config: &SupervisorConfig,
@@ -1339,12 +1429,7 @@ async fn acquire_idle_exclusive(
         }
         let activity_changed = backend_use.activity_notified();
         tokio::pin!(activity_changed);
-        if effective_idle_anchor(
-            backend_use.activity_snapshot(),
-            state.cycle,
-            state.rcon_zero_anchor,
-        ) != Some(expected_anchor)
-        {
+        if state.effective_idle_anchor(backend_use.activity_snapshot()) != Some(expected_anchor) {
             return IdleExclusiveOutcome::ActivityChanged;
         }
 
@@ -1367,11 +1452,7 @@ async fn acquire_idle_exclusive(
                 }
             }
             () = &mut activity_changed => {
-                let anchor = effective_idle_anchor(
-                    backend_use.activity_snapshot(),
-                    state.cycle,
-                    state.rcon_zero_anchor,
-                );
+                let anchor = state.effective_idle_anchor(backend_use.activity_snapshot());
                 if anchor != Some(expected_anchor)
                     || anchor.is_none_or(|anchor| Instant::now() < anchor + config.idle_timeout)
                 {
@@ -1385,7 +1466,7 @@ async fn acquire_idle_exclusive(
 
 async fn final_rcon_player_check(
     mut client: RconClient,
-    child: &mut Child,
+    child: &mut OwnedProcess,
     control: &mut SupervisorControl,
     config: &SupervisorConfig,
     state: &mut RunningMonitorState,
@@ -1428,7 +1509,7 @@ async fn final_rcon_player_check(
 
     match outcome {
         WaitOutcome::Command(Ok(Ok(response))) => match observed_player_count(&response) {
-            Some(0) => FinalRconCheck::Zero(client),
+            Some(0) => FinalRconCheck::Zero,
             Some(player_count) => {
                 log::debug!("Final idle check found {player_count} online player(s)");
                 FinalRconCheck::Veto(Some(client))
@@ -1448,8 +1529,57 @@ async fn final_rcon_player_check(
     }
 }
 
+async fn confirm_idle_player_state(
+    child: &mut OwnedProcess,
+    control: &mut SupervisorControl,
+    config: &SupervisorConfig,
+    state: &mut RunningMonitorState,
+) -> IdlePlayerCheck {
+    let final_rcon = match &mut state.player_inspection {
+        PlayerInspection::ProxyOnly => return IdlePlayerCheck::Confirmed,
+        PlayerInspection::ConfiguredRcon {
+            client,
+            next_poll,
+            zero_anchor,
+        } => {
+            let Some(client) = client.take() else {
+                *zero_anchor = None;
+                *next_poll = Instant::now() + config.retry_interval;
+                return IdlePlayerCheck::Veto;
+            };
+            client
+        }
+    };
+
+    match final_rcon_player_check(final_rcon, child, control, config, state).await {
+        FinalRconCheck::Zero => IdlePlayerCheck::Confirmed,
+        FinalRconCheck::Veto(rcon) => {
+            let retry_connection = rcon.is_none();
+            let PlayerInspection::ConfiguredRcon {
+                client,
+                next_poll,
+                zero_anchor,
+            } = &mut state.player_inspection
+            else {
+                unreachable!("final RCON check requires configured player inspection");
+            };
+            *client = rcon;
+            *zero_anchor = None;
+            *next_poll = Instant::now()
+                + if retry_connection {
+                    config.retry_interval
+                } else {
+                    config.poll_interval
+                };
+            IdlePlayerCheck::Veto
+        }
+        FinalRconCheck::Shutdown => IdlePlayerCheck::Shutdown,
+        FinalRconCheck::ChildWait(status) => IdlePlayerCheck::ChildWait(status),
+    }
+}
+
 async fn attempt_expired_idle_stop(
-    child: &mut Child,
+    child: &mut OwnedProcess,
     control: &mut SupervisorControl,
     config: &SupervisorConfig,
     backend_use: &BackendUseCoordinator,
@@ -1460,19 +1590,14 @@ async fn attempt_expired_idle_stop(
         match acquire_idle_exclusive(child, control, backend_use, config, state, anchor).await {
             IdleExclusiveOutcome::Acquired(guard) => guard,
             IdleExclusiveOutcome::ActivityChanged => return RunningMonitorOutcome::Continue,
-            IdleExclusiveOutcome::Shutdown => {
-                return RunningMonitorOutcome::Shutdown(state.rcon.take());
-            }
+            IdleExclusiveOutcome::Shutdown => return RunningMonitorOutcome::Shutdown,
             IdleExclusiveOutcome::ChildWait(status) => {
-                return RunningMonitorOutcome::ChildWait {
-                    status,
-                    rcon: state.rcon.take(),
-                };
+                return RunningMonitorOutcome::ChildWait(status);
             }
         };
 
     let activity = backend_use.activity_snapshot();
-    let unchanged_anchor = effective_idle_anchor(activity, state.cycle, state.rcon_zero_anchor);
+    let unchanged_anchor = state.effective_idle_anchor(activity);
     if activity.is_none_or(|snapshot| {
         snapshot.cycle() != state.cycle || snapshot.active_login_transfer_sessions() != 0
     }) || unchanged_anchor != Some(anchor)
@@ -1482,84 +1607,58 @@ async fn attempt_expired_idle_stop(
         return RunningMonitorOutcome::Continue;
     }
     if control.shutdown_pending() {
-        return RunningMonitorOutcome::Shutdown(state.rcon.take());
+        return RunningMonitorOutcome::Shutdown;
     }
     match child.try_wait() {
         Ok(Some(status)) => {
-            return RunningMonitorOutcome::ChildWait {
-                status: Ok(status),
-                rcon: state.rcon.take(),
-            };
+            return RunningMonitorOutcome::ChildWait(Ok(status));
         }
         Ok(None) => {}
         Err(error) => {
-            return RunningMonitorOutcome::ChildWait {
-                status: Err(error),
-                rcon: state.rcon.take(),
-            };
+            return RunningMonitorOutcome::ChildWait(Err(error));
         }
     }
 
-    let Some(final_rcon) = state.rcon.take() else {
-        state.rcon_zero_anchor = None;
-        state.next_poll = Instant::now() + config.retry_interval;
-        return RunningMonitorOutcome::Continue;
-    };
-    let final_rcon = match final_rcon_player_check(final_rcon, child, control, config, state).await
-    {
-        FinalRconCheck::Zero(client) => client,
-        FinalRconCheck::Veto(rcon) => {
-            let retry_connection = rcon.is_none();
-            state.rcon = rcon;
-            state.rcon_zero_anchor = None;
-            state.next_poll = Instant::now()
-                + if retry_connection {
-                    config.retry_interval
-                } else {
-                    config.poll_interval
-                };
-            return RunningMonitorOutcome::Continue;
+    match confirm_idle_player_state(child, control, config, state).await {
+        IdlePlayerCheck::Confirmed => {}
+        IdlePlayerCheck::Veto => return RunningMonitorOutcome::Continue,
+        IdlePlayerCheck::Shutdown => return RunningMonitorOutcome::Shutdown,
+        IdlePlayerCheck::ChildWait(status) => {
+            return RunningMonitorOutcome::ChildWait(status);
         }
-        FinalRconCheck::Shutdown => return RunningMonitorOutcome::Shutdown(None),
-        FinalRconCheck::ChildWait(status) => {
-            return RunningMonitorOutcome::ChildWait { status, rcon: None };
-        }
-    };
+    }
 
     if control.current_lifecycle().owned_running_cycle() != Some(state.cycle) {
-        state.rcon = Some(final_rcon);
         return RunningMonitorOutcome::Continue;
     }
     if control.shutdown_pending() {
-        return RunningMonitorOutcome::Shutdown(Some(final_rcon));
+        return RunningMonitorOutcome::Shutdown;
     }
     match child.try_wait() {
         Ok(Some(status)) => {
-            return RunningMonitorOutcome::ChildWait {
-                status: Ok(status),
-                rcon: Some(final_rcon),
-            };
+            return RunningMonitorOutcome::ChildWait(Ok(status));
         }
         Ok(None) => {}
         Err(error) => {
-            return RunningMonitorOutcome::ChildWait {
-                status: Err(error),
-                rcon: Some(final_rcon),
-            };
+            return RunningMonitorOutcome::ChildWait(Err(error));
         }
     }
 
     let idle_for = Instant::now().saturating_duration_since(anchor);
     control.begin_idle_stop(state.cycle);
-    log::info!(
-        "Server proxy sessions and RCON player count have been idle for {idle_for:?}; stopping it"
-    );
+    if config.rcon.is_some() {
+        log::info!(
+            "Server proxy sessions and RCON player count have been idle for {idle_for:?}; stopping it"
+        );
+    } else {
+        log::info!("Server proxy sessions have been idle for {idle_for:?}; stopping it");
+    }
     drop(exclusive);
-    RunningMonitorOutcome::Committed(final_rcon)
+    RunningMonitorOutcome::Committed
 }
 
 async fn advance_running_monitor(
-    child: &mut Child,
+    child: &mut OwnedProcess,
     control: &mut SupervisorControl,
     config: &SupervisorConfig,
     backend_use: &BackendUseCoordinator,
@@ -1567,57 +1666,48 @@ async fn advance_running_monitor(
 ) -> RunningMonitorOutcome {
     let activity_changed = backend_use.activity_notified();
     tokio::pin!(activity_changed);
-    let effective_anchor = effective_idle_anchor(
-        backend_use.activity_snapshot(),
-        state.cycle,
-        state.rcon_zero_anchor,
-    );
+    let effective_anchor = state.effective_idle_anchor(backend_use.activity_snapshot());
     if let Some(anchor) = effective_anchor
         && Instant::now() >= anchor + config.idle_timeout
     {
         return attempt_expired_idle_stop(child, control, config, backend_use, state, anchor).await;
     }
 
-    let next_poll = state.next_poll;
+    let next_poll = match &state.player_inspection {
+        PlayerInspection::ProxyOnly => None,
+        PlayerInspection::ConfiguredRcon { next_poll, .. } => Some(*next_poll),
+    };
     let stable_at = state.stable_at;
     let stability_pending = state.stability_pending;
     tokio::select! {
         biased;
 
-        _ = &mut control.shutdown => RunningMonitorOutcome::Shutdown(state.rcon.take()),
+        _ = &mut control.shutdown => RunningMonitorOutcome::Shutdown,
         request = control.wake_requests.recv() => {
             if request.is_none() {
-                RunningMonitorOutcome::Shutdown(state.rcon.take())
+                RunningMonitorOutcome::Shutdown
             } else {
                 log::debug!("Ignoring start request because the server is already running");
                 RunningMonitorOutcome::Continue
             }
         }
-        status = child.wait() => RunningMonitorOutcome::ChildWait {
-            status,
-            rcon: state.rcon.take(),
-        },
+        status = child.wait() => RunningMonitorOutcome::ChildWait(status),
         () = sleep_until(stable_at), if stability_pending => {
             match complete_stability_window(child, control, &mut state.stability_pending) {
-                Ok(Some(status)) => RunningMonitorOutcome::ChildWait {
-                    status: Ok(status),
-                    rcon: state.rcon.take(),
-                },
+                Ok(Some(status)) => RunningMonitorOutcome::ChildWait(Ok(status)),
                 Ok(None) => RunningMonitorOutcome::Continue,
-                Err(error) => RunningMonitorOutcome::ChildWait {
-                    status: Err(error),
-                    rcon: state.rcon.take(),
-                },
+                Err(error) => RunningMonitorOutcome::ChildWait(Err(error)),
             }
         }
         () = &mut activity_changed => RunningMonitorOutcome::Continue,
-        () = sleep_until(next_poll) => {
-            poll_player_presence(
-                &mut state.rcon,
-                &mut state.rcon_zero_anchor,
-                &mut state.next_poll,
-                config,
-            ).await;
+        () = async {
+            if let Some(next_poll) = next_poll {
+                sleep_until(next_poll).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            poll_player_presence(&mut state.player_inspection, config).await;
             RunningMonitorOutcome::Continue
         }
         () = async {
@@ -1631,37 +1721,33 @@ async fn advance_running_monitor(
 }
 
 async fn monitor_running_server(
-    mut child: Child,
-    initial_rcon: RconClient,
+    mut child: OwnedProcess,
+    player_inspection: PlayerInspection,
     control: &mut SupervisorControl,
     config: &SupervisorConfig,
     backend_use: &BackendUseCoordinator,
     cycle: BackendCycle,
 ) -> Result<CycleOutcome> {
-    let mut state = RunningMonitorState::new(cycle, initial_rcon, control.current_lifecycle());
+    let mut state = RunningMonitorState::new(cycle, player_inspection, control.current_lifecycle());
 
     loop {
         match advance_running_monitor(&mut child, control, config, backend_use, &mut state).await {
             RunningMonitorOutcome::Continue => {}
-            RunningMonitorOutcome::Committed(rcon) => {
-                return stop_committed_idle_server(
-                    child,
-                    Some(rcon),
-                    control,
-                    config.shutdown_timeout,
-                )
-                .await;
+            RunningMonitorOutcome::Committed => {
+                drop(state);
+                return stop_committed_idle_server(child, control, config).await;
             }
-            RunningMonitorOutcome::Shutdown(rcon) => {
-                return stop_for_shutdown(child, rcon, control, config.shutdown_timeout).await;
+            RunningMonitorOutcome::Shutdown => {
+                drop(state);
+                return stop_for_shutdown(child, control, config).await;
             }
-            RunningMonitorOutcome::ChildWait { status, rcon } => {
+            RunningMonitorOutcome::ChildWait(status) => {
+                drop(state);
                 return process_wait_outcome(
                     status,
                     child,
-                    rcon,
                     control,
-                    config.shutdown_timeout,
+                    config,
                     FailureCategory::ExitedUnexpectedly,
                 )
                 .await;
@@ -1670,23 +1756,30 @@ async fn monitor_running_server(
     }
 }
 
-async fn poll_player_presence(
-    rcon: &mut Option<RconClient>,
-    rcon_zero_anchor: &mut Option<Instant>,
-    next_poll: &mut Instant,
-    config: &SupervisorConfig,
-) {
-    let Some(client) = rcon.as_mut() else {
-        *rcon_zero_anchor = None;
+async fn poll_player_presence(player_inspection: &mut PlayerInspection, config: &SupervisorConfig) {
+    let PlayerInspection::ConfiguredRcon {
+        client,
+        next_poll,
+        zero_anchor,
+    } = player_inspection
+    else {
+        return;
+    };
+    let rcon_config = config
+        .rcon
+        .as_ref()
+        .expect("configured RCON player state requires RCON configuration");
+    let Some(rcon_client) = client.as_mut() else {
+        *zero_anchor = None;
         match timeout(
             config.command_timeout,
-            RconClient::connect(&config.rcon_address, &config.rcon_password),
+            RconClient::connect(&rcon_config.endpoint, &rcon_config.password),
         )
         .await
         {
-            Ok(Ok(client)) => {
+            Ok(Ok(connected)) => {
                 log::info!("Reconnected to RCON");
-                *rcon = Some(client);
+                *client = Some(connected);
                 *next_poll = Instant::now();
             }
             Ok(Err(error)) => {
@@ -1701,19 +1794,19 @@ async fn poll_player_presence(
         return;
     };
 
-    let response = match timeout(config.command_timeout, client.command("list")).await {
+    let response = match timeout(config.command_timeout, rcon_client.command("list")).await {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
             log::warn!("RCON player poll failed; idle shutdown is suspended: {error:#}");
-            *rcon = None;
-            *rcon_zero_anchor = None;
+            *client = None;
+            *zero_anchor = None;
             *next_poll = Instant::now() + config.retry_interval;
             return;
         }
         Err(_) => {
             log::warn!("RCON player poll timed out; idle shutdown is suspended");
-            *rcon = None;
-            *rcon_zero_anchor = None;
+            *client = None;
+            *zero_anchor = None;
             *next_poll = Instant::now() + config.retry_interval;
             return;
         }
@@ -1721,15 +1814,15 @@ async fn poll_player_presence(
 
     match observed_player_count(&response) {
         Some(0) => {
-            let started = *rcon_zero_anchor.get_or_insert_with(Instant::now);
+            let started = *zero_anchor.get_or_insert_with(Instant::now);
             let idle_for = Instant::now().saturating_duration_since(started);
             log::debug!("RCON has continuously reported zero players for {idle_for:?}");
         }
         Some(player_count) => {
-            *rcon_zero_anchor = None;
+            *zero_anchor = None;
             log::debug!("Server has {player_count} online player(s)");
         }
-        None => *rcon_zero_anchor = None,
+        None => *zero_anchor = None,
     }
     *next_poll = Instant::now() + config.poll_interval;
 }
@@ -1749,27 +1842,25 @@ fn reaped_failure(
 
 async fn process_wait_outcome(
     status: std::io::Result<ExitStatus>,
-    child: Child,
-    rcon: Option<RconClient>,
+    child: OwnedProcess,
     control: &mut SupervisorControl,
-    shutdown_timeout: Duration,
+    config: &SupervisorConfig,
     failure: FailureCategory,
 ) -> Result<CycleOutcome> {
     match status {
         Ok(status) => Ok(reaped_failure(control, failure, status)),
-        Err(error) => reap_after_wait_error(child, rcon, control, shutdown_timeout, error).await,
+        Err(error) => reap_after_wait_error(child, control, config, error).await,
     }
 }
 
 async fn reap_after_wait_error(
-    mut child: Child,
-    mut rcon: Option<RconClient>,
+    mut child: OwnedProcess,
     control: &mut SupervisorControl,
-    shutdown_timeout: Duration,
+    config: &SupervisorConfig,
     wait_error: std::io::Error,
 ) -> Result<CycleOutcome> {
     control.set_phase(ServerPhase::Stopping);
-    stop_and_reap(&mut child, rcon.as_mut(), shutdown_timeout)
+    stop_and_reap(&mut child, config)
         .await
         .with_context(|| format!("cleanup failed after server process wait error: {wait_error}"))?;
     control.set_phase(ServerPhase::Stopped);
@@ -1777,25 +1868,23 @@ async fn reap_after_wait_error(
 }
 
 async fn stop_for_shutdown(
-    mut child: Child,
-    mut rcon: Option<RconClient>,
+    mut child: OwnedProcess,
     control: &mut SupervisorControl,
-    shutdown_timeout: Duration,
+    config: &SupervisorConfig,
 ) -> Result<CycleOutcome> {
     control.set_phase(ServerPhase::Stopping);
-    stop_and_reap(&mut child, rcon.as_mut(), shutdown_timeout).await?;
+    stop_and_reap(&mut child, config).await?;
     Ok(CycleOutcome::Shutdown)
 }
 
 async fn stop_failed_server(
-    mut child: Child,
-    mut rcon: Option<RconClient>,
+    mut child: OwnedProcess,
     control: &mut SupervisorControl,
-    shutdown_timeout: Duration,
+    config: &SupervisorConfig,
     failure: FailureCategory,
 ) -> Result<CycleOutcome> {
     let retry_delay = control.begin_failure_cleanup(failure);
-    let cleanup = stop_and_reap(&mut child, rcon.as_mut(), shutdown_timeout);
+    let cleanup = stop_and_reap(&mut child, config);
     finish_failed_cleanup(cleanup, control, retry_delay).await
 }
 
@@ -1849,16 +1938,15 @@ where
 }
 
 async fn stop_committed_idle_server(
-    mut child: Child,
-    mut rcon: Option<RconClient>,
+    mut child: OwnedProcess,
     control: &mut SupervisorControl,
-    shutdown_timeout: Duration,
+    config: &SupervisorConfig,
 ) -> Result<CycleOutcome> {
     let stopping = control.current_lifecycle();
     assert_eq!(stopping.phase, ServerPhase::Stopping);
     assert_eq!(stopping.failure, None);
     assert_eq!(stopping.failure_streak, 0);
-    let cleanup = stop_and_reap(&mut child, rcon.as_mut(), shutdown_timeout);
+    let cleanup = stop_and_reap(&mut child, config);
     tokio::pin!(cleanup);
 
     let mut restart = false;
@@ -1911,18 +1999,22 @@ async fn stop_committed_idle_server(
     })
 }
 
-async fn stop_and_reap(
-    child: &mut Child,
-    rcon: Option<&mut RconClient>,
-    shutdown_timeout: Duration,
-) -> Result<()> {
+async fn stop_and_reap(child: &mut OwnedProcess, config: &SupervisorConfig) -> Result<()> {
     let mut wait_error = None;
-    let graceful_stop_sent = if let Some(rcon) = rcon {
-        match timeout(shutdown_timeout.min(Duration::from_secs(5)), rcon.stop()).await {
+    let command_deadline = Instant::now() + config.command_timeout;
+    let graceful_stop_sent = if let Some(rcon_config) = &config.rcon {
+        let rcon_stop = async {
+            let mut client =
+                RconClient::connect(&rcon_config.endpoint, &rcon_config.password).await?;
+            client.stop().await
+        };
+        match timeout_at(command_deadline, rcon_stop).await {
             Ok(Ok(())) => true,
             Ok(Err(error)) => {
-                log::warn!("Failed to send the RCON stop command: {error:#}");
-                false
+                log::warn!(
+                    "Failed to send the RCON stop command; trying the owned console: {error:#}"
+                );
+                send_console_stop_before(child, command_deadline).await
             }
             Err(_) => {
                 log::warn!("Sending the RCON stop command timed out");
@@ -1930,11 +2022,11 @@ async fn stop_and_reap(
             }
         }
     } else {
-        false
+        send_console_stop_before(child, command_deadline).await
     };
 
     if graceful_stop_sent {
-        match timeout(shutdown_timeout, child.wait()).await {
+        match timeout(config.shutdown_timeout, child.wait()).await {
             Ok(Ok(status)) => {
                 log_process_exit(status);
                 return Ok(());
@@ -1943,7 +2035,10 @@ async fn stop_and_reap(
                 log::warn!("Failed while waiting for server shutdown: {error}");
                 wait_error = Some(error);
             }
-            Err(_) => log::warn!("Server did not exit within {shutdown_timeout:?}; terminating it"),
+            Err(_) => log::warn!(
+                "Server did not exit within {:?}; terminating it",
+                config.shutdown_timeout
+            ),
         }
     }
 
@@ -1961,6 +2056,20 @@ async fn stop_and_reap(
         return Err(error).context("failed while waiting for graceful server shutdown");
     }
     Ok(())
+}
+
+async fn send_console_stop_before(child: &mut OwnedProcess, deadline: Instant) -> bool {
+    match timeout_at(deadline, child.send_console_stop()).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            log::warn!("Failed to send the console stop command: {error:#}");
+            false
+        }
+        Err(_) => {
+            log::warn!("Sending the console stop command timed out");
+            false
+        }
+    }
 }
 
 pub fn parse_player_count(response: &str) -> Result<u32> {
@@ -2101,90 +2210,92 @@ mod tests {
         let address = listener.local_addr().unwrap().to_string();
         let (events, event_receiver) = mpsc::unbounded_channel();
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener
-                .accept()
-                .await
-                .expect("test RCON client should connect");
-            let auth = read_test_rcon_packet(&mut stream).await;
-            assert_eq!(auth.kind, TEST_AUTH);
-            assert_eq!(auth.body, b"secret");
-            write_test_rcon_packet(&mut stream, auth.id, TEST_AUTH_RESPONSE, b"").await;
-
             let mut replies = std::collections::VecDeque::from(replies);
             let mut list_index = 0;
-            loop {
-                let command = match try_read_test_rcon_packet(&mut stream).await {
-                    Ok(command) => command,
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::UnexpectedEof
-                                | std::io::ErrorKind::ConnectionReset
-                                | std::io::ErrorKind::BrokenPipe
-                        ) =>
-                    {
-                        let _ = events.send(TestRconEvent::Closed);
-                        break;
-                    }
-                    Err(error) => panic!("test RCON packet read failed: {error}"),
-                };
-                assert_eq!(command.kind, TEST_EXEC_COMMAND);
-                if command.body == b"stop" {
-                    events.send(TestRconEvent::Stop).unwrap();
-                    break;
-                }
-                assert_eq!(command.body, b"list");
-                let end_marker = read_test_rcon_packet(&mut stream).await;
-                assert_eq!(end_marker.kind, TEST_EXEC_COMMAND);
-                assert!(end_marker.body.is_empty());
-                list_index += 1;
-                let reply = replies
-                    .pop_front()
-                    .expect("test RCON server received an unexpected list command");
-                match reply {
-                    TestListReply::Body(body) => {
-                        write_test_rcon_packet(
-                            &mut stream,
-                            command.id,
-                            TEST_RESPONSE_VALUE,
-                            body.as_bytes(),
-                        )
-                        .await;
-                        write_test_rcon_packet(
-                            &mut stream,
-                            end_marker.id,
-                            TEST_RESPONSE_VALUE,
-                            b"",
-                        )
-                        .await;
-                        events.send(TestRconEvent::List(list_index)).unwrap();
-                    }
-                    TestListReply::Close => {
-                        events.send(TestRconEvent::List(list_index)).unwrap();
-                        stream.set_zero_linger().unwrap();
-                        drop(stream);
-                        let _ = events.send(TestRconEvent::Closed);
-                        break;
-                    }
-                    TestListReply::Block { started } => {
-                        events.send(TestRconEvent::List(list_index)).unwrap();
-                        started.send(()).unwrap();
-                        let mut byte = [0];
-                        match stream.read(&mut byte).await {
-                            Ok(0) => {}
-                            Err(error)
-                                if matches!(
-                                    error.kind(),
-                                    std::io::ErrorKind::ConnectionReset
-                                        | std::io::ErrorKind::BrokenPipe
-                                ) => {}
-                            Ok(received) => panic!(
-                                "canceled final RCON client was reused and sent {received} byte(s)"
-                            ),
-                            Err(error) => panic!("blocked RCON client read failed: {error}"),
+            'connections: loop {
+                let (mut stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("test RCON client should connect");
+                let auth = read_test_rcon_packet(&mut stream).await;
+                assert_eq!(auth.kind, TEST_AUTH);
+                assert_eq!(auth.body, b"secret");
+                write_test_rcon_packet(&mut stream, auth.id, TEST_AUTH_RESPONSE, b"").await;
+
+                loop {
+                    let command = match try_read_test_rcon_packet(&mut stream).await {
+                        Ok(command) => command,
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::UnexpectedEof
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::BrokenPipe
+                            ) =>
+                        {
+                            let _ = events.send(TestRconEvent::Closed);
+                            continue 'connections;
                         }
-                        let _ = events.send(TestRconEvent::Closed);
-                        break;
+                        Err(error) => panic!("test RCON packet read failed: {error}"),
+                    };
+                    assert_eq!(command.kind, TEST_EXEC_COMMAND);
+                    if command.body == b"stop" {
+                        events.send(TestRconEvent::Stop).unwrap();
+                        break 'connections;
+                    }
+                    assert_eq!(command.body, b"list");
+                    let end_marker = read_test_rcon_packet(&mut stream).await;
+                    assert_eq!(end_marker.kind, TEST_EXEC_COMMAND);
+                    assert!(end_marker.body.is_empty());
+                    list_index += 1;
+                    let reply = replies
+                        .pop_front()
+                        .expect("test RCON server received an unexpected list command");
+                    match reply {
+                        TestListReply::Body(body) => {
+                            write_test_rcon_packet(
+                                &mut stream,
+                                command.id,
+                                TEST_RESPONSE_VALUE,
+                                body.as_bytes(),
+                            )
+                            .await;
+                            write_test_rcon_packet(
+                                &mut stream,
+                                end_marker.id,
+                                TEST_RESPONSE_VALUE,
+                                b"",
+                            )
+                            .await;
+                            events.send(TestRconEvent::List(list_index)).unwrap();
+                        }
+                        TestListReply::Close => {
+                            events.send(TestRconEvent::List(list_index)).unwrap();
+                            stream.set_zero_linger().unwrap();
+                            drop(stream);
+                            let _ = events.send(TestRconEvent::Closed);
+                            continue 'connections;
+                        }
+                        TestListReply::Block { started } => {
+                            events.send(TestRconEvent::List(list_index)).unwrap();
+                            started.send(()).unwrap();
+                            let mut byte = [0];
+                            match stream.read(&mut byte).await {
+                                Ok(0) => {}
+                                Err(error)
+                                    if matches!(
+                                        error.kind(),
+                                        std::io::ErrorKind::ConnectionReset
+                                            | std::io::ErrorKind::BrokenPipe
+                                    ) => {}
+                                Ok(received) => panic!(
+                                    "canceled final RCON client was reused and sent {received} byte(s)"
+                                ),
+                                Err(error) => panic!("blocked RCON client read failed: {error}"),
+                            }
+                            let _ = events.send(TestRconEvent::Closed);
+                            continue 'connections;
+                        }
                     }
                 }
             }
@@ -2335,8 +2446,10 @@ mod tests {
                 "supervisor::tests::server_process_fixture".to_owned(),
                 "--quiet".to_owned(),
             ],
-            rcon_address,
-            rcon_password: "secret".to_owned(),
+            rcon: Some(RconConfig {
+                endpoint: rcon_address,
+                password: "secret".to_owned(),
+            }),
             poll_interval: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(30),
             startup_timeout: Duration::from_secs(30),
@@ -2344,6 +2457,13 @@ mod tests {
             command_timeout: Duration::from_secs(1),
             shutdown_timeout: Duration::from_millis(250),
         }
+    }
+
+    fn no_rcon_config() -> SupervisorConfig {
+        let mut config = test_config(String::new());
+        config.rcon = None;
+        config.arguments[2] = "supervisor::tests::console_stop_fixture".to_owned();
+        config
     }
 
     fn player_count_reply(player_count: u32) -> TestListReply {
@@ -2356,8 +2476,10 @@ mod tests {
         SupervisorConfig {
             command: "mcservernap-test-command-that-does-not-exist".to_owned(),
             arguments: Vec::new(),
-            rcon_address: "127.0.0.1:9".to_owned(),
-            rcon_password: "secret".to_owned(),
+            rcon: Some(RconConfig {
+                endpoint: "127.0.0.1:9".to_owned(),
+                password: "secret".to_owned(),
+            }),
             poll_interval: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(30),
             startup_timeout: Duration::from_secs(30),
@@ -2371,7 +2493,7 @@ mod tests {
         rcon: RconProbeClassification,
         backend: BackendProbeClassification,
     ) -> ReconciliationResult {
-        ReconciliationResult {
+        ReconciliationResult::ConfiguredRcon {
             rcon: rcon::RconProbeResult {
                 classification: rcon,
                 detail: None,
@@ -2472,6 +2594,10 @@ mod tests {
         Arc::new(BackendUseCoordinator::new())
     }
 
+    fn test_backend_endpoint() -> BackendEndpoint {
+        BackendEndpoint::network(Arc::from("127.0.0.1"), 9, Duration::from_secs(1))
+    }
+
     fn running_backend_use(lifecycle: LifecycleState) -> Arc<BackendUseCoordinator> {
         let backend_use = test_backend_use();
         let cycle = lifecycle
@@ -2481,15 +2607,20 @@ mod tests {
         backend_use
     }
 
-    async fn assert_final_rcon_veto(reply: TestListReply, retained_for_shutdown: bool) {
+    async fn connected_player_inspection(rcon_address: &str) -> PlayerInspection {
+        PlayerInspection::ConfiguredRcon {
+            client: Some(RconClient::connect(rcon_address, "secret").await.unwrap()),
+            next_poll: Instant::now(),
+            zero_anchor: None,
+        }
+    }
+
+    async fn assert_final_rcon_veto(reply: TestListReply) {
         let (rcon_address, mut events, rcon_server) =
             spawn_scripted_list_rcon_server(vec![player_count_reply(0), reply]).await;
         let mut config = test_config(rcon_address.clone());
         config.idle_timeout = Duration::from_secs(1);
         config.poll_interval = Duration::from_secs(100);
-        let rcon = RconClient::connect(&rcon_address, "secret")
-            .await
-            .expect("test RCON client should authenticate");
         let child = process::launch(&config.command, &config.arguments)
             .expect("test server process should launch");
         let (wake_sender, wake_receiver) = mpsc::channel(1);
@@ -2503,11 +2634,12 @@ mod tests {
         };
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
+        let player_inspection = connected_player_inspection(&rcon_address).await;
         let monitor_backend_use = Arc::clone(&backend_use);
         let monitor = tokio::spawn(async move {
             monitor_running_server(
                 child,
-                rcon,
+                player_inspection,
                 &mut control,
                 &config,
                 &monitor_backend_use,
@@ -2523,6 +2655,7 @@ mod tests {
         assert_eq!(lifecycle.borrow().phase, ServerPhase::Running);
         drop(observation);
 
+        tokio::time::resume();
         shutdown_sender
             .send(())
             .expect("running monitor should still await shutdown");
@@ -2532,11 +2665,8 @@ mod tests {
             .expect("shutdown after a final RCON veto should succeed");
         assert_eq!(outcome, CycleOutcome::Shutdown);
         drop(wake_sender);
-        if retained_for_shutdown {
-            assert_eq!(events.recv().await, Some(TestRconEvent::Stop));
-        } else {
-            assert_eq!(events.recv().await, Some(TestRconEvent::Closed));
-        }
+        assert_eq!(events.recv().await, Some(TestRconEvent::Closed));
+        assert_eq!(events.recv().await, Some(TestRconEvent::Stop));
         rcon_server
             .await
             .expect("test RCON server should not panic");
@@ -2553,7 +2683,7 @@ mod tests {
         let (lifecycle_sender, lifecycle) = watch::channel(LifecycleState::reconciling());
         let (rcon_address, backend) = refused_endpoints();
         let mut config = launch_failure_config();
-        config.rcon_address = rcon_address;
+        config.rcon.as_mut().unwrap().endpoint = rcon_address;
         let supervisor = tokio::spawn(run(
             wake_receiver,
             shutdown_receiver,
@@ -2641,6 +2771,15 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "launched as a console-controlled supervisor test server process"]
+    fn console_stop_fixture() {
+        let mut command = [0; 5];
+        std::io::Read::read_exact(&mut std::io::stdin(), &mut command)
+            .expect("test process should receive a console stop command");
+        assert_eq!(&command, b"stop\n");
+    }
+
+    #[test]
     #[ignore = "launched as a short-lived supervisor test server process"]
     fn rapid_exit_fixture() {
         std::thread::sleep(Duration::from_millis(500));
@@ -2722,6 +2861,35 @@ mod tests {
         for (rcon, backend, expected) in cases {
             assert_eq!(
                 test_reconciliation(rcon, backend).classification(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn backend_only_reconciliation_classification_is_exact() {
+        let cases = [
+            (
+                BackendProbeClassification::Connected,
+                ReconciliationClassification::FullyReady,
+            ),
+            (
+                BackendProbeClassification::Refused,
+                ReconciliationClassification::Clean,
+            ),
+            (
+                BackendProbeClassification::Inconclusive,
+                ReconciliationClassification::Inconclusive,
+            ),
+        ];
+
+        for (backend, expected) in cases {
+            assert_eq!(
+                ReconciliationResult::BackendOnly(BackendProbeResult {
+                    classification: backend,
+                    detail: None,
+                })
+                .classification(),
                 expected
             );
         }
@@ -3222,7 +3390,7 @@ mod tests {
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let (lifecycle_sender, mut lifecycle) = watch::channel(LifecycleState::reconciling());
         let mut config = launch_failure_config();
-        config.rcon_address = rcon_address;
+        config.rcon.as_mut().unwrap().endpoint = rcon_address;
         let supervisor = tokio::spawn(run(
             wake_receiver,
             shutdown_receiver,
@@ -3681,9 +3849,15 @@ mod tests {
         };
         control.record_launch_success();
 
-        let outcome = run_server_cycle(child, &mut control, &config, &test_backend_use())
-            .await
-            .expect("pre-readiness exit should be retryable");
+        let outcome = run_server_cycle(
+            child,
+            &mut control,
+            &config,
+            &test_backend_endpoint(),
+            &test_backend_use(),
+        )
+        .await
+        .expect("pre-readiness exit should be retryable");
         assert!(matches!(outcome, CycleOutcome::Failed { .. }));
         let failure = *lifecycle.borrow();
         assert_eq!(failure.phase, ServerPhase::Cooldown);
@@ -3696,6 +3870,219 @@ mod tests {
                 - failure.phase_started_at,
             Duration::from_secs(5)
         );
+    }
+
+    #[tokio::test]
+    async fn no_rcon_backend_readiness_and_shutdown_use_owned_console() {
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_address = backend_listener.local_addr().unwrap();
+        let backend = BackendEndpoint::network(
+            Arc::from("127.0.0.1"),
+            backend_address.port(),
+            Duration::from_secs(1),
+        );
+        let backend_accept = tokio::spawn(async move { backend_listener.accept().await.unwrap() });
+        let config = no_rcon_config();
+        let child = process::launch(&config.command, &config.arguments).unwrap();
+        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let starting = LifecycleState {
+            phase: ServerPhase::Starting,
+            launch_generation: 1,
+            ..LifecycleState::stopped()
+        };
+        let (lifecycle_sender, mut lifecycle) = watch::channel(starting);
+        let backend_use = test_backend_use();
+        let cycle = tokio::spawn(async move {
+            let mut control = SupervisorControl {
+                wake_requests: wake_receiver,
+                shutdown: shutdown_receiver,
+                lifecycle: lifecycle_sender,
+            };
+            run_server_cycle(child, &mut control, &config, &backend, &backend_use).await
+        });
+
+        wait_for_phase(&mut lifecycle, ServerPhase::Running).await;
+        shutdown_sender.send(()).unwrap();
+        assert_eq!(cycle.await.unwrap().unwrap(), CycleOutcome::Shutdown);
+        drop(wake_sender);
+        backend_accept.await.unwrap();
+        assert_eq!(lifecycle.borrow().phase, ServerPhase::Stopping);
+    }
+
+    #[tokio::test]
+    async fn no_rcon_readiness_timeout_cleans_up_and_reaps() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let backend =
+            BackendEndpoint::network(Arc::from("127.0.0.1"), port, Duration::from_millis(10));
+        let mut config = no_rcon_config();
+        config.startup_timeout = Duration::from_millis(50);
+        config.retry_interval = Duration::from_millis(10);
+        config.command_timeout = Duration::from_millis(10);
+        let child = process::launch(&config.command, &config.arguments).unwrap();
+        let (_wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let starting = LifecycleState {
+            phase: ServerPhase::Starting,
+            launch_generation: 1,
+            ..LifecycleState::stopped()
+        };
+        let (lifecycle_sender, lifecycle) = watch::channel(starting);
+        let mut control = SupervisorControl {
+            wake_requests: wake_receiver,
+            shutdown: shutdown_receiver,
+            lifecycle: lifecycle_sender,
+        };
+
+        let outcome = run_server_cycle(child, &mut control, &config, &backend, &test_backend_use())
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CycleOutcome::Failed { .. }));
+        assert_eq!(
+            lifecycle.borrow().failure,
+            Some(FailureCategory::StartupTimedOut)
+        );
+        assert_eq!(lifecycle.borrow().phase, ServerPhase::Cooldown);
+    }
+
+    #[tokio::test]
+    async fn no_rcon_running_child_exit_is_reaped_as_failure() {
+        let mut config = no_rcon_config();
+        config.arguments[2] = "supervisor::tests::rapid_exit_fixture".to_owned();
+        let child = process::launch(&config.command, &config.arguments).unwrap();
+        let (_wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let running = running_lifecycle(0);
+        let (lifecycle_sender, lifecycle) = watch::channel(running);
+        let mut control = SupervisorControl {
+            wake_requests: wake_receiver,
+            shutdown: shutdown_receiver,
+            lifecycle: lifecycle_sender,
+        };
+        let backend_use = running_backend_use(running);
+
+        let outcome = monitor_running_server(
+            child,
+            PlayerInspection::ProxyOnly,
+            &mut control,
+            &config,
+            &backend_use,
+            running.owned_running_cycle().unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, CycleOutcome::Failed { .. }));
+        assert_eq!(
+            lifecycle.borrow().failure,
+            Some(FailureCategory::ExitedUnexpectedly)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_rcon_idle_stop_waits_for_exclusive_and_sends_no_rcon_traffic() {
+        let rcon_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = no_rcon_config();
+        config.idle_timeout = Duration::from_secs(1);
+        let child = process::launch(&config.command, &config.arguments).unwrap();
+        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let running = running_lifecycle(0);
+        let (lifecycle_sender, lifecycle) = watch::channel(running);
+        let mut control = SupervisorControl {
+            wake_requests: wake_receiver,
+            shutdown: shutdown_receiver,
+            lifecycle: lifecycle_sender,
+        };
+        let backend_use = running_backend_use(running);
+        let cycle = running.owned_running_cycle().unwrap();
+        let active_session = backend_use
+            .establish_login_transfer_session(backend_use.acquire_shared(cycle).await)
+            .unwrap();
+        let monitor = tokio::spawn(async move {
+            monitor_running_server(
+                child,
+                PlayerInspection::ProxyOnly,
+                &mut control,
+                &config,
+                &backend_use,
+                cycle,
+            )
+            .await
+        });
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(lifecycle.borrow().phase, ServerPhase::Running);
+        drop(active_session);
+        tokio::time::advance(Duration::from_millis(999)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(lifecycle.borrow().phase, ServerPhase::Running);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(monitor.await.unwrap().unwrap(), CycleOutcome::Stopped);
+        assert_eq!(lifecycle.borrow().phase, ServerPhase::Stopping);
+        let rcon_listener = rcon_listener.into_std().unwrap();
+        assert!(matches!(
+            rcon_listener.accept(),
+            Err(error) if error.kind() == ErrorKind::WouldBlock
+        ));
+        drop(wake_sender);
+    }
+
+    #[tokio::test]
+    async fn rcon_stop_failure_falls_back_to_exact_console_stop() {
+        let mut config = no_rcon_config();
+        let refused_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let refused_address = refused_listener.local_addr().unwrap().to_string();
+        drop(refused_listener);
+        config.rcon = Some(RconConfig {
+            endpoint: refused_address,
+            password: "secret".to_owned(),
+        });
+        let child = process::launch(&config.command, &config.arguments).unwrap();
+        let (_wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let running = running_lifecycle(0);
+        let (lifecycle_sender, _lifecycle) = watch::channel(running);
+        let mut control = SupervisorControl {
+            wake_requests: wake_receiver,
+            shutdown: shutdown_receiver,
+            lifecycle: lifecycle_sender,
+        };
+
+        assert_eq!(
+            stop_for_shutdown(child, &mut control, &config)
+                .await
+                .unwrap(),
+            CycleOutcome::Shutdown
+        );
+    }
+
+    #[tokio::test]
+    async fn console_failure_is_reaped_and_timeout_forces_termination() {
+        let mut failed_config = no_rcon_config();
+        failed_config.arguments[2] = "supervisor::tests::rapid_exit_fixture".to_owned();
+        let mut failed_child =
+            process::launch(&failed_config.command, &failed_config.arguments).unwrap();
+        let failed_pid = failed_child.id().unwrap();
+        wait_for_test_process_exit(failed_pid);
+        assert!(failed_child.send_console_stop().await.is_err());
+        stop_and_reap(&mut failed_child, &failed_config)
+            .await
+            .unwrap();
+        assert!(test_process_has_exited(failed_pid));
+
+        let mut timeout_config = no_rcon_config();
+        timeout_config.arguments[2] = "supervisor::tests::server_process_fixture".to_owned();
+        timeout_config.command_timeout = Duration::ZERO;
+        let mut timeout_child =
+            process::launch(&timeout_config.command, &timeout_config.arguments).unwrap();
+        let timeout_pid = timeout_child.id().unwrap();
+        stop_and_reap(&mut timeout_child, &timeout_config)
+            .await
+            .unwrap();
+        assert!(test_process_has_exited(timeout_pid));
     }
 
     #[tokio::test]
@@ -3718,9 +4105,15 @@ mod tests {
             control.begin_reconciliation();
             control.record_launch_success();
 
-            let outcome = run_server_cycle(child, &mut control, &config, &test_backend_use())
-                .await
-                .expect("unexpected exit should be retryable");
+            let outcome = run_server_cycle(
+                child,
+                &mut control,
+                &config,
+                &test_backend_endpoint(),
+                &test_backend_use(),
+            )
+            .await
+            .expect("unexpected exit should be retryable");
             assert!(matches!(outcome, CycleOutcome::Failed { .. }));
             let failure = *lifecycle.borrow();
             assert_eq!(failure.phase, ServerPhase::Cooldown);
@@ -3752,9 +4145,6 @@ mod tests {
             spawn_blocked_player_count_rcon_server().await;
         let mut config = signaled_exit_config(rcon_address.clone(), exit_signal_address);
         config.command_timeout = Duration::from_secs(120);
-        let rcon = RconClient::connect(&rcon_address, "secret")
-            .await
-            .expect("test RCON client should authenticate");
         let child = process::launch(&config.command, &config.arguments)
             .expect("signaled test server should launch");
         let process_id = child
@@ -3775,8 +4165,17 @@ mod tests {
         };
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
+        let player_inspection = connected_player_inspection(&rcon_address).await;
         let monitor = tokio::spawn(async move {
-            monitor_running_server(child, rcon, &mut control, &config, &backend_use, cycle).await
+            monitor_running_server(
+                child,
+                player_inspection,
+                &mut control,
+                &config,
+                &backend_use,
+                cycle,
+            )
+            .await
         });
 
         poll_started
@@ -3833,9 +4232,6 @@ mod tests {
     async fn stable_running_resets_the_streak_before_an_unexpected_exit() {
         let (rcon_address, first_poll, rcon_server) = spawn_player_count_rcon_server(1).await;
         let config = stable_exit_config(rcon_address.clone());
-        let rcon = RconClient::connect(&rcon_address, "secret")
-            .await
-            .expect("test RCON client should authenticate");
         let child = process::launch(&config.command, &config.arguments)
             .expect("stable-window test server should launch");
         let (_wake_sender, wake_receiver) = mpsc::channel(1);
@@ -3849,8 +4245,17 @@ mod tests {
         };
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
+        let player_inspection = connected_player_inspection(&rcon_address).await;
         let monitor = tokio::spawn(async move {
-            monitor_running_server(child, rcon, &mut control, &config, &backend_use, cycle).await
+            monitor_running_server(
+                child,
+                player_inspection,
+                &mut control,
+                &config,
+                &backend_use,
+                cycle,
+            )
+            .await
         });
 
         first_poll
@@ -3882,6 +4287,92 @@ mod tests {
             .expect("test RCON server should not panic");
     }
 
+    #[tokio::test]
+    async fn configured_readiness_player_and_stop_use_separate_rcon_sessions() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rcon_address = listener.local_addr().unwrap().to_string();
+        let (events, mut event_receiver) = mpsc::unbounded_channel();
+        let rcon_server = tokio::spawn(async move {
+            for session in 1..=3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let auth = read_test_rcon_packet(&mut stream).await;
+                assert_eq!(auth.kind, TEST_AUTH);
+                assert_eq!(auth.body, b"secret");
+                write_test_rcon_packet(&mut stream, auth.id, TEST_AUTH_RESPONSE, b"").await;
+                events.send(session).unwrap();
+
+                match session {
+                    1 => {
+                        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+                    }
+                    2 => {
+                        for _ in 0..2 {
+                            let command = read_test_rcon_packet(&mut stream).await;
+                            assert_eq!(command.body, b"list");
+                            let marker = read_test_rcon_packet(&mut stream).await;
+                            assert!(marker.body.is_empty());
+                            write_test_rcon_packet(
+                                &mut stream,
+                                command.id,
+                                TEST_RESPONSE_VALUE,
+                                b"There are 0 of a max of 20 players online:",
+                            )
+                            .await;
+                            write_test_rcon_packet(
+                                &mut stream,
+                                marker.id,
+                                TEST_RESPONSE_VALUE,
+                                b"",
+                            )
+                            .await;
+                        }
+                        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+                    }
+                    3 => {
+                        let stop = read_test_rcon_packet(&mut stream).await;
+                        assert_eq!(stop.body, b"stop");
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        });
+
+        let mut config = test_config(rcon_address);
+        config.idle_timeout = Duration::from_millis(30);
+        config.poll_interval = Duration::from_secs(1);
+        let child = process::launch(&config.command, &config.arguments).unwrap();
+        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let starting = LifecycleState {
+            phase: ServerPhase::Starting,
+            launch_generation: 1,
+            ..LifecycleState::stopped()
+        };
+        let (lifecycle_sender, lifecycle) = watch::channel(starting);
+        let mut control = SupervisorControl {
+            wake_requests: wake_receiver,
+            shutdown: shutdown_receiver,
+            lifecycle: lifecycle_sender,
+        };
+
+        let outcome = run_server_cycle(
+            child,
+            &mut control,
+            &config,
+            &test_backend_endpoint(),
+            &test_backend_use(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, CycleOutcome::Stopped);
+        assert_eq!(lifecycle.borrow().phase, ServerPhase::Stopping);
+        assert_eq!(event_receiver.recv().await, Some(1));
+        assert_eq!(event_receiver.recv().await, Some(2));
+        assert_eq!(event_receiver.recv().await, Some(3));
+        drop(wake_sender);
+        rcon_server.await.unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn idle_stop_waits_for_exclusive_and_runs_a_distinct_final_rcon_check() {
         let (rcon_address, mut events, rcon_server) =
@@ -3890,9 +4381,6 @@ mod tests {
         let mut config = test_config(rcon_address.clone());
         config.idle_timeout = Duration::from_secs(10);
         config.poll_interval = Duration::from_secs(100);
-        let rcon = RconClient::connect(&rcon_address, "secret")
-            .await
-            .expect("test RCON client should authenticate");
         let child = process::launch(&config.command, &config.arguments)
             .expect("test server process should launch");
         let (wake_sender, wake_receiver) = mpsc::channel(1);
@@ -3907,11 +4395,12 @@ mod tests {
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
         let replay_lease = backend_use.acquire_shared(cycle).await;
+        let player_inspection = connected_player_inspection(&rcon_address).await;
         let monitor_backend_use = Arc::clone(&backend_use);
         let monitor = tokio::spawn(async move {
             monitor_running_server(
                 child,
-                rcon,
+                player_inspection,
                 &mut control,
                 &config,
                 &monitor_backend_use,
@@ -3940,6 +4429,7 @@ mod tests {
         assert_eq!(events.recv().await, Some(TestRconEvent::List(2)));
         wait_for_phase(&mut lifecycle, ServerPhase::Stopping).await;
         let stopping_started_at = lifecycle.borrow().phase_started_at;
+        assert_eq!(events.recv().await, Some(TestRconEvent::Closed));
         assert_eq!(events.recv().await, Some(TestRconEvent::Stop));
         let outcome = monitor
             .await
@@ -3955,10 +4445,18 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn positive_malformed_and_failed_final_rcon_checks_veto_idle_stop() {
-        assert_final_rcon_veto(player_count_reply(2), true).await;
-        assert_final_rcon_veto(TestListReply::Body("unexpected output".to_owned()), true).await;
-        assert_final_rcon_veto(TestListReply::Close, false).await;
+    async fn positive_final_rcon_check_vetoes_idle_stop() {
+        assert_final_rcon_veto(player_count_reply(2)).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn malformed_final_rcon_check_vetoes_idle_stop() {
+        assert_final_rcon_veto(TestListReply::Body("unexpected output".to_owned())).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_final_rcon_check_vetoes_idle_stop() {
+        assert_final_rcon_veto(TestListReply::Close).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -3975,7 +4473,6 @@ mod tests {
         config.idle_timeout = Duration::from_secs(1);
         config.poll_interval = Duration::from_secs(100);
         config.command_timeout = Duration::from_secs(10);
-        let rcon = RconClient::connect(&rcon_address, "secret").await.unwrap();
         let child = process::launch(&config.command, &config.arguments).unwrap();
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
@@ -3988,11 +4485,12 @@ mod tests {
         };
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
+        let player_inspection = connected_player_inspection(&rcon_address).await;
         let monitor_backend_use = Arc::clone(&backend_use);
         let monitor = tokio::spawn(async move {
             monitor_running_server(
                 child,
-                rcon,
+                player_inspection,
                 &mut control,
                 &config,
                 &monitor_backend_use,
@@ -4014,6 +4512,7 @@ mod tests {
         shutdown_sender.send(()).unwrap();
         let outcome = monitor.await.unwrap().unwrap();
         assert_eq!(outcome, CycleOutcome::Shutdown);
+        assert_eq!(events.recv().await, Some(TestRconEvent::Stop));
         drop(wake_sender);
         rcon_server.await.unwrap();
         assert!(matches!(
@@ -4028,7 +4527,6 @@ mod tests {
             spawn_scripted_list_rcon_server(Vec::new()).await;
         let mut config = test_config(rcon_address.clone());
         config.idle_timeout = Duration::from_secs(1);
-        let rcon = RconClient::connect(&rcon_address, "secret").await.unwrap();
         let mut child = process::launch(&config.command, &config.arguments).unwrap();
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
@@ -4041,10 +4539,13 @@ mod tests {
         };
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
-        let mut state = RunningMonitorState::new(cycle, rcon, running);
-        drop(state.rcon.take());
-        state.rcon_zero_anchor = Some(running.phase_started_at);
-        assert_eq!(events.recv().await, Some(TestRconEvent::Closed));
+        let mut state =
+            RunningMonitorState::new(cycle, PlayerInspection::from_config(&config), running);
+        let PlayerInspection::ConfiguredRcon { zero_anchor, .. } = &mut state.player_inspection
+        else {
+            panic!("test configuration should enable RCON player inspection");
+        };
+        *zero_anchor = Some(running.phase_started_at);
 
         tokio::time::advance(config.idle_timeout).await;
         let outcome = attempt_expired_idle_stop(
@@ -4058,12 +4559,17 @@ mod tests {
         .await;
         assert!(matches!(outcome, RunningMonitorOutcome::Continue));
         assert_eq!(lifecycle.borrow().phase, ServerPhase::Running);
-        assert_eq!(state.rcon_zero_anchor, None);
+        let PlayerInspection::ConfiguredRcon { zero_anchor, .. } = &state.player_inspection else {
+            panic!("test configuration should enable RCON player inspection");
+        };
+        assert_eq!(*zero_anchor, None);
 
-        let outcome = stop_for_shutdown(child, None, &mut control, config.shutdown_timeout)
+        tokio::time::resume();
+        let outcome = stop_for_shutdown(child, &mut control, &config)
             .await
             .unwrap();
         assert_eq!(outcome, CycleOutcome::Shutdown);
+        assert_eq!(events.recv().await, Some(TestRconEvent::Stop));
         drop(wake_sender);
         rcon_server.await.unwrap();
     }
@@ -4082,7 +4588,6 @@ mod tests {
         config.idle_timeout = Duration::from_secs(1);
         config.poll_interval = Duration::from_secs(100);
         config.command_timeout = Duration::from_secs(120);
-        let rcon = RconClient::connect(&rcon_address, "secret").await.unwrap();
         let child = process::launch(&config.command, &config.arguments).unwrap();
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
@@ -4095,8 +4600,17 @@ mod tests {
         };
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
+        let player_inspection = connected_player_inspection(&rcon_address).await;
         let monitor = tokio::spawn(async move {
-            monitor_running_server(child, rcon, &mut control, &config, &backend_use, cycle).await
+            monitor_running_server(
+                child,
+                player_inspection,
+                &mut control,
+                &config,
+                &backend_use,
+                cycle,
+            )
+            .await
         });
 
         assert_eq!(events.recv().await, Some(TestRconEvent::List(1)));
@@ -4108,6 +4622,7 @@ mod tests {
         let outcome = monitor.await.unwrap().unwrap();
         assert_eq!(outcome, CycleOutcome::Shutdown);
         assert_eq!(lifecycle.borrow().phase, ServerPhase::Stopping);
+        assert_eq!(events.recv().await, Some(TestRconEvent::Stop));
         drop(wake_sender);
         rcon_server.await.unwrap();
         assert!(matches!(
@@ -4125,20 +4640,29 @@ mod tests {
             let (rcon_address, _events, rcon_server) =
                 spawn_scripted_list_rcon_server(vec![first_reply, player_count_reply(0)]).await;
             let config = test_config(rcon_address.clone());
-            let mut rcon = Some(RconClient::connect(&rcon_address, "secret").await.unwrap());
+            let mut player_inspection = PlayerInspection::ConfiguredRcon {
+                client: Some(RconClient::connect(&rcon_address, "secret").await.unwrap()),
+                next_poll: Instant::now(),
+                zero_anchor: Some(Instant::now()),
+            };
             let old_anchor = Instant::now();
             tokio::time::advance(Duration::from_secs(5)).await;
-            let mut rcon_zero_anchor = Some(old_anchor);
-            let mut next_poll = Instant::now();
 
-            poll_player_presence(&mut rcon, &mut rcon_zero_anchor, &mut next_poll, &config).await;
-            assert_eq!(rcon_zero_anchor, None);
+            poll_player_presence(&mut player_inspection, &config).await;
+            let PlayerInspection::ConfiguredRcon { zero_anchor, .. } = &player_inspection else {
+                unreachable!();
+            };
+            assert_eq!(*zero_anchor, None);
             tokio::time::advance(Duration::from_secs(7)).await;
-            poll_player_presence(&mut rcon, &mut rcon_zero_anchor, &mut next_poll, &config).await;
-            assert!(rcon_zero_anchor.is_some_and(|anchor| anchor > old_anchor));
+            poll_player_presence(&mut player_inspection, &config).await;
+            let PlayerInspection::ConfiguredRcon { zero_anchor, .. } = &player_inspection else {
+                unreachable!();
+            };
+            assert!(zero_anchor.is_some_and(|anchor| anchor > old_anchor));
 
-            drop(rcon);
-            rcon_server.await.unwrap();
+            drop(player_inspection);
+            rcon_server.abort();
+            assert!(rcon_server.await.unwrap_err().is_cancelled());
         }
     }
 
@@ -4149,7 +4673,6 @@ mod tests {
         let mut config = test_config(rcon_address.clone());
         config.idle_timeout = Duration::from_secs(1);
         config.poll_interval = Duration::from_secs(100);
-        let rcon = RconClient::connect(&rcon_address, "secret").await.unwrap();
         let child = process::launch(&config.command, &config.arguments).unwrap();
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
@@ -4163,8 +4686,17 @@ mod tests {
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
         let blocking_reader = backend_use.acquire_shared(cycle).await;
+        let player_inspection = connected_player_inspection(&rcon_address).await;
         let monitor = tokio::spawn(async move {
-            monitor_running_server(child, rcon, &mut control, &config, &backend_use, cycle).await
+            monitor_running_server(
+                child,
+                player_inspection,
+                &mut control,
+                &config,
+                &backend_use,
+                cycle,
+            )
+            .await
         });
 
         assert_eq!(events.recv().await, Some(TestRconEvent::List(1)));
@@ -4184,6 +4716,7 @@ mod tests {
         ));
 
         shutdown_sender.send(()).unwrap();
+        assert_eq!(events.recv().await, Some(TestRconEvent::Closed));
         assert_eq!(events.recv().await, Some(TestRconEvent::Stop));
         let outcome = monitor.await.unwrap().unwrap();
         assert_eq!(outcome, CycleOutcome::Shutdown);
@@ -4200,7 +4733,6 @@ mod tests {
         let mut config = signaled_exit_config(rcon_address.clone(), exit_signal_address);
         config.idle_timeout = Duration::from_secs(1);
         config.poll_interval = Duration::from_secs(100);
-        let rcon = RconClient::connect(&rcon_address, "secret").await.unwrap();
         let child = process::launch(&config.command, &config.arguments).unwrap();
         let (mut exit_signal, _) = exit_listener.accept().await.unwrap();
         let (wake_sender, wake_receiver) = mpsc::channel(1);
@@ -4215,8 +4747,17 @@ mod tests {
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
         let blocking_reader = backend_use.acquire_shared(cycle).await;
+        let player_inspection = connected_player_inspection(&rcon_address).await;
         let monitor = tokio::spawn(async move {
-            monitor_running_server(child, rcon, &mut control, &config, &backend_use, cycle).await
+            monitor_running_server(
+                child,
+                player_inspection,
+                &mut control,
+                &config,
+                &backend_use,
+                cycle,
+            )
+            .await
         });
 
         assert_eq!(events.recv().await, Some(TestRconEvent::List(1)));
@@ -4228,7 +4769,8 @@ mod tests {
         assert!(matches!(outcome, CycleOutcome::Failed { .. }));
         assert_eq!(lifecycle.borrow().phase, ServerPhase::Cooldown);
         drop((blocking_reader, wake_sender));
-        rcon_server.await.unwrap();
+        rcon_server.abort();
+        assert!(rcon_server.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test(start_paused = true)]
@@ -4247,7 +4789,6 @@ mod tests {
         config.idle_timeout = Duration::from_secs(1);
         config.poll_interval = Duration::from_secs(100);
         config.command_timeout = Duration::from_secs(120);
-        let rcon = RconClient::connect(&rcon_address, "secret").await.unwrap();
         let child = process::launch(&config.command, &config.arguments).unwrap();
         let (mut exit_signal, _) = exit_listener.accept().await.unwrap();
         let (wake_sender, wake_receiver) = mpsc::channel(1);
@@ -4261,37 +4802,38 @@ mod tests {
         };
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
+        let player_inspection = connected_player_inspection(&rcon_address).await;
         let monitor = tokio::spawn(async move {
-            monitor_running_server(child, rcon, &mut control, &config, &backend_use, cycle).await
+            monitor_running_server(
+                child,
+                player_inspection,
+                &mut control,
+                &config,
+                &backend_use,
+                cycle,
+            )
+            .await
         });
 
         assert_eq!(events.recv().await, Some(TestRconEvent::List(1)));
         tokio::time::advance(Duration::from_secs(1)).await;
         final_started_receiver.await.unwrap();
         assert_eq!(events.recv().await, Some(TestRconEvent::List(2)));
+        tokio::time::resume();
         exit_signal.write_all(&[1]).await.unwrap();
         assert_eq!(events.recv().await, Some(TestRconEvent::Closed));
         let outcome = monitor.await.unwrap().unwrap();
         assert!(matches!(outcome, CycleOutcome::Failed { .. }));
         assert_eq!(lifecycle.borrow().phase, ServerPhase::Cooldown);
         drop(wake_sender);
-        rcon_server.await.unwrap();
-        assert!(matches!(
-            events.try_recv(),
-            Err(mpsc::error::TryRecvError::Disconnected)
-        ));
+        rcon_server.abort();
+        assert!(rcon_server.await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]
     async fn controlled_idle_stop_resets_the_failure_streak() {
         let (rcon_address, rcon_ready, rcon_server) = spawn_test_rcon_server().await;
         let config = test_config(rcon_address.clone());
-        let rcon = RconClient::connect(&rcon_address, "secret")
-            .await
-            .expect("test RCON client should authenticate");
-        rcon_ready
-            .await
-            .expect("test RCON server should authenticate the client");
         let child = process::launch(&config.command, &config.arguments)
             .expect("test server process should launch");
         let (_wake_sender, wake_receiver) = mpsc::channel(1);
@@ -4305,10 +4847,12 @@ mod tests {
         };
 
         control.begin_idle_stop(running.owned_running_cycle().unwrap());
-        let outcome =
-            stop_committed_idle_server(child, Some(rcon), &mut control, config.shutdown_timeout)
-                .await
-                .expect("controlled idle stop should succeed");
+        let outcome = stop_committed_idle_server(child, &mut control, &config)
+            .await
+            .expect("controlled idle stop should succeed");
+        rcon_ready
+            .await
+            .expect("test RCON server should authenticate the fresh stop client");
         assert_eq!(outcome, CycleOutcome::Stopped);
         assert_eq!(lifecycle.borrow().failure_streak, 0);
         assert_eq!(lifecycle.borrow().failure, None);
@@ -4338,9 +4882,8 @@ mod tests {
 
         let error = reap_after_wait_error(
             child,
-            None,
             &mut control,
-            config.shutdown_timeout,
+            &config,
             std::io::Error::other("synthetic process wait failure"),
         )
         .await
@@ -4515,12 +5058,6 @@ mod tests {
     #[tokio::test]
     async fn shutdown_precedes_a_running_phase_wake() {
         let (rcon_address, rcon_ready, rcon_server) = spawn_test_rcon_server().await;
-        let rcon = RconClient::connect(&rcon_address, "secret")
-            .await
-            .expect("test RCON client should authenticate");
-        rcon_ready
-            .await
-            .expect("test RCON server should authenticate the client");
         let config = test_config(rcon_address);
         let child = process::launch(&config.command, &config.arguments)
             .expect("test server process should launch");
@@ -4548,11 +5085,21 @@ mod tests {
 
         let outcome = timeout(
             Duration::from_secs(10),
-            monitor_running_server(child, rcon, &mut control, &config, &backend_use, cycle),
+            monitor_running_server(
+                child,
+                PlayerInspection::from_config(&config),
+                &mut control,
+                &config,
+                &backend_use,
+                cycle,
+            ),
         )
         .await
         .expect("supervisor cleanup should be bounded")
         .expect("supervisor cleanup should succeed");
+        rcon_ready
+            .await
+            .expect("test RCON server should authenticate the fresh stop client");
         assert_eq!(outcome, CycleOutcome::Shutdown);
         timeout(Duration::from_secs(2), rcon_server)
             .await
@@ -4565,12 +5112,6 @@ mod tests {
     #[tokio::test]
     async fn stopping_wake_flood_cannot_starve_cleanup() {
         let (rcon_address, rcon_ready, rcon_server) = spawn_test_rcon_server().await;
-        let rcon = RconClient::connect(&rcon_address, "secret")
-            .await
-            .expect("test RCON client should authenticate");
-        rcon_ready
-            .await
-            .expect("test RCON server should authenticate the client");
         let config = test_config(rcon_address);
         let child = process::launch(&config.command, &config.arguments)
             .expect("test server process should launch");
@@ -4585,8 +5126,7 @@ mod tests {
                 lifecycle: lifecycle_sender,
             };
             control.begin_idle_stop(active.owned_running_cycle().unwrap());
-            stop_committed_idle_server(child, Some(rcon), &mut control, config.shutdown_timeout)
-                .await
+            stop_committed_idle_server(child, &mut control, &config).await
         });
 
         wait_for_phase(&mut lifecycle, ServerPhase::Stopping).await;
@@ -4617,6 +5157,9 @@ mod tests {
             .expect("stop task should not panic")
             .expect("server cleanup should succeed");
         assert_eq!(outcome, CycleOutcome::Restart);
+        rcon_ready
+            .await
+            .expect("test RCON server should authenticate the fresh stop client");
         assert_eq!(lifecycle.borrow().failure_streak, 0);
         assert_eq!(lifecycle.borrow().failure, None);
         let mut sent = 0;
@@ -4636,12 +5179,6 @@ mod tests {
     #[tokio::test]
     async fn shutdown_overrides_a_stopping_phase_restart() {
         let (rcon_address, rcon_ready, rcon_server) = spawn_test_rcon_server().await;
-        let rcon = RconClient::connect(&rcon_address, "secret")
-            .await
-            .expect("test RCON client should authenticate");
-        rcon_ready
-            .await
-            .expect("test RCON server should authenticate the client");
         let config = test_config(rcon_address);
         let child = process::launch(&config.command, &config.arguments)
             .expect("test server process should launch");
@@ -4660,8 +5197,7 @@ mod tests {
                 lifecycle: lifecycle_sender,
             };
             control.begin_idle_stop(active.owned_running_cycle().unwrap());
-            stop_committed_idle_server(child, Some(rcon), &mut control, config.shutdown_timeout)
-                .await
+            stop_committed_idle_server(child, &mut control, &config).await
         });
 
         wait_for_phase(&mut lifecycle, ServerPhase::Stopping).await;
@@ -4679,6 +5215,9 @@ mod tests {
             .expect("stop task should not panic")
             .expect("server cleanup should succeed");
         assert_eq!(outcome, CycleOutcome::Shutdown);
+        rcon_ready
+            .await
+            .expect("test RCON server should authenticate the fresh stop client");
         timeout(Duration::from_secs(2), rcon_server)
             .await
             .expect("test RCON server should finish")
