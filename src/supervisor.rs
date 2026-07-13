@@ -541,6 +541,7 @@ impl SupervisorControl {
             current.phase,
             ServerPhase::Reconciling | ServerPhase::External
         ));
+        let entering_external = current.phase != ServerPhase::External;
         self.publish(LifecycleState {
             phase: ServerPhase::External,
             launch_generation: if consume_demand {
@@ -554,6 +555,11 @@ impl SupervisorControl {
             retry_at: None,
             reconciliation_evidence: ReconciliationEvidence::Positive,
         });
+        if entering_external {
+            log::info!(
+                "Detected a ready external backend; proxying without process ownership or automatic shutdown."
+            );
+        }
     }
 
     fn publish_conflict(&self, evidence: ReconciliationEvidence, consume_demand: bool) {
