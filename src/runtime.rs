@@ -2,14 +2,17 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, TryAcquireError, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, sleep, sleep_until, timeout};
 
-use crate::minecraft::{ClientRequest, ConnectionEnvelope, MinecraftResponder};
+use crate::backend_use::{
+    BackendCycle, BackendUseCoordinator, BackendUseLease, LoginTransferProxySession,
+};
+use crate::minecraft::{ClientRequest, ConnectionEnvelope, HandshakeIntent, MinecraftResponder};
 use crate::supervisor::{
     self, BackendEndpoint, LifecycleState, ServerPhase, SupervisorConfig, WakeRequest,
 };
@@ -42,6 +45,7 @@ pub struct ServerRuntime {
 struct ClientContext {
     lifecycle: watch::Receiver<LifecycleState>,
     wake_requests: mpsc::Sender<WakeRequest>,
+    backend_use: Arc<BackendUseCoordinator>,
     responder: Arc<MinecraftResponder>,
     server_host: Arc<str>,
     server_port: u16,
@@ -74,6 +78,7 @@ impl ServerRuntime {
         let (wake_requests, wake_receiver) = mpsc::channel(PENDING_WAKE_CAPACITY);
         let (supervisor_shutdown, shutdown_receiver) = oneshot::channel();
         let (lifecycle_sender, lifecycle) = watch::channel(LifecycleState::reconciling());
+        let backend_use = Arc::new(BackendUseCoordinator::new());
         let supervisor_wait_limit = supervisor_config.shutdown_timeout + SUPERVISOR_SHUTDOWN_MARGIN;
         let server_host: Arc<str> = Arc::from(server_host);
         let supervisor = tokio::spawn(supervisor::run(
@@ -82,10 +87,12 @@ impl ServerRuntime {
             lifecycle_sender,
             supervisor_config,
             BackendEndpoint::network(Arc::clone(&server_host), server_port, proxy_connect_timeout),
+            Arc::clone(&backend_use),
         ));
         let client_context = ClientContext {
             lifecycle,
             wake_requests,
+            backend_use,
             responder: Arc::new(responder),
             server_host,
             server_port,
@@ -231,15 +238,14 @@ async fn handle_sampled_connection(
 ) -> Result<()> {
     let current_phase = observed_lifecycle.phase();
 
-    if matches!(current_phase, ServerPhase::Running | ServerPhase::External) {
-        return proxy_connection(
-            connection,
-            peer,
-            &context.server_host,
-            context.server_port,
-            context.proxy_connect_timeout,
-        )
-        .await;
+    if current_phase == ServerPhase::Running {
+        let cycle = observed_lifecycle
+            .owned_running_cycle()
+            .expect("running lifecycle must have an owned backend cycle");
+        return proxy_owned_connection(connection, peer, &context, cycle).await;
+    }
+    if current_phase == ServerPhase::External {
+        return proxy_external_connection(connection, peer, &context).await;
     }
 
     let operation_timeout = context.handshake_timeout;
@@ -305,31 +311,128 @@ async fn handle_sampled_connection(
     Ok(())
 }
 
-async fn proxy_connection(
+async fn proxy_owned_connection(
     connection: ConnectionEnvelope,
     peer: std::net::SocketAddr,
-    server_host: &str,
-    server_port: u16,
-    connect_timeout: Duration,
+    context: &ClientContext,
+    cycle: BackendCycle,
 ) -> Result<()> {
-    let (mut client, framed_handshake) = connection.into_proxy_parts();
-    let mut backend = connect_backend(server_host, server_port, connect_timeout).await?;
+    let lease = context.backend_use.acquire_shared(cycle).await;
+    ensure_current_owned_cycle(&context.lifecycle, cycle)?;
+    let backend = connect_backend(
+        &context.server_host,
+        context.server_port,
+        context.proxy_connect_timeout,
+    )
+    .await?;
     backend
         .set_nodelay(true)
         .context("failed to enable TCP_NODELAY for backend")?;
-    log::debug!("Proxying {peer} to {server_host}:{server_port}");
+    proxy_connected_owned(connection, backend, peer, context, cycle, lease).await
+}
+
+async fn proxy_connected_owned(
+    connection: ConnectionEnvelope,
+    mut backend: TcpStream,
+    peer: std::net::SocketAddr,
+    context: &ClientContext,
+    cycle: BackendCycle,
+    lease: BackendUseLease,
+) -> Result<()> {
+    ensure_current_owned_cycle(&context.lifecycle, cycle)?;
+    let intent = connection.intent();
+    let (mut client, framed_handshake) = connection.into_proxy_parts();
+    log::debug!(
+        "Proxying {peer} to {}:{}",
+        context.server_host,
+        context.server_port
+    );
 
     backend
         .write_all(&framed_handshake)
         .await
         .with_context(|| format!("failed to replay Minecraft handshake for {peer}"))?;
+    let _session = establish_owned_proxy_activity(context, cycle, intent, lease)?;
+    proxy_streams(&mut client, &mut backend, peer, framed_handshake.len()).await
+}
 
-    let (client_to_server, server_to_client) =
-        tokio::io::copy_bidirectional(&mut client, &mut backend)
-            .await
-            .with_context(|| format!("proxy I/O failed for {peer}"))?;
+fn establish_owned_proxy_activity(
+    context: &ClientContext,
+    cycle: BackendCycle,
+    intent: HandshakeIntent,
+    lease: BackendUseLease,
+) -> Result<Option<LoginTransferProxySession>> {
+    ensure_current_owned_cycle(&context.lifecycle, cycle)?;
+    match intent {
+        HandshakeIntent::Login | HandshakeIntent::Transfer => {
+            let session = context
+                .backend_use
+                .establish_login_transfer_session(lease)
+                .map_err(|_stale_lease| {
+                    anyhow::anyhow!("backend activity cycle changed before proxy establishment")
+                })?;
+            Ok(Some(session))
+        }
+        HandshakeIntent::Status | HandshakeIntent::Unknown(_) => {
+            drop(lease);
+            Ok(None)
+        }
+    }
+}
+
+async fn proxy_external_connection(
+    connection: ConnectionEnvelope,
+    peer: std::net::SocketAddr,
+    context: &ClientContext,
+) -> Result<()> {
+    let (mut client, framed_handshake) = connection.into_proxy_parts();
+    let mut backend = connect_backend(
+        &context.server_host,
+        context.server_port,
+        context.proxy_connect_timeout,
+    )
+    .await?;
+    backend
+        .set_nodelay(true)
+        .context("failed to enable TCP_NODELAY for backend")?;
+    log::debug!(
+        "Proxying {peer} to {}:{}",
+        context.server_host,
+        context.server_port
+    );
+    backend
+        .write_all(&framed_handshake)
+        .await
+        .with_context(|| format!("failed to replay Minecraft handshake for {peer}"))?;
+    proxy_streams(&mut client, &mut backend, peer, framed_handshake.len()).await
+}
+
+fn ensure_current_owned_cycle(
+    lifecycle: &watch::Receiver<LifecycleState>,
+    cycle: BackendCycle,
+) -> Result<()> {
+    ensure!(
+        lifecycle.has_changed().is_ok(),
+        "server lifecycle authority stopped while opening a proxy connection"
+    );
+    ensure!(
+        lifecycle.borrow().owned_running_cycle() == Some(cycle),
+        "owned backend cycle changed while opening a proxy connection"
+    );
+    Ok(())
+}
+
+async fn proxy_streams(
+    client: &mut TcpStream,
+    backend: &mut TcpStream,
+    peer: std::net::SocketAddr,
+    replayed_handshake_bytes: usize,
+) -> Result<()> {
+    let (client_to_server, server_to_client) = tokio::io::copy_bidirectional(client, backend)
+        .await
+        .with_context(|| format!("proxy I/O failed for {peer}"))?;
     let client_to_server = client_to_server
-        + u64::try_from(framed_handshake.len()).expect("handshake length fits in u64");
+        + u64::try_from(replayed_handshake_bytes).expect("handshake length fits in u64");
     log::debug!(
         "Proxy for {peer} closed ({client_to_server} bytes upstream, {server_to_client} downstream)"
     );
@@ -481,6 +584,39 @@ mod tests {
         )
     }
 
+    async fn parsed_connection(
+        framed_handshake: &[u8],
+    ) -> (TcpStream, ConnectionEnvelope, std::net::SocketAddr) {
+        let (mut client, server) = connected_pair().await;
+        let peer = server.peer_addr().expect("client peer address");
+        client
+            .write_all(framed_handshake)
+            .await
+            .expect("framed handshake should write");
+        let connection = ConnectionEnvelope::read(server, Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("framed handshake should parse");
+        (client, connection, peer)
+    }
+
+    async fn wait_for_active_sessions(backend_use: &BackendUseCoordinator, expected: usize) {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let changed = backend_use.activity_notified();
+                tokio::pin!(changed);
+                if backend_use
+                    .activity_snapshot()
+                    .is_some_and(|snapshot| snapshot.active_login_transfer_sessions() == expected)
+                {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("proxy activity should reach the expected session count");
+    }
+
     fn assert_no_wake(wake_receiver: &mut mpsc::Receiver<WakeRequest>) {
         assert!(matches!(
             wake_receiver.try_recv(),
@@ -488,23 +624,21 @@ mod tests {
         ));
     }
 
-    fn client_context(
-        phase: ServerPhase,
-        wake_requests: mpsc::Sender<WakeRequest>,
-        backend_port: u16,
-    ) -> ClientContext {
-        client_context_with_lifecycle(phase, wake_requests, backend_port).0
-    }
-
     fn client_context_with_lifecycle(
         phase: ServerPhase,
         wake_requests: mpsc::Sender<WakeRequest>,
         backend_port: u16,
     ) -> (ClientContext, watch::Sender<LifecycleState>) {
-        let (lifecycle_sender, lifecycle) = watch::channel(LifecycleState::test_phase(phase));
+        let lifecycle_state = LifecycleState::test_phase(phase);
+        let (lifecycle_sender, lifecycle) = watch::channel(lifecycle_state);
+        let backend_use = Arc::new(BackendUseCoordinator::new());
+        if let Some(cycle) = lifecycle_state.owned_running_cycle() {
+            backend_use.begin_cycle(cycle, Instant::now());
+        }
         let context = ClientContext {
             lifecycle,
             wake_requests,
+            backend_use,
             responder: Arc::new(
                 MinecraftResponder::new(&Config::default(), None)
                     .expect("test responder should be constructed"),
@@ -517,7 +651,7 @@ mod tests {
         (context, lifecycle_sender)
     }
 
-    async fn assert_phase_proxies_exact_bytes(phase: ServerPhase) {
+    async fn assert_phase_proxies_exact_bytes(phase: ServerPhase, framed_handshake: Vec<u8>) {
         let backend_listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("backend listener should bind");
@@ -526,11 +660,11 @@ mod tests {
             .expect("backend listener has an address")
             .port();
         let (wake_sender, mut wake_receiver) = mpsc::channel(1);
-        let context = client_context(phase, wake_sender, backend_port);
+        let (context, _lifecycle_authority) =
+            client_context_with_lifecycle(phase, wake_sender, backend_port);
         let (mut client, server) = connected_pair().await;
         let peer = server.peer_addr().expect("client peer address");
         let handler = tokio::spawn(handle_client(server, peer, context));
-        let framed_handshake = non_minimal_unknown_handshake();
         let following_bytes = vec![0, 1, 2, 0xff, 4, 5, 6];
         let mut expected = framed_handshake.clone();
         expected.extend_from_slice(&following_bytes);
@@ -575,14 +709,336 @@ mod tests {
 
     #[tokio::test]
     async fn running_and_external_forward_exact_original_bytes() {
-        assert_phase_proxies_exact_bytes(ServerPhase::Running).await;
-        assert_phase_proxies_exact_bytes(ServerPhase::External).await;
+        let protocol = crate::minecraft::MinecraftVersion::latest().protocol();
+        for intent in [1, 2, 3] {
+            assert_phase_proxies_exact_bytes(
+                ServerPhase::Running,
+                handshake_frame(protocol, intent),
+            )
+            .await;
+        }
+        assert_phase_proxies_exact_bytes(ServerPhase::Running, non_minimal_unknown_handshake())
+            .await;
+        assert_phase_proxies_exact_bytes(ServerPhase::External, non_minimal_unknown_handshake())
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn status_writer_first_rejects_the_reader_after_stopping() {
+        let backend_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("backend listener should bind");
+        let backend_port = backend_listener.local_addr().unwrap().port();
+        let (wake_sender, _wake_receiver) = mpsc::channel(1);
+        let (context, lifecycle_authority) =
+            client_context_with_lifecycle(ServerPhase::Running, wake_sender, backend_port);
+        let cycle = context.lifecycle.borrow().owned_running_cycle().unwrap();
+        let first_reader = context.backend_use.acquire_shared(cycle).await;
+        let (writer_polling, writer_polled) = oneshot::channel();
+        let writer = {
+            let backend_use = Arc::clone(&context.backend_use);
+            let writer_authority = lifecycle_authority.clone();
+            tokio::spawn(async move {
+                writer_polling.send(()).unwrap();
+                let _exclusive = backend_use.acquire_exclusive().await;
+                writer_authority.send_replace(LifecycleState::test_phase(ServerPhase::Stopping));
+            })
+        };
+        writer_polled.await.unwrap();
+        tokio::task::yield_now().await;
+
+        let (mut client, server) = connected_pair().await;
+        let peer = server.peer_addr().unwrap();
+        let handler = tokio::spawn(handle_client(server, peer, context));
+        client
+            .write_all(&handshake_frame(12_345, 1))
+            .await
+            .expect("status handshake should write");
+        tokio::task::yield_now().await;
+        drop(first_reader);
+
+        writer.await.unwrap();
+        let error = handler
+            .await
+            .expect("client task should not panic")
+            .expect_err("stale reader should reject the stopped cycle");
+        assert!(error.to_string().contains("owned backend cycle changed"));
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(response.is_empty());
+        let backend_listener = backend_listener.into_std().unwrap();
+        assert!(matches!(
+            backend_listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn status_reader_first_finishes_replay_before_stopping() {
+        let (wake_sender, _wake_receiver) = mpsc::channel(1);
+        let (context, lifecycle_authority) =
+            client_context_with_lifecycle(ServerPhase::Running, wake_sender, 9);
+        let backend_use = Arc::clone(&context.backend_use);
+        let cycle = context.lifecycle.borrow().owned_running_cycle().unwrap();
+        let lease = backend_use.acquire_shared(cycle).await;
+        let handshake = handshake_frame(12_345, 1);
+        let (mut client, connection, peer) = parsed_connection(&handshake).await;
+        let (backend, mut backend_peer) = connected_pair().await;
+
+        let (writer_polling, writer_polled) = oneshot::channel();
+        let writer = {
+            let backend_use = Arc::clone(&backend_use);
+            let lifecycle_authority = lifecycle_authority.clone();
+            tokio::spawn(async move {
+                writer_polling.send(()).unwrap();
+                let _exclusive = backend_use.acquire_exclusive().await;
+                lifecycle_authority.send_replace(LifecycleState::test_phase(ServerPhase::Stopping));
+            })
+        };
+        writer_polled.await.unwrap();
+
+        let proxy = tokio::spawn(async move {
+            proxy_connected_owned(connection, backend, peer, &context, cycle, lease).await
+        });
+        let mut replayed = vec![0; handshake.len()];
+        backend_peer.read_exact(&mut replayed).await.unwrap();
+        assert_eq!(replayed, handshake);
+        writer.await.unwrap();
+
+        backend_peer.write_all(b"x").await.unwrap();
+        assert_eq!(client.read_u8().await.unwrap(), b'x');
+        let snapshot = backend_use.activity_snapshot().unwrap();
+        assert_eq!(snapshot.active_login_transfer_sessions(), 0);
+        assert_eq!(snapshot.last_final_session_disconnect(), None);
+        drop((client, backend_peer));
+        proxy
+            .await
+            .expect("status proxy task should not panic")
+            .expect("status proxy should continue after its replay lease is released");
+    }
+
+    #[tokio::test]
+    async fn post_connect_revalidation_prevents_replay_to_a_changed_cycle() {
+        let (wake_sender, _wake_receiver) = mpsc::channel(1);
+        let (context, lifecycle_authority) =
+            client_context_with_lifecycle(ServerPhase::Running, wake_sender, 9);
+        let cycle = context.lifecycle.borrow().owned_running_cycle().unwrap();
+        let lease = context.backend_use.acquire_shared(cycle).await;
+        let (backend, mut backend_peer) = connected_pair().await;
+        let handshake = handshake_frame(12_345, 1);
+        let (mut client, connection, peer) = parsed_connection(&handshake).await;
+
+        lifecycle_authority.send_replace(LifecycleState::test_phase(ServerPhase::Stopping));
+        let error = proxy_connected_owned(connection, backend, peer, &context, cycle, lease)
+            .await
+            .expect_err("changed lifecycle should reject the connected backend");
+        assert!(error.to_string().contains("owned backend cycle changed"));
+        let mut replayed = Vec::new();
+        backend_peer.read_to_end(&mut replayed).await.unwrap();
+        assert!(replayed.is_empty());
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(response.is_empty());
+    }
+
+    #[tokio::test]
+    async fn login_session_is_established_only_after_complete_replay() {
+        let (wake_sender, _wake_receiver) = mpsc::channel(1);
+        let (context, _lifecycle_authority) =
+            client_context_with_lifecycle(ServerPhase::Running, wake_sender, 9);
+        let cycle = context.lifecycle.borrow().owned_running_cycle().unwrap();
+        let lease = context.backend_use.acquire_shared(cycle).await;
+        let (mut backend, mut backend_peer) = connected_pair().await;
+        let handshake = handshake_frame(12_345, 2);
+        let mut replayed = vec![0; handshake.len()];
+
+        let (write, read) = tokio::join!(
+            backend.write_all(&handshake),
+            backend_peer.read_exact(&mut replayed)
+        );
+        write.expect("complete handshake should replay");
+        read.expect("backend should receive the complete handshake");
+        assert_eq!(replayed, handshake);
+        assert_eq!(
+            context
+                .backend_use
+                .activity_snapshot()
+                .unwrap()
+                .active_login_transfer_sessions(),
+            0
+        );
+
+        let session =
+            establish_owned_proxy_activity(&context, cycle, HandshakeIntent::Login, lease)
+                .expect("current replay should establish activity")
+                .expect("login intent should create a proxy session");
+        assert_eq!(
+            context
+                .backend_use
+                .activity_snapshot()
+                .unwrap()
+                .active_login_transfer_sessions(),
+            1
+        );
+        drop(session);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_change_at_replay_completion_cannot_establish_a_session() {
+        let (wake_sender, _wake_receiver) = mpsc::channel(1);
+        let (context, lifecycle_authority) =
+            client_context_with_lifecycle(ServerPhase::Running, wake_sender, 9);
+        let cycle = context.lifecycle.borrow().owned_running_cycle().unwrap();
+        let lease = context.backend_use.acquire_shared(cycle).await;
+        let (mut backend, mut backend_peer) = connected_pair().await;
+        let handshake = handshake_frame(12_345, 2);
+        let mut replayed = vec![0; handshake.len()];
+        let (write, read) = tokio::join!(
+            backend.write_all(&handshake),
+            backend_peer.read_exact(&mut replayed)
+        );
+        write.unwrap();
+        read.unwrap();
+
+        lifecycle_authority.send_replace(LifecycleState::test_phase(ServerPhase::Stopping));
+        let result = establish_owned_proxy_activity(&context, cycle, HandshakeIntent::Login, lease);
+        assert!(result.is_err());
+        let snapshot = context.backend_use.activity_snapshot().unwrap();
+        assert_eq!(snapshot.active_login_transfer_sessions(), 0);
+        assert_eq!(snapshot.last_final_session_disconnect(), None);
+    }
+
+    #[tokio::test]
+    async fn concrete_replay_failure_creates_no_session_or_disconnect_timestamp() {
+        let (wake_sender, _wake_receiver) = mpsc::channel(1);
+        let (context, _lifecycle_authority) =
+            client_context_with_lifecycle(ServerPhase::Running, wake_sender, 9);
+        let cycle = context.lifecycle.borrow().owned_running_cycle().unwrap();
+        let lease = context.backend_use.acquire_shared(cycle).await;
+        let handshake = handshake_frame(12_345, 2);
+        let (_client, connection, peer) = parsed_connection(&handshake).await;
+        let (mut backend, reset_peer) = connected_pair().await;
+        reset_peer
+            .set_zero_linger()
+            .expect("test backend should support abortive close");
+        drop(reset_peer);
+        backend
+            .read_u8()
+            .await
+            .expect_err("abortive close should reset the backend socket");
+
+        let error = proxy_connected_owned(connection, backend, peer, &context, cycle, lease)
+            .await
+            .expect_err("reset backend should fail handshake replay");
+        assert!(error.to_string().contains("failed to replay"));
+        let snapshot = context.backend_use.activity_snapshot().unwrap();
+        assert_eq!(snapshot.active_login_transfer_sessions(), 0);
+        assert_eq!(snapshot.last_final_session_disconnect(), None);
+    }
+
+    #[tokio::test]
+    async fn clean_close_proxy_error_and_task_abort_release_login_sessions() {
+        enum Termination {
+            CleanClose,
+            ProxyError,
+            TaskAbort,
+        }
+
+        for termination in [
+            Termination::CleanClose,
+            Termination::ProxyError,
+            Termination::TaskAbort,
+        ] {
+            let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let backend_port = backend_listener.local_addr().unwrap().port();
+            let (wake_sender, _wake_receiver) = mpsc::channel(1);
+            let (context, _lifecycle_authority) =
+                client_context_with_lifecycle(ServerPhase::Running, wake_sender, backend_port);
+            let backend_use = Arc::clone(&context.backend_use);
+            let (mut client, server) = connected_pair().await;
+            let peer = server.peer_addr().unwrap();
+            let handler = tokio::spawn(handle_client(server, peer, context));
+            let handshake = handshake_frame(12_345, 2);
+            client.write_all(&handshake).await.unwrap();
+            let (mut backend, _) = backend_listener.accept().await.unwrap();
+            let mut replayed = vec![0; handshake.len()];
+            backend.read_exact(&mut replayed).await.unwrap();
+            assert_eq!(replayed, handshake);
+            wait_for_active_sessions(&backend_use, 1).await;
+
+            match termination {
+                Termination::CleanClose => {
+                    drop((client, backend));
+                    handler
+                        .await
+                        .expect("client task should not panic")
+                        .expect("clean socket close should end the proxy");
+                }
+                Termination::ProxyError => {
+                    backend.set_zero_linger().unwrap();
+                    drop(backend);
+                    let result = handler.await.expect("client task should not panic");
+                    assert!(result.is_err());
+                    drop(client);
+                }
+                Termination::TaskAbort => {
+                    handler.abort();
+                    assert!(handler.await.unwrap_err().is_cancelled());
+                    drop((client, backend));
+                }
+            }
+            let snapshot = backend_use.activity_snapshot().unwrap();
+            assert_eq!(snapshot.active_login_transfer_sessions(), 0);
+            assert!(snapshot.last_final_session_disconnect().is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn status_releases_lease_after_replay_without_changing_activity() {
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_port = backend_listener.local_addr().unwrap().port();
+        let (wake_sender, _wake_receiver) = mpsc::channel(1);
+        let (context, _lifecycle_authority) =
+            client_context_with_lifecycle(ServerPhase::Running, wake_sender, backend_port);
+        let backend_use = Arc::clone(&context.backend_use);
+        let (mut client, server) = connected_pair().await;
+        let peer = server.peer_addr().unwrap();
+        let handler = tokio::spawn(handle_client(server, peer, context));
+        let handshake = handshake_frame(12_345, 1);
+        client.write_all(&handshake).await.unwrap();
+        let (mut backend, _) = backend_listener.accept().await.unwrap();
+        let mut replayed = vec![0; handshake.len()];
+        backend.read_exact(&mut replayed).await.unwrap();
+        assert_eq!(replayed, handshake);
+
+        let exclusive = timeout(Duration::from_secs(2), backend_use.acquire_exclusive())
+            .await
+            .expect("status lease should be released after replay");
+        backend.write_all(b"x").await.unwrap();
+        assert_eq!(client.read_u8().await.unwrap(), b'x');
+        let snapshot = backend_use.activity_snapshot().unwrap();
+        assert_eq!(snapshot.active_login_transfer_sessions(), 0);
+        assert_eq!(snapshot.last_final_session_disconnect(), None);
+        drop(exclusive);
+        drop((client, backend));
+        handler
+            .await
+            .expect("status proxy task should not panic")
+            .expect("status proxy should close cleanly");
+        assert_eq!(
+            backend_use
+                .activity_snapshot()
+                .unwrap()
+                .last_final_session_disconnect(),
+            None
+        );
     }
 
     #[tokio::test]
     async fn sleeping_unknown_intent_closes_without_response_or_wake() {
         let (wake_sender, mut wake_receiver) = mpsc::channel(1);
-        let context = client_context(ServerPhase::Stopped, wake_sender, 9);
+        let (context, _lifecycle_authority) =
+            client_context_with_lifecycle(ServerPhase::Stopped, wake_sender, 9);
         let (mut client, server) = connected_pair().await;
         let peer = server.peer_addr().expect("client peer address");
         let handler = tokio::spawn(handle_client(server, peer, context));
@@ -610,7 +1066,8 @@ mod tests {
         let version = crate::minecraft::MinecraftVersion::latest();
         let unsupported_protocol = version.protocol() - 1;
         let (wake_sender, mut wake_receiver) = mpsc::channel(1);
-        let context = client_context(ServerPhase::Stopped, wake_sender, 9);
+        let (context, _lifecycle_authority) =
+            client_context_with_lifecycle(ServerPhase::Stopped, wake_sender, 9);
         let (mut client, server) = connected_pair().await;
         let peer = server.peer_addr().expect("client peer address");
         let handler = tokio::spawn(handle_client(server, peer, context));
@@ -641,7 +1098,8 @@ mod tests {
             (ServerPhase::Cooldown, 2),
         ] {
             let (wake_sender, mut wake_receiver) = mpsc::channel(1);
-            let context = client_context(phase, wake_sender, 9);
+            let (context, _lifecycle_authority) =
+                client_context_with_lifecycle(phase, wake_sender, 9);
             let observed = *context.lifecycle.borrow();
             let (mut client, server) = connected_pair().await;
             let peer = server.peer_addr().expect("client peer address");
@@ -681,6 +1139,7 @@ mod tests {
         let (wake_sender, mut wake_receiver) = mpsc::channel(1);
         let (context, lifecycle_sender) =
             client_context_with_lifecycle(ServerPhase::Stopped, wake_sender, backend_port);
+        let backend_use = Arc::clone(&context.backend_use);
         let (mut client, server) = connected_pair().await;
         let peer = server.peer_addr().expect("client peer address");
         let handler = tokio::spawn(handle_client(server, peer, context));
@@ -691,7 +1150,9 @@ mod tests {
             .write_all(&handshake[..1])
             .await
             .expect("first handshake byte should write");
-        lifecycle_sender.send_replace(LifecycleState::test_phase(ServerPhase::Running));
+        let running = LifecycleState::test_phase(ServerPhase::Running);
+        backend_use.begin_cycle(running.owned_running_cycle().unwrap(), Instant::now());
+        lifecycle_sender.send_replace(running);
         client
             .write_all(&handshake[1..])
             .await
@@ -790,7 +1251,11 @@ mod tests {
             .await
             .expect("handshake should parse");
         let observed = *context.lifecycle.borrow();
-        lifecycle_sender.send_replace(LifecycleState::test_phase(ServerPhase::Running));
+        let running = LifecycleState::test_phase(ServerPhase::Running);
+        context
+            .backend_use
+            .begin_cycle(running.owned_running_cycle().unwrap(), Instant::now());
+        lifecycle_sender.send_replace(running);
         let handler = tokio::spawn(handle_sampled_connection(
             connection, peer, context, observed, deadline,
         ));
@@ -814,14 +1279,19 @@ mod tests {
     #[tokio::test]
     async fn active_backend_failure_does_not_fall_back_or_wake() {
         let (wake_sender, mut wake_receiver) = mpsc::channel(1);
-        let mut context = client_context(ServerPhase::Running, wake_sender, 0);
+        let (mut context, _lifecycle_authority) =
+            client_context_with_lifecycle(ServerPhase::Running, wake_sender, 0);
         context.proxy_connect_timeout = Duration::from_millis(25);
+        let backend_use = Arc::clone(&context.backend_use);
         let (mut client, server) = connected_pair().await;
         let peer = server.peer_addr().expect("client peer address");
         let handler = tokio::spawn(handle_client(server, peer, context));
 
         client
-            .write_all(&handshake_frame(12_345, 77))
+            .write_all(&handshake_frame(
+                crate::minecraft::MinecraftVersion::latest().protocol(),
+                2,
+            ))
             .await
             .expect("active handshake should write");
         let mut response = Vec::new();
@@ -836,13 +1306,17 @@ mod tests {
 
         assert!(error.to_string().contains("could not connect"));
         assert!(response.is_empty());
+        let snapshot = backend_use.activity_snapshot().unwrap();
+        assert_eq!(snapshot.active_login_transfer_sessions(), 0);
+        assert_eq!(snapshot.last_final_session_disconnect(), None);
         assert_no_wake(&mut wake_receiver);
     }
 
     #[tokio::test]
     async fn conflict_disconnects_exactly_and_coalesces_demand() {
         let (wake_sender, mut wake_receiver) = mpsc::channel(1);
-        let context = client_context(ServerPhase::Conflict, wake_sender, 9);
+        let (context, _lifecycle_authority) =
+            client_context_with_lifecycle(ServerPhase::Conflict, wake_sender, 9);
         let mut responses = Vec::new();
 
         for _ in 0..2 {
