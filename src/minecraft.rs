@@ -421,7 +421,7 @@ fn parse_handshake(packet: &[u8]) -> Result<Handshake> {
     let mut cursor = PacketCursor::new(packet);
     ensure!(cursor.read_varint()? == 0, "expected handshake packet ID 0");
     let protocol_version = cursor.read_varint()?;
-    let (_, requested_address_range) = cursor.read_string_with_range(255)?;
+    let requested_address_range = cursor.read_utf8_string_range()?;
     let requested_port = cursor.read_u16()?;
     let intent = match cursor.read_varint()? {
         1 => HandshakeIntent::Status,
@@ -611,6 +611,16 @@ impl<'a> PacketCursor<'a> {
             "string exceeds its UTF-16 length limit"
         );
         Ok((value, start..self.offset))
+    }
+
+    fn read_utf8_string_range(&mut self) -> Result<Range<usize>> {
+        let byte_length = self.read_varint()?;
+        ensure!(byte_length >= 0, "string has a negative byte length");
+        let byte_length = usize::try_from(byte_length).context("string byte length is negative")?;
+        let start = self.offset;
+        let bytes = self.read_bytes(byte_length)?;
+        std::str::from_utf8(bytes).context("string is not valid UTF-8")?;
+        Ok(start..self.offset)
     }
 
     fn read_u16(&mut self) -> Result<u16> {
@@ -889,23 +899,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_envelope_enforces_utf16_address_limit() {
-        let accepted = format!("{}a", "😀".repeat(127));
-        assert_eq!(accepted.encode_utf16().count(), 255);
-        let accepted_body = encode_handshake(763, &accepted, 25_565, 2);
-        let connection = read_connection(&frame_raw_packet(&accepted_body))
-            .await
-            .expect("255 UTF-16 code units should be accepted");
-        assert_eq!(connection.requested_address(), accepted);
+    async fn connection_envelope_accepts_extended_forge_addresses() {
+        let base_hostname = [
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(63),
+        ]
+        .join(".");
+        assert_eq!(base_hostname.encode_utf16().count(), 255);
 
-        let rejected = "😀".repeat(128);
-        assert_eq!(rejected.encode_utf16().count(), 256);
-        let rejected_body = encode_handshake(763, &rejected, 25_565, 2);
-        assert!(
-            read_connection(&frame_raw_packet(&rejected_body))
-                .await
-                .is_err()
-        );
+        let forge_address = format!("{base_hostname}\0FML\0");
+        let forge_body = encode_handshake(763, &forge_address, 25_565, 2);
+        let connection = read_connection(&frame_raw_packet(&forge_body))
+            .await
+            .expect("legacy Forge address should be accepted");
+        assert_eq!(connection.requested_address(), forge_address);
+
+        let address_261 = format!("{forge_address}x");
+        assert_eq!(address_261.encode_utf16().count(), 261);
+        let body_261 = encode_handshake(763, &address_261, 25_565, 2);
+        let connection = read_connection(&frame_raw_packet(&body_261))
+            .await
+            .expect("261-unit address within the handshake frame should be accepted");
+        assert_eq!(connection.requested_address(), address_261);
     }
 
     #[tokio::test]
