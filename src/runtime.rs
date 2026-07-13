@@ -20,6 +20,18 @@ use crate::supervisor::{
 const PENDING_WAKE_CAPACITY: usize = 1;
 const SUPERVISOR_SHUTDOWN_MARGIN: Duration = Duration::from_secs(10);
 
+fn supervisor_shutdown_wait_limit(
+    command_timeout: Duration,
+    shutdown_timeout: Duration,
+) -> Result<Duration> {
+    command_timeout
+        .checked_add(shutdown_timeout)
+        .and_then(|combined| combined.checked_add(SUPERVISOR_SHUTDOWN_MARGIN))
+        .context(
+            "rcon_command_timeout_seconds plus shutdown_timeout_seconds and the supervisor shutdown margin exceed the supported duration; reduce one of the timeout settings",
+        )
+}
+
 pub struct ServerRuntimeConfig {
     pub bind_host: String,
     pub bind_port: u16,
@@ -70,6 +82,10 @@ impl ServerRuntime {
             max_connections,
             supervisor: supervisor_config,
         } = config;
+        let supervisor_wait_limit = supervisor_shutdown_wait_limit(
+            supervisor_config.command_timeout,
+            supervisor_config.shutdown_timeout,
+        )?;
         let listener = TcpListener::bind((bind_host.as_str(), bind_port))
             .await
             .with_context(|| format!("failed to listen on {bind_host}:{bind_port}"))?;
@@ -79,7 +95,6 @@ impl ServerRuntime {
         let (supervisor_shutdown, shutdown_receiver) = oneshot::channel();
         let (lifecycle_sender, lifecycle) = watch::channel(LifecycleState::reconciling());
         let backend_use = Arc::new(BackendUseCoordinator::new());
-        let supervisor_wait_limit = supervisor_config.shutdown_timeout + SUPERVISOR_SHUTDOWN_MARGIN;
         let server_host: Arc<str> = Arc::from(server_host);
         let supervisor = tokio::spawn(supervisor::run(
             wake_receiver,
@@ -1485,6 +1500,39 @@ mod tests {
         TcpListener::bind(address)
             .await
             .expect("runtime should release its listener");
+    }
+
+    #[test]
+    fn supervisor_watchdog_includes_all_shutdown_budgets() {
+        let command_delivery = Duration::from_secs(7);
+        let graceful_exit = Duration::from_secs(11);
+
+        assert_eq!(
+            supervisor_shutdown_wait_limit(command_delivery, graceful_exit).unwrap(),
+            command_delivery + graceful_exit + SUPERVISOR_SHUTDOWN_MARGIN
+        );
+    }
+
+    #[test]
+    fn default_shutdown_cleanup_fits_within_supervisor_watchdog() {
+        let command_delivery = Duration::from_secs(10);
+        let graceful_exit = Duration::from_secs(30);
+        let forced_reaping = Duration::from_secs(5);
+        let watchdog = supervisor_shutdown_wait_limit(command_delivery, graceful_exit).unwrap();
+
+        assert_eq!(watchdog, Duration::from_secs(50));
+        assert!(command_delivery + graceful_exit + forced_reaping <= watchdog);
+    }
+
+    #[test]
+    fn supervisor_watchdog_rejects_duration_overflow() {
+        let error = supervisor_shutdown_wait_limit(Duration::MAX, Duration::from_nanos(1))
+            .expect_err("overflowing shutdown budgets must be rejected");
+        let message = error.to_string();
+
+        assert!(message.contains("rcon_command_timeout_seconds"));
+        assert!(message.contains("shutdown_timeout_seconds"));
+        assert!(message.contains("reduce"));
     }
 
     #[tokio::test]

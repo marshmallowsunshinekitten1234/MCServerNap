@@ -77,21 +77,21 @@ The first run creates `config/cfg.toml`. Use `--config <path>` or `MCSERVERNAP_C
 
 Existing configurations must set `schema_version = 2` and add the matching `minecraft_version`.
 
-| Setting                         |  Default | Purpose                                                  |
-| ------------------------------- | -------: | -------------------------------------------------------- |
-| `schema_version`                |      `2` | Configuration format required by this release.           |
-| `minecraft_version`             | `"26.2"` | Exact backend release, from `"1.20.1"` through `"26.2"`. |
-| `rcon_poll_interval_seconds`    |     `60` | Time between successful player-count checks.             |
-| `rcon_idle_timeout_seconds`     |    `600` | Required proxy/RCON idle time before shutdown.           |
-| `rcon_startup_timeout_seconds`  |    `600` | Maximum time to wait for RCON during startup.            |
-| `rcon_retry_interval_seconds`   |      `2` | Delay between failed RCON connections.                   |
-| `rcon_command_timeout_seconds`  |     `10` | Timeout for an RCON connection or command.               |
-| `shutdown_timeout_seconds`      |     `30` | Graceful shutdown time before forced termination.        |
-| `handshake_timeout_seconds`     |      `5` | Total deadline for handshake and required sleeping packet. |
-| `proxy_connect_timeout_seconds` |     `10` | Time allowed to connect to the backend.                  |
-| `max_connections`               |    `512` | Maximum concurrent client tasks.                         |
-| `motd_*`                        |        — | Sleeping server-list message and style.                  |
-| `connection_msg_*`              |        — | Message shown while starting the server.                 |
+| Setting                         |  Default | Purpose                                                                                                                       |
+| ------------------------------- | -------: | ----------------------------------------------------------------------------------------------------------------------------- |
+| `schema_version`                |      `2` | Configuration format required by this release.                                                                                |
+| `minecraft_version`             | `"26.2"` | Exact backend release, from `"1.20.1"` through `"26.2"`.                                                                      |
+| `rcon_poll_interval_seconds`    |     `60` | Time between successful player-count checks.                                                                                  |
+| `rcon_idle_timeout_seconds`     |    `600` | Required proxy/RCON idle time before shutdown.                                                                                |
+| `rcon_startup_timeout_seconds`  |    `600` | Maximum time to wait for RCON during startup.                                                                                 |
+| `rcon_retry_interval_seconds`   |      `2` | Delay between failed RCON connections.                                                                                        |
+| `rcon_command_timeout_seconds`  |     `10` | Maximum total time to send `stop`. RCON is tried first; if it fails early, the remaining time is used for the server console. |
+| `shutdown_timeout_seconds`      |     `30` | Graceful shutdown time before forced termination.                                                                             |
+| `handshake_timeout_seconds`     |      `5` | Total deadline for handshake and required sleeping packet.                                                                    |
+| `proxy_connect_timeout_seconds` |     `10` | Time allowed to connect to the backend.                                                                                       |
+| `max_connections`               |    `512` | Maximum concurrent client tasks.                                                                                              |
+| `motd_*`                        |        — | Sleeping server-list message and style.                                                                                       |
+| `connection_msg_*`              |        — | Message shown while starting the server.                                                                                      |
 
 Every duration must be greater than zero. Configuration is strict: missing fields, unknown fields, and unsupported schema versions are rejected instead of being guessed or migrated.
 
