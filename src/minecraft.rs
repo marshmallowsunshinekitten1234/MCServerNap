@@ -1,4 +1,5 @@
 use std::io::ErrorKind;
+use std::ops::Range;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -6,7 +7,7 @@ use serde::Serialize;
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 
 use crate::config::Config;
 
@@ -25,6 +26,114 @@ const CONFLICT_DISCONNECT_MESSAGE: &str = "MCServerNap cannot safely start the s
 pub enum LoginIntent {
     Login,
     Transfer,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HandshakeIntent {
+    Status,
+    Login,
+    Transfer,
+    Unknown(i32),
+}
+
+// Deliberately no Debug: forwarding addresses may contain profiles or authentication tokens.
+#[allow(
+    dead_code,
+    reason = "the single-server routing insertion point retains address and port without selecting on them"
+)]
+pub(crate) struct ConnectionEnvelope {
+    socket: TcpStream,
+    framed_handshake: Vec<u8>,
+    protocol_version: i32,
+    requested_address_range: Range<usize>,
+    requested_port: u16,
+    intent: HandshakeIntent,
+}
+
+impl ConnectionEnvelope {
+    pub(crate) async fn read(socket: TcpStream, deadline: Instant) -> Result<Self> {
+        timeout_at(deadline, Self::read_inner(socket))
+            .await
+            .context("initial Minecraft handshake timed out")?
+    }
+
+    async fn read_inner(mut socket: TcpStream) -> Result<Self> {
+        let mut framed_handshake = Vec::with_capacity(3);
+        let mut declared_length = 0usize;
+
+        for position in 0..3 {
+            let byte = socket
+                .read_u8()
+                .await
+                .context("client closed a partial handshake length")?;
+            framed_handshake.push(byte);
+            declared_length |= usize::from(byte & 0x7f) << (position * 7);
+
+            if byte & 0x80 == 0 {
+                ensure!(
+                    declared_length <= MAX_PACKET_LENGTH,
+                    "handshake exceeds protocol limit"
+                );
+                ensure!(
+                    declared_length <= MAX_HANDSHAKE_PACKET_LENGTH,
+                    "handshake length {declared_length} exceeds the {MAX_HANDSHAKE_PACKET_LENGTH}-byte limit"
+                );
+
+                let body_offset = framed_handshake.len();
+                framed_handshake.resize(body_offset + declared_length, 0);
+                socket
+                    .read_exact(&mut framed_handshake[body_offset..])
+                    .await
+                    .context("client closed a partial handshake body")?;
+
+                let handshake = parse_handshake(&framed_handshake[body_offset..])?;
+                let requested_address_range = (body_offset
+                    + handshake.requested_address_range.start)
+                    ..(body_offset + handshake.requested_address_range.end);
+                return Ok(Self {
+                    socket,
+                    framed_handshake,
+                    protocol_version: handshake.protocol_version,
+                    requested_address_range,
+                    requested_port: handshake.requested_port,
+                    intent: handshake.intent,
+                });
+            }
+        }
+
+        bail!("handshake length VarInt exceeds three bytes")
+    }
+
+    pub(crate) const fn protocol_version(&self) -> i32 {
+        self.protocol_version
+    }
+
+    pub(crate) const fn intent(&self) -> HandshakeIntent {
+        self.intent
+    }
+
+    pub(crate) fn socket_mut(&mut self) -> &mut TcpStream {
+        &mut self.socket
+    }
+
+    pub(crate) fn into_proxy_parts(self) -> (TcpStream, Vec<u8>) {
+        (self.socket, self.framed_handshake)
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "the single-server routing insertion point does not consume its endpoint yet"
+)]
+impl ConnectionEnvelope {
+    pub(crate) fn requested_address(&self) -> &str {
+        std::str::from_utf8(&self.framed_handshake[self.requested_address_range.clone()])
+            .expect("requested address was validated while constructing the envelope")
+    }
+
+    pub(crate) const fn requested_port(&self) -> u16 {
+        self.requested_port
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,8 +248,49 @@ impl MinecraftResponder {
         })
     }
 
-    pub async fn read_client_request(&self, socket: &mut TcpStream) -> Result<ClientRequest> {
-        read_client_request_for_version(socket, self.minecraft_version).await
+    pub(crate) async fn read_sleeping_request(
+        &self,
+        connection: &mut ConnectionEnvelope,
+        deadline: Instant,
+    ) -> Result<Option<ClientRequest>> {
+        let login_intent = match connection.intent() {
+            HandshakeIntent::Status => {
+                let request = read_initial_packet(
+                    connection.socket_mut(),
+                    MAX_STATUS_PACKET_LENGTH,
+                    deadline,
+                )
+                .await?;
+                let mut cursor = PacketCursor::new(&request);
+                ensure!(
+                    cursor.read_varint()? == 0,
+                    "expected status request packet ID 0"
+                );
+                cursor.ensure_finished()?;
+                return Ok(Some(ClientRequest::Status));
+            }
+            HandshakeIntent::Login => LoginIntent::Login,
+            HandshakeIntent::Transfer => LoginIntent::Transfer,
+            HandshakeIntent::Unknown(_) => return Ok(None),
+        };
+
+        if connection.protocol_version() != self.minecraft_version.protocol() {
+            return Ok(Some(ClientRequest::UnsupportedProtocol {
+                protocol_version: connection.protocol_version(),
+            }));
+        }
+
+        validate_login_intent(self.minecraft_version, login_intent)?;
+        let login_start = read_initial_packet(
+            connection.socket_mut(),
+            MAX_LOGIN_START_PACKET_LENGTH,
+            deadline,
+        )
+        .await?;
+        parse_login_start(&login_start, self.minecraft_version)?;
+        Ok(Some(ClientRequest::Login {
+            intent: login_intent,
+        }))
     }
 
     pub async fn send_login_disconnect(
@@ -229,49 +379,6 @@ fn is_normal_client_close(error: &anyhow::Error) -> bool {
     })
 }
 
-/// Read and validate the initial protocol exchange while the backend is asleep.
-/// Login requests include a validated Login Start packet so a bare handshake does not wake the server.
-async fn read_client_request_for_version(
-    socket: &mut TcpStream,
-    minecraft_version: MinecraftVersion,
-) -> Result<ClientRequest> {
-    let first = socket
-        .read_u8()
-        .await
-        .context("failed to read the first client byte")?;
-
-    let handshake_packet =
-        read_packet_after_first_byte(socket, first, MAX_HANDSHAKE_PACKET_LENGTH).await?;
-    let handshake = parse_handshake(&handshake_packet)?;
-
-    let intent = match handshake.intent {
-        HandshakeIntent::Status => {
-            let request = read_packet(socket, MAX_STATUS_PACKET_LENGTH).await?;
-            let mut cursor = PacketCursor::new(&request);
-            ensure!(
-                cursor.read_varint()? == 0,
-                "expected status request packet ID 0"
-            );
-            cursor.ensure_finished()?;
-            return Ok(ClientRequest::Status);
-        }
-        HandshakeIntent::Login => LoginIntent::Login,
-        HandshakeIntent::Transfer => LoginIntent::Transfer,
-    };
-
-    if handshake.protocol_version != minecraft_version.protocol() {
-        return Ok(ClientRequest::UnsupportedProtocol {
-            protocol_version: handshake.protocol_version,
-        });
-    }
-
-    validate_login_intent(minecraft_version, intent)?;
-
-    let login_start = read_packet(socket, MAX_LOGIN_START_PACKET_LENGTH).await?;
-    parse_login_start(&login_start, minecraft_version)?;
-    Ok(ClientRequest::Login { intent })
-}
-
 fn validate_login_intent(minecraft_version: MinecraftVersion, intent: LoginIntent) -> Result<()> {
     ensure!(
         intent != LoginIntent::Transfer
@@ -303,16 +410,10 @@ fn parse_login_start(packet: &[u8], minecraft_version: MinecraftVersion) -> Resu
     cursor.ensure_finished()
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HandshakeIntent {
-    Status,
-    Login,
-    Transfer,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Handshake {
     protocol_version: i32,
+    requested_address_range: Range<usize>,
+    requested_port: u16,
     intent: HandshakeIntent,
 }
 
@@ -320,19 +421,31 @@ fn parse_handshake(packet: &[u8]) -> Result<Handshake> {
     let mut cursor = PacketCursor::new(packet);
     ensure!(cursor.read_varint()? == 0, "expected handshake packet ID 0");
     let protocol_version = cursor.read_varint()?;
-    cursor.read_string(255)?;
-    cursor.read_u16()?;
+    let (_, requested_address_range) = cursor.read_string_with_range(255)?;
+    let requested_port = cursor.read_u16()?;
     let intent = match cursor.read_varint()? {
         1 => HandshakeIntent::Status,
         2 => HandshakeIntent::Login,
         3 => HandshakeIntent::Transfer,
-        value => bail!("unsupported handshake intent {value}"),
+        value => HandshakeIntent::Unknown(value),
     };
     cursor.ensure_finished()?;
     Ok(Handshake {
         protocol_version,
+        requested_address_range,
+        requested_port,
         intent,
     })
+}
+
+async fn read_initial_packet(
+    socket: &mut TcpStream,
+    application_limit: usize,
+    deadline: Instant,
+) -> Result<Vec<u8>> {
+    timeout_at(deadline, read_packet(socket, application_limit))
+        .await
+        .context("initial Minecraft exchange timed out")?
 }
 
 async fn read_packet(socket: &mut TcpStream, application_limit: usize) -> Result<Vec<u8>> {
@@ -476,6 +589,13 @@ impl<'a> PacketCursor<'a> {
     }
 
     fn read_string(&mut self, max_utf16_units: usize) -> Result<&'a str> {
+        Ok(self.read_string_with_range(max_utf16_units)?.0)
+    }
+
+    fn read_string_with_range(
+        &mut self,
+        max_utf16_units: usize,
+    ) -> Result<(&'a str, Range<usize>)> {
         let byte_length = self.read_varint()?;
         ensure!(byte_length >= 0, "string has a negative byte length");
         let byte_length = usize::try_from(byte_length).context("string byte length is negative")?;
@@ -483,13 +603,14 @@ impl<'a> PacketCursor<'a> {
             byte_length <= max_utf16_units * 3,
             "string exceeds its encoded byte limit"
         );
+        let start = self.offset;
         let bytes = self.read_bytes(byte_length)?;
         let value = std::str::from_utf8(bytes).context("string is not valid UTF-8")?;
         ensure!(
             value.encode_utf16().count() <= max_utf16_units,
             "string exceeds its UTF-16 length limit"
         );
-        Ok(value)
+        Ok((value, start..self.offset))
     }
 
     fn read_u16(&mut self) -> Result<u16> {
@@ -600,6 +721,41 @@ mod tests {
         packet
     }
 
+    fn responder_for_version(minecraft_version: MinecraftVersion) -> MinecraftResponder {
+        MinecraftResponder::new(
+            &Config {
+                minecraft_version,
+                ..Config::default()
+            },
+            None,
+        )
+        .expect("test responder should be constructed")
+    }
+
+    async fn read_connection(framed_handshake: &[u8]) -> Result<ConnectionEnvelope> {
+        let (mut client, server) = socket_pair().await;
+        client
+            .write_all(framed_handshake)
+            .await
+            .expect("test handshake should write");
+        client
+            .shutdown()
+            .await
+            .expect("test client write half should close");
+        ConnectionEnvelope::read(server, Instant::now() + Duration::from_secs(2)).await
+    }
+
+    async fn read_sleeping_exchange(
+        exchange: &[u8],
+        minecraft_version: MinecraftVersion,
+    ) -> Result<Option<ClientRequest>> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut connection = read_connection(exchange).await?;
+        responder_for_version(minecraft_version)
+            .read_sleeping_request(&mut connection, deadline)
+            .await
+    }
+
     fn encode_login_start_prefix(username: &str) -> Vec<u8> {
         let mut packet = Vec::new();
         write_varint(0, &mut packet);
@@ -647,45 +803,205 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parses_login_and_transfer_handshakes() {
-        let minecraft_version = MinecraftVersion::latest();
-        assert_eq!(
-            parse_handshake(&encode_handshake(
-                minecraft_version.protocol(),
-                "localhost",
-                25565,
-                2,
-            ))
-            .expect("valid login handshake"),
-            Handshake {
-                protocol_version: minecraft_version.protocol(),
-                intent: HandshakeIntent::Login,
+    #[tokio::test]
+    async fn connection_envelope_extracts_routing_metadata_and_all_intents() {
+        let protocol_version = 1_234;
+        let address = "play.example.test";
+        let requested_port = 25_565;
+        for (value, expected) in [
+            (1, HandshakeIntent::Status),
+            (2, HandshakeIntent::Login),
+            (3, HandshakeIntent::Transfer),
+            (77, HandshakeIntent::Unknown(77)),
+        ] {
+            let body = encode_handshake(protocol_version, address, requested_port, value);
+            let framed = frame_raw_packet(&body);
+            let connection = read_connection(&framed)
+                .await
+                .expect("structurally valid handshake should parse");
+
+            assert_eq!(connection.protocol_version(), protocol_version);
+            assert_eq!(connection.requested_address(), address);
+            assert_eq!(connection.requested_port(), requested_port);
+            assert_eq!(connection.intent(), expected);
+            assert_eq!(connection.framed_handshake, framed);
+            let address_pointer = connection.requested_address().as_ptr() as usize;
+            let frame_start = connection.framed_handshake.as_ptr() as usize;
+            assert!((frame_start..frame_start + framed.len()).contains(&address_pointer));
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_envelope_preserves_embedded_nul_address_data() {
+        let address = "localhost\0FORGE\0profile-token";
+        let body = encode_handshake(763, address, 25_565, 2);
+        let connection = read_connection(&frame_raw_packet(&body))
+            .await
+            .expect("Forge-style handshake should parse");
+
+        assert_eq!(connection.requested_address(), address);
+        assert_eq!(connection.intent(), HandshakeIntent::Login);
+    }
+
+    #[tokio::test]
+    async fn connection_envelope_accepts_non_minimal_frame_and_field_varints() {
+        let mut body = vec![0x80, 0x00, 0xfb, 0x00, 0x89, 0x00];
+        body.extend_from_slice(b"localhost");
+        body.extend_from_slice(&25_565_u16.to_be_bytes());
+        body.extend_from_slice(&[0x82, 0x00]);
+        let body_length = u8::try_from(body.len()).expect("test body length fits in one byte");
+        let mut framed = vec![body_length | 0x80, 0x80, 0x00];
+        framed.extend_from_slice(&body);
+
+        let connection = read_connection(&framed)
+            .await
+            .expect("non-minimal VarInts should remain valid");
+        assert_eq!(connection.framed_handshake, framed);
+        assert_eq!(connection.protocol_version(), 123);
+        assert_eq!(connection.requested_address(), "localhost");
+        assert_eq!(connection.requested_port(), 25_565);
+        assert_eq!(connection.intent(), HandshakeIntent::Login);
+    }
+
+    #[tokio::test]
+    async fn connection_envelope_reads_one_byte_fragmentation() {
+        let body = encode_handshake(763, "fragmented.example", 25_565, 3);
+        let framed = frame_raw_packet(&body);
+        let (mut client, server) = socket_pair().await;
+        let expected = framed.clone();
+        let writer = tokio::spawn(async move {
+            for byte in framed {
+                client
+                    .write_all(&[byte])
+                    .await
+                    .expect("fragment should write");
+                tokio::task::yield_now().await;
             }
-        );
-        assert_eq!(
-            parse_handshake(&encode_handshake(
-                minecraft_version.protocol(),
-                "localhost",
-                25565,
-                3,
-            ))
-            .expect("valid transfer handshake")
-            .intent,
-            HandshakeIntent::Transfer
+        });
+
+        let connection = ConnectionEnvelope::read(server, Instant::now() + Duration::from_secs(2))
+            .await
+            .expect("fragmented handshake should parse");
+        writer.await.expect("writer should not panic");
+        assert_eq!(connection.framed_handshake, expected);
+        assert_eq!(connection.requested_address(), "fragmented.example");
+        assert_eq!(connection.intent(), HandshakeIntent::Transfer);
+    }
+
+    #[tokio::test]
+    async fn connection_envelope_enforces_utf16_address_limit() {
+        let accepted = format!("{}a", "😀".repeat(127));
+        assert_eq!(accepted.encode_utf16().count(), 255);
+        let accepted_body = encode_handshake(763, &accepted, 25_565, 2);
+        let connection = read_connection(&frame_raw_packet(&accepted_body))
+            .await
+            .expect("255 UTF-16 code units should be accepted");
+        assert_eq!(connection.requested_address(), accepted);
+
+        let rejected = "😀".repeat(128);
+        assert_eq!(rejected.encode_utf16().count(), 256);
+        let rejected_body = encode_handshake(763, &rejected, 25_565, 2);
+        assert!(
+            read_connection(&frame_raw_packet(&rejected_body))
+                .await
+                .is_err()
         );
     }
 
-    #[test]
-    fn rejects_truncated_and_trailing_handshakes() {
-        let minecraft_version = MinecraftVersion::latest();
-        let mut truncated = encode_handshake(minecraft_version.protocol(), "localhost", 25565, 2);
-        truncated.pop();
-        assert!(parse_handshake(&truncated).is_err());
+    #[tokio::test]
+    async fn oversized_declared_handshake_is_rejected_without_waiting_for_a_body() {
+        let (mut client, server) = socket_pair().await;
+        let mut prefix = Vec::new();
+        write_varint(
+            i32::try_from(MAX_HANDSHAKE_PACKET_LENGTH + 1).expect("test length fits in i32"),
+            &mut prefix,
+        );
+        client
+            .write_all(&prefix)
+            .await
+            .expect("oversized prefix should write");
 
-        let mut trailing = encode_handshake(minecraft_version.protocol(), "localhost", 25565, 2);
+        let result = timeout(
+            Duration::from_millis(100),
+            ConnectionEnvelope::read(server, Instant::now() + Duration::from_secs(1)),
+        )
+        .await
+        .expect("declared length should be rejected before reading a body");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn connection_envelope_rejects_malformed_handshakes_and_frames() {
+        let valid = encode_handshake(763, "localhost", 25_565, 2);
+
+        let mut invalid_utf8 = encode_handshake(763, "x", 25_565, 2);
+        let address_offset = 1 + varint_size(763) + 1;
+        invalid_utf8[address_offset] = 0xff;
+
+        let mut wrong_packet_id = valid.clone();
+        wrong_packet_id[0] = 1;
+
+        let mut trailing = valid.clone();
         trailing.push(0);
-        assert!(parse_handshake(&trailing).is_err());
+
+        for body in [invalid_utf8, wrong_packet_id, trailing] {
+            assert!(read_connection(&frame_raw_packet(&body)).await.is_err());
+        }
+
+        for incomplete_frame in [Vec::new(), vec![0x80], vec![5, 0, 1]] {
+            assert!(read_connection(&incomplete_frame).await.is_err());
+        }
+
+        assert!(read_connection(&[0x80, 0x80, 0x80]).await.is_err());
+
+        let mut structurally_truncated = valid;
+        structurally_truncated.pop();
+        assert!(
+            read_connection(&frame_raw_packet(&structurally_truncated))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initial_deadline_is_absolute_across_handshake_and_sleeping_request() {
+        let body = encode_handshake(763, "localhost", 25_565, 1);
+        let framed = frame_raw_packet(&body);
+        let (mut client, server) = socket_pair().await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let reader = tokio::spawn(async move {
+            let mut connection = ConnectionEnvelope::read(server, deadline).await?;
+            responder_for_version(MinecraftVersion::latest())
+                .read_sleeping_request(&mut connection, deadline)
+                .await
+        });
+
+        for byte in framed {
+            client
+                .write_all(&[byte])
+                .await
+                .expect("trickle byte should write");
+            tokio::time::advance(Duration::from_millis(100)).await;
+        }
+        client
+            .write_all(&[1])
+            .await
+            .expect("status frame prefix should write");
+        let past_original_deadline =
+            deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1);
+        tokio::time::advance(past_original_deadline).await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            reader.is_finished(),
+            "reader should expire at the original absolute deadline"
+        );
+
+        let error = reader
+            .await
+            .expect("reader should not panic")
+            .expect_err("the original deadline should expire");
+        assert_eq!(error.to_string(), "initial Minecraft exchange timed out");
     }
 
     #[test]
@@ -741,68 +1057,51 @@ mod tests {
 
     #[tokio::test]
     async fn reads_coalesced_handshake_and_status_packets() {
-        let (mut client, mut server) = socket_pair().await;
         let handshake = encode_handshake(1234, "localhost", 25565, 1);
         let mut exchange = frame_raw_packet(&handshake);
         exchange.extend_from_slice(&frame_raw_packet(&[0]));
-        client
-            .write_all(&exchange)
-            .await
-            .expect("client exchange should write");
 
         assert_eq!(
-            read_client_request_for_version(&mut server, MinecraftVersion::latest())
+            read_sleeping_exchange(&exchange, MinecraftVersion::latest())
                 .await
                 .expect("coalesced exchange should parse"),
-            ClientRequest::Status
+            Some(ClientRequest::Status)
         );
     }
 
     #[tokio::test]
     async fn login_request_requires_and_consumes_login_start() {
-        let (mut client, mut server) = socket_pair().await;
         let minecraft_version = MinecraftVersion::latest();
         let handshake = encode_handshake(minecraft_version.protocol(), "localhost", 25565, 2);
         let mut exchange = frame_raw_packet(&handshake);
         exchange.extend_from_slice(&frame_raw_packet(&encode_required_uuid_login_start(
             "player", [7; 16],
         )));
-        client
-            .write_all(&exchange)
-            .await
-            .expect("client exchange should write");
-
         assert_eq!(
-            read_client_request_for_version(&mut server, minecraft_version)
+            read_sleeping_exchange(&exchange, minecraft_version)
                 .await
                 .expect("login exchange should parse"),
-            ClientRequest::Login {
+            Some(ClientRequest::Login {
                 intent: LoginIntent::Login
-            }
+            })
         );
     }
 
     #[tokio::test]
     async fn minecraft_1_20_1_login_request_accepts_absent_uuid() {
-        let (mut client, mut server) = socket_pair().await;
         let minecraft_version = version_named("1.20.1");
         let handshake = encode_handshake(minecraft_version.protocol(), "localhost", 25565, 2);
         let mut exchange = frame_raw_packet(&handshake);
         exchange.extend_from_slice(&frame_raw_packet(&encode_optional_uuid_login_start(
             "player", None,
         )));
-        client
-            .write_all(&exchange)
-            .await
-            .expect("client exchange should write");
-
         assert_eq!(
-            read_client_request_for_version(&mut server, minecraft_version)
+            read_sleeping_exchange(&exchange, minecraft_version)
                 .await
                 .expect("1.20.1 login exchange should parse"),
-            ClientRequest::Login {
+            Some(ClientRequest::Login {
                 intent: LoginIntent::Login
-            }
+            })
         );
     }
 
@@ -821,28 +1120,23 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_unconfigured_login_protocol_without_waking() {
-        let (mut client, mut server) = socket_pair().await;
         let minecraft_version = MinecraftVersion::latest();
         let unsupported_protocol = minecraft_version.protocol() - 1;
         let handshake = encode_handshake(unsupported_protocol, "localhost", 25565, 2);
-        client
-            .write_all(&frame_raw_packet(&handshake))
-            .await
-            .expect("client handshake should write");
 
         assert_eq!(
-            read_client_request_for_version(&mut server, minecraft_version)
+            read_sleeping_exchange(&frame_raw_packet(&handshake), minecraft_version)
                 .await
                 .expect("handshake should parse"),
-            ClientRequest::UnsupportedProtocol {
+            Some(ClientRequest::UnsupportedProtocol {
                 protocol_version: unsupported_protocol
-            }
+            })
         );
     }
 
     #[tokio::test]
     async fn rejects_legacy_unframed_ping() {
-        let (mut client, mut server) = socket_pair().await;
+        let (mut client, server) = socket_pair().await;
         client
             .write_all(&[0xfe, 0x01])
             .await
@@ -853,25 +1147,9 @@ mod tests {
             .expect("legacy client write half should close");
 
         assert!(
-            read_client_request_for_version(&mut server, MinecraftVersion::latest())
+            ConnectionEnvelope::read(server, Instant::now() + Duration::from_secs(2))
                 .await
                 .is_err()
-        );
-    }
-
-    #[test]
-    fn accepts_forge_handshake_hostname_marker() {
-        let handshake = encode_handshake(
-            version_named("1.20.1").protocol(),
-            "localhost\0FORGE",
-            25565,
-            2,
-        );
-        assert_eq!(
-            parse_handshake(&handshake)
-                .expect("Forge handshake should parse")
-                .intent,
-            HandshakeIntent::Login
         );
     }
 
