@@ -61,6 +61,10 @@ Everything after `--` is passed to the server command. The backend and RCON host
 
 When the backend is confirmed stopped, the first login attempt starts it and receives the configured startup message. The player reconnects once the server is ready.
 
+Automatic idle stopping requires both Login/Transfer proxy-session idleness and continuous RCON evidence of zero players, followed by a fresh final RCON check. Login/Transfer tracking represents open proxy connections, not authenticated players: a client that holds one of these connections open conservatively prevents automatic stopping.
+
+Status connections do not reset the activity timer. They are best-effort at the final stop boundary and may be interrupted if an idle stop commits after their handshake has been forwarded.
+
 If the server fails to start or later exits unexpectedly, MCServerNap does not keep restarting it on its own. A new login attempt schedules one more start after a cooldown; consecutive failures increase the cooldown through 5, 10, 20, 40, and at most 60 seconds.
 
 Launch commands inherit MCServerNap's working directory. A launch script should change to the server directory and remain attached to Java until it exits. On Unix, finish with `exec java ...`; on Windows, do not use `start` or `Start-Process`.
@@ -78,7 +82,7 @@ Existing configurations must set `schema_version = 2` and add the matching `mine
 | `schema_version`                |      `2` | Configuration format required by this release.           |
 | `minecraft_version`             | `"26.2"` | Exact backend release, from `"1.20.1"` through `"26.2"`. |
 | `rcon_poll_interval_seconds`    |     `60` | Time between successful player-count checks.             |
-| `rcon_idle_timeout_seconds`     |    `600` | Confirmed-empty time before shutdown.                    |
+| `rcon_idle_timeout_seconds`     |    `600` | Required proxy/RCON idle time before shutdown.           |
 | `rcon_startup_timeout_seconds`  |    `600` | Maximum time to wait for RCON during startup.            |
 | `rcon_retry_interval_seconds`   |      `2` | Delay between failed RCON connections.                   |
 | `rcon_command_timeout_seconds`  |     `10` | Timeout for an RCON connection or command.               |
