@@ -19,6 +19,7 @@ const MAX_PACKET_LENGTH: usize = (1 << 21) - 1;
 const MAX_HANDSHAKE_PACKET_LENGTH: usize = 1_024;
 const MAX_LOGIN_START_PACKET_LENGTH: usize = 128;
 const MAX_STATUS_PACKET_LENGTH: usize = 32;
+const CONFLICT_DISCONNECT_MESSAGE: &str = "MCServerNap cannot safely start the server because the backend state is uncertain. Try again later or contact the server administrator.";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LoginIntent {
@@ -38,6 +39,7 @@ pub struct MinecraftResponder {
     minecraft_version: MinecraftVersion,
     status_response: Vec<u8>,
     login_disconnect: Vec<u8>,
+    conflict_disconnect: Vec<u8>,
     incompatible_disconnect: Vec<u8>,
 }
 
@@ -108,6 +110,13 @@ impl MinecraftResponder {
         let disconnect_json = serde_json::to_string(&disconnect_component)
             .context("failed to serialize the login disconnect message")?;
         let login_disconnect = encode_string_packet(0, &disconnect_json)?;
+        let conflict_component = json!({
+            "text": CONFLICT_DISCONNECT_MESSAGE,
+            "color": "red",
+        });
+        let conflict_json = serde_json::to_string(&conflict_component)
+            .context("failed to serialize the conflict disconnect message")?;
+        let conflict_disconnect = encode_string_packet(0, &conflict_json)?;
         let incompatible_component = json!({
             "text": format!(
                 "This server requires Minecraft Java {} (protocol {}).",
@@ -125,6 +134,7 @@ impl MinecraftResponder {
             minecraft_version,
             status_response,
             login_disconnect,
+            conflict_disconnect,
             incompatible_disconnect,
         })
     }
@@ -181,6 +191,17 @@ impl MinecraftResponder {
                 .context("failed to send status pong")?;
         }
 
+        shutdown_with_timeout(socket, operation_timeout).await
+    }
+
+    pub async fn send_conflict_disconnect(
+        &self,
+        socket: &mut TcpStream,
+        operation_timeout: Duration,
+    ) -> Result<()> {
+        write_all_with_timeout(socket, &self.conflict_disconnect, operation_timeout)
+            .await
+            .context("failed to send conflict disconnect")?;
         shutdown_with_timeout(socket, operation_timeout).await
     }
 
@@ -690,6 +711,32 @@ mod tests {
             assert_eq!(value["version"]["protocol"], minecraft_version.protocol());
             assert_eq!(value["version"]["name"], minecraft_version.name());
         }
+    }
+
+    #[test]
+    fn conflict_disconnect_is_fixed_and_red() {
+        let responder = MinecraftResponder::new(&Config::default(), None)
+            .expect("responder should be constructed");
+        let (frame_length, frame_prefix) =
+            decode_varint(&responder.conflict_disconnect).expect("frame length");
+        assert_eq!(
+            usize::try_from(frame_length).expect("positive frame length"),
+            responder.conflict_disconnect.len() - frame_prefix
+        );
+        let mut cursor = PacketCursor::new(&responder.conflict_disconnect[frame_prefix..]);
+        assert_eq!(cursor.read_varint().expect("disconnect packet ID"), 0);
+        let component: Value = serde_json::from_str(
+            cursor
+                .read_string(32_767)
+                .expect("disconnect JSON should be present"),
+        )
+        .expect("disconnect component should be valid JSON");
+        cursor
+            .ensure_finished()
+            .expect("disconnect packet should have no trailing data");
+        assert_eq!(component["text"], CONFLICT_DISCONNECT_MESSAGE);
+        assert_eq!(component["color"], "red");
+        assert_eq!(component.as_object().expect("JSON object").len(), 2);
     }
 
     #[tokio::test]

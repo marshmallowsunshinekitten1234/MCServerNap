@@ -1,25 +1,38 @@
 use std::future::Future;
+use std::io::ErrorKind;
 use std::process::ExitStatus;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use tokio::net::TcpStream;
 use tokio::process::Child;
 use tokio::sync::oneshot::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, sleep_until, timeout};
 
 use crate::process;
-use crate::rcon::RconClient;
+use crate::rcon::{self, RconClient, RconProbeClassification};
 
 const STABILITY_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServerPhase {
+    Reconciling,
     Stopped,
     Starting,
     Running,
     Stopping,
     Cooldown,
+    External,
+    Conflict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconciliationEvidence {
+    None,
+    Inconclusive,
+    Positive,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,9 +51,23 @@ pub(crate) struct LifecycleState {
     failure_streak: u32,
     phase_started_at: Instant,
     retry_at: Option<Instant>,
+    reconciliation_evidence: ReconciliationEvidence,
 }
 
 impl LifecycleState {
+    pub(crate) fn reconciling() -> Self {
+        Self {
+            phase: ServerPhase::Reconciling,
+            launch_generation: 0,
+            failure: None,
+            failure_streak: 0,
+            phase_started_at: Instant::now(),
+            retry_at: None,
+            reconciliation_evidence: ReconciliationEvidence::None,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn stopped() -> Self {
         Self {
             phase: ServerPhase::Stopped,
@@ -49,11 +76,43 @@ impl LifecycleState {
             failure_streak: 0,
             phase_started_at: Instant::now(),
             retry_at: None,
+            reconciliation_evidence: ReconciliationEvidence::None,
         }
     }
 
     pub(crate) const fn phase(self) -> ServerPhase {
         self.phase
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_phase(phase: ServerPhase) -> Self {
+        let reconciliation_evidence = match phase {
+            ServerPhase::External => ReconciliationEvidence::Positive,
+            ServerPhase::Conflict => ReconciliationEvidence::Inconclusive,
+            _ => ReconciliationEvidence::None,
+        };
+        let state = Self {
+            phase,
+            reconciliation_evidence,
+            ..Self::stopped()
+        };
+        assert!(state.invariant_holds());
+        state
+    }
+
+    fn invariant_holds(self) -> bool {
+        match self.phase {
+            ServerPhase::Reconciling => true,
+            ServerPhase::External => {
+                self.reconciliation_evidence == ReconciliationEvidence::Positive
+            }
+            ServerPhase::Conflict => self.reconciliation_evidence != ReconciliationEvidence::None,
+            ServerPhase::Stopped
+            | ServerPhase::Starting
+            | ServerPhase::Running
+            | ServerPhase::Stopping
+            | ServerPhase::Cooldown => self.reconciliation_evidence == ReconciliationEvidence::None,
+        }
     }
 }
 
@@ -74,8 +133,15 @@ impl WakeRequest {
             && self.observed.launch_generation == current.launch_generation
             && matches!(
                 self.observed.phase,
-                ServerPhase::Stopped | ServerPhase::Stopping | ServerPhase::Cooldown
+                ServerPhase::Reconciling
+                    | ServerPhase::Stopped
+                    | ServerPhase::Stopping
+                    | ServerPhase::Cooldown
             )
+    }
+
+    fn requests_conflict_reconciliation(self, current: LifecycleState) -> bool {
+        current.phase == ServerPhase::Conflict && self.observed == current
     }
 
     fn requests_restart(self, current: LifecycleState) -> bool {
@@ -110,6 +176,26 @@ pub struct SupervisorConfig {
     pub shutdown_timeout: Duration,
 }
 
+pub(crate) struct BackendEndpoint {
+    host: Arc<str>,
+    port: u16,
+    connect_timeout: Duration,
+    #[cfg(test)]
+    scripted_probes: Option<tokio::sync::Mutex<mpsc::UnboundedReceiver<ReconciliationResult>>>,
+}
+
+impl BackendEndpoint {
+    pub(crate) fn network(host: Arc<str>, port: u16, connect_timeout: Duration) -> Self {
+        Self {
+            host,
+            port,
+            connect_timeout,
+            #[cfg(test)]
+            scripted_probes: None,
+        }
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum CycleOutcome {
     Stopped,
@@ -136,6 +222,76 @@ enum CooldownOutcome {
     Shutdown,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BackendProbeClassification {
+    Connected,
+    Refused,
+    Inconclusive,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconciliationClassification {
+    Clean,
+    FullyReady,
+    Positive,
+    Inconclusive,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ConflictClassification {
+    rcon: RconProbeClassification,
+    backend: BackendProbeClassification,
+    sticky_positive: bool,
+}
+
+struct BackendProbeResult {
+    classification: BackendProbeClassification,
+    detail: Option<anyhow::Error>,
+}
+
+struct ReconciliationResult {
+    rcon: rcon::RconProbeResult,
+    backend: BackendProbeResult,
+}
+
+impl ReconciliationResult {
+    fn classification(&self) -> ReconciliationClassification {
+        use BackendProbeClassification::{Connected, Inconclusive as BackendInconclusive, Refused};
+        use RconProbeClassification::{
+            AcceptedFailure, Authenticated, Inconclusive as RconInconclusive,
+            Refused as RconRefused,
+        };
+
+        match (self.rcon.classification, self.backend.classification) {
+            (Authenticated, Connected) => ReconciliationClassification::FullyReady,
+            (Authenticated | AcceptedFailure, _) | (_, Connected) => {
+                ReconciliationClassification::Positive
+            }
+            (RconRefused, Refused) => ReconciliationClassification::Clean,
+            (RconRefused | RconInconclusive, Refused | BackendInconclusive) => {
+                ReconciliationClassification::Inconclusive
+            }
+        }
+    }
+
+    fn conflict_classification(&self, sticky_positive: bool) -> ConflictClassification {
+        ConflictClassification {
+            rcon: self.rcon.classification,
+            backend: self.backend.classification,
+            sticky_positive,
+        }
+    }
+
+    fn log_details(&self) {
+        if let Some(error) = &self.rcon.detail {
+            log::debug!("RCON reconciliation detail: {error:#}");
+        }
+        if let Some(error) = &self.backend.detail {
+            log::debug!("Minecraft backend reconciliation detail: {error:#}");
+        }
+    }
+}
+
 struct SupervisorControl {
     wake_requests: mpsc::Receiver<WakeRequest>,
     shutdown: oneshot::Receiver<()>,
@@ -143,7 +299,7 @@ struct SupervisorControl {
 }
 
 impl SupervisorControl {
-    async fn wait_for_wake(&mut self) -> bool {
+    async fn wait_for_reconciliation_demand(&mut self) -> bool {
         loop {
             // Closure is terminal even when the one-slot wake latch is still occupied.
             if self.wake_requests.is_closed() {
@@ -158,7 +314,10 @@ impl SupervisorControl {
                     let Some(request) = request else {
                         return false;
                     };
-                    if request.can_start(self.current_lifecycle()) {
+                    let current = self.current_lifecycle();
+                    if request.can_start(current)
+                        || request.requests_conflict_reconciliation(current)
+                    {
                         return true;
                     }
                     log::debug!("Ignoring stale server wake-up request");
@@ -178,31 +337,49 @@ impl SupervisorControl {
         *self.lifecycle.borrow()
     }
 
-    fn finish_launch_attempt(&self, phase: ServerPhase) {
+    fn publish(&self, next: LifecycleState) {
+        assert!(next.invariant_holds(), "invalid lifecycle state: {next:?}");
+        self.lifecycle.send_replace(next);
+    }
+
+    fn record_launch_success(&self) {
         let current = self.current_lifecycle();
+        assert_eq!(current.phase, ServerPhase::Reconciling);
+        assert_ne!(
+            current.reconciliation_evidence,
+            ReconciliationEvidence::Positive
+        );
         // Every request that observed the pre-launch phase belongs to the same coalesced burst.
-        self.lifecycle.send_replace(LifecycleState {
-            phase,
+        self.publish(LifecycleState {
+            phase: ServerPhase::Starting,
             launch_generation: current.launch_generation.wrapping_add(1),
+            failure: current.failure,
+            failure_streak: current.failure_streak,
             phase_started_at: Instant::now(),
             retry_at: None,
-            ..current
+            reconciliation_evidence: ReconciliationEvidence::None,
         });
     }
 
     fn record_launch_failure(&self) -> Instant {
         let current = self.current_lifecycle();
+        assert_eq!(current.phase, ServerPhase::Reconciling);
+        assert_ne!(
+            current.reconciliation_evidence,
+            ReconciliationEvidence::Positive
+        );
         let failure_streak = current.failure_streak.saturating_add(1);
         let now = Instant::now();
         let retry_delay = failure_backoff(failure_streak);
         let retry_at = now + retry_delay;
-        self.lifecycle.send_replace(LifecycleState {
+        self.publish(LifecycleState {
             phase: ServerPhase::Cooldown,
             launch_generation: current.launch_generation.wrapping_add(1),
             failure: Some(FailureCategory::LaunchFailed),
             failure_streak,
             phase_started_at: now,
             retry_at: Some(retry_at),
+            reconciliation_evidence: ReconciliationEvidence::None,
         });
         log_failure_cooldown(FailureCategory::LaunchFailed, failure_streak, retry_delay);
         retry_at
@@ -210,17 +387,26 @@ impl SupervisorControl {
 
     fn record_reaped_failure(&self, failure: FailureCategory) -> Instant {
         let current = self.current_lifecycle();
+        assert!(matches!(
+            current.phase,
+            ServerPhase::Starting | ServerPhase::Running
+        ));
+        assert_eq!(
+            current.reconciliation_evidence,
+            ReconciliationEvidence::None
+        );
         let failure_streak = current.failure_streak.saturating_add(1);
         let now = Instant::now();
         let retry_delay = failure_backoff(failure_streak);
         let retry_at = now + retry_delay;
-        self.lifecycle.send_replace(LifecycleState {
+        self.publish(LifecycleState {
             phase: ServerPhase::Cooldown,
+            launch_generation: current.launch_generation,
             failure: Some(failure),
             failure_streak,
             phase_started_at: now,
             retry_at: Some(retry_at),
-            ..current
+            reconciliation_evidence: ReconciliationEvidence::None,
         });
         log_failure_cooldown(failure, failure_streak, retry_delay);
         retry_at
@@ -228,27 +414,41 @@ impl SupervisorControl {
 
     fn begin_failure_cleanup(&self, failure: FailureCategory) -> Duration {
         let current = self.current_lifecycle();
+        assert_eq!(current.phase, ServerPhase::Starting);
+        assert_eq!(
+            current.reconciliation_evidence,
+            ReconciliationEvidence::None
+        );
         let failure_streak = current.failure_streak.saturating_add(1);
-        self.lifecycle.send_replace(LifecycleState {
+        self.publish(LifecycleState {
             phase: ServerPhase::Stopping,
+            launch_generation: current.launch_generation,
             failure: Some(failure),
             failure_streak,
             phase_started_at: Instant::now(),
             retry_at: None,
-            ..current
+            reconciliation_evidence: ReconciliationEvidence::None,
         });
         failure_backoff(failure_streak)
     }
 
     fn finish_failure_cleanup(&self, retry_delay: Duration) -> Instant {
         let current = self.current_lifecycle();
+        assert_eq!(current.phase, ServerPhase::Stopping);
+        assert_eq!(
+            current.reconciliation_evidence,
+            ReconciliationEvidence::None
+        );
         let now = Instant::now();
         let retry_at = now + retry_delay;
-        self.lifecycle.send_replace(LifecycleState {
+        self.publish(LifecycleState {
             phase: ServerPhase::Cooldown,
+            launch_generation: current.launch_generation,
+            failure: current.failure,
+            failure_streak: current.failure_streak,
             phase_started_at: now,
             retry_at: Some(retry_at),
-            ..current
+            reconciliation_evidence: ReconciliationEvidence::None,
         });
         log_failure_cooldown(
             current
@@ -262,21 +462,119 @@ impl SupervisorControl {
 
     fn reset_failure_streak(&self) {
         let current = self.current_lifecycle();
-        self.lifecycle.send_replace(LifecycleState {
+        assert_eq!(current.phase, ServerPhase::Running);
+        assert_eq!(
+            current.reconciliation_evidence,
+            ReconciliationEvidence::None
+        );
+        self.publish(LifecycleState {
+            phase: current.phase,
+            launch_generation: current.launch_generation,
             failure: None,
             failure_streak: 0,
+            phase_started_at: current.phase_started_at,
             retry_at: None,
-            ..current
+            reconciliation_evidence: ReconciliationEvidence::None,
         });
     }
 
     fn set_phase(&self, phase: ServerPhase) {
-        let current = self.current_lifecycle();
-        self.lifecycle.send_replace(LifecycleState {
+        assert!(matches!(
             phase,
+            ServerPhase::Stopped
+                | ServerPhase::Starting
+                | ServerPhase::Running
+                | ServerPhase::Stopping
+                | ServerPhase::Cooldown
+        ));
+        let current = self.current_lifecycle();
+        assert_eq!(
+            current.reconciliation_evidence,
+            ReconciliationEvidence::None
+        );
+        self.publish(LifecycleState {
+            phase,
+            launch_generation: current.launch_generation,
+            failure: current.failure,
+            failure_streak: current.failure_streak,
             phase_started_at: Instant::now(),
             retry_at: None,
-            ..current
+            reconciliation_evidence: ReconciliationEvidence::None,
+        });
+    }
+
+    fn begin_reconciliation(&self) -> ReconciliationEvidence {
+        let current = self.current_lifecycle();
+        assert!(matches!(
+            current.phase,
+            ServerPhase::Stopped | ServerPhase::Cooldown | ServerPhase::Conflict
+        ));
+        self.publish(LifecycleState {
+            phase: ServerPhase::Reconciling,
+            launch_generation: current.launch_generation,
+            failure: current.failure,
+            failure_streak: current.failure_streak,
+            phase_started_at: Instant::now(),
+            retry_at: current.retry_at,
+            reconciliation_evidence: current.reconciliation_evidence,
+        });
+        current.reconciliation_evidence
+    }
+
+    fn publish_stopped_after_clean_reconciliation(&self) {
+        let current = self.current_lifecycle();
+        assert_eq!(current.phase, ServerPhase::Reconciling);
+        self.publish(LifecycleState {
+            phase: ServerPhase::Stopped,
+            launch_generation: current.launch_generation,
+            failure: current.failure,
+            failure_streak: current.failure_streak,
+            phase_started_at: Instant::now(),
+            retry_at: None,
+            reconciliation_evidence: ReconciliationEvidence::None,
+        });
+    }
+
+    fn publish_external(&self, consume_demand: bool) {
+        let current = self.current_lifecycle();
+        assert!(matches!(
+            current.phase,
+            ServerPhase::Reconciling | ServerPhase::External
+        ));
+        self.publish(LifecycleState {
+            phase: ServerPhase::External,
+            launch_generation: if consume_demand {
+                current.launch_generation.wrapping_add(1)
+            } else {
+                current.launch_generation
+            },
+            failure: current.failure,
+            failure_streak: current.failure_streak,
+            phase_started_at: Instant::now(),
+            retry_at: None,
+            reconciliation_evidence: ReconciliationEvidence::Positive,
+        });
+    }
+
+    fn publish_conflict(&self, evidence: ReconciliationEvidence, consume_demand: bool) {
+        assert_ne!(evidence, ReconciliationEvidence::None);
+        let current = self.current_lifecycle();
+        assert!(matches!(
+            current.phase,
+            ServerPhase::Reconciling | ServerPhase::External
+        ));
+        self.publish(LifecycleState {
+            phase: ServerPhase::Conflict,
+            launch_generation: if consume_demand {
+                current.launch_generation.wrapping_add(1)
+            } else {
+                current.launch_generation
+            },
+            failure: current.failure,
+            failure_streak: current.failure_streak,
+            phase_started_at: Instant::now(),
+            retry_at: None,
+            reconciliation_evidence: evidence,
         });
     }
 
@@ -328,6 +626,342 @@ impl SupervisorControl {
     }
 }
 
+enum ReconciliationWaitOutcome {
+    Completed {
+        result: ReconciliationResult,
+        startup_demand: bool,
+    },
+    Shutdown,
+}
+
+#[derive(Debug)]
+enum StartupReconciliationOutcome {
+    Idle,
+    Launch,
+    Shutdown,
+}
+
+#[derive(Debug)]
+enum FinalGateOutcome {
+    Launch,
+    Blocked,
+    Shutdown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExternalMonitorOutcome {
+    Conflict,
+    Shutdown,
+}
+
+async fn probe_backend(endpoint: &BackendEndpoint) -> BackendProbeResult {
+    match timeout(
+        endpoint.connect_timeout,
+        TcpStream::connect((endpoint.host.as_ref(), endpoint.port)),
+    )
+    .await
+    {
+        Ok(Ok(_)) => BackendProbeResult {
+            classification: BackendProbeClassification::Connected,
+            detail: None,
+        },
+        Ok(Err(error)) if error.kind() == ErrorKind::ConnectionRefused => BackendProbeResult {
+            classification: BackendProbeClassification::Refused,
+            detail: Some(error.into()),
+        },
+        Ok(Err(error)) => BackendProbeResult {
+            classification: BackendProbeClassification::Inconclusive,
+            detail: Some(error.into()),
+        },
+        Err(_) => BackendProbeResult {
+            classification: BackendProbeClassification::Inconclusive,
+            detail: Some(anyhow::anyhow!(
+                "Minecraft backend TCP connection timed out"
+            )),
+        },
+    }
+}
+
+async fn reconciliation_probe(
+    config: &SupervisorConfig,
+    backend: &BackendEndpoint,
+) -> ReconciliationResult {
+    #[cfg(test)]
+    if let Some(scripted_probes) = &backend.scripted_probes {
+        return scripted_probes
+            .lock()
+            .await
+            .recv()
+            .await
+            .expect("test reconciliation script ended unexpectedly");
+    }
+
+    let (rcon, backend) = tokio::join!(
+        rcon::probe(
+            &config.rcon_address,
+            &config.rcon_password,
+            config.command_timeout,
+        ),
+        probe_backend(backend),
+    );
+    ReconciliationResult { rcon, backend }
+}
+
+async fn wait_for_reconciliation(
+    control: &mut SupervisorControl,
+    config: &SupervisorConfig,
+    backend: &BackendEndpoint,
+    latch_startup_demand: bool,
+) -> ReconciliationWaitOutcome {
+    let probe = reconciliation_probe(config, backend);
+    tokio::pin!(probe);
+    let mut startup_demand = false;
+
+    loop {
+        if control.wake_requests.is_closed() {
+            return ReconciliationWaitOutcome::Shutdown;
+        }
+
+        tokio::select! {
+            biased;
+
+            _ = &mut control.shutdown => {
+                return ReconciliationWaitOutcome::Shutdown;
+            }
+            result = &mut probe => {
+                return ReconciliationWaitOutcome::Completed {
+                    result,
+                    startup_demand,
+                };
+            }
+            request = control.wake_requests.recv() => {
+                let Some(request) = request else {
+                    return ReconciliationWaitOutcome::Shutdown;
+                };
+                if latch_startup_demand
+                    && !startup_demand
+                    && request.observed == control.current_lifecycle()
+                {
+                    startup_demand = true;
+                    log::info!("Latched one server wake-up request during startup reconciliation");
+                } else {
+                    log::debug!("Ignoring coalesced server wake-up request during reconciliation");
+                }
+            }
+        }
+    }
+}
+
+fn publish_conflict_observation(
+    control: &SupervisorControl,
+    result: &ReconciliationResult,
+    evidence: ReconciliationEvidence,
+    consume_demand: bool,
+    last_conflict: &mut Option<ConflictClassification>,
+) {
+    let sticky_positive = evidence == ReconciliationEvidence::Positive;
+    let classification = result.conflict_classification(sticky_positive);
+    control.publish_conflict(evidence, consume_demand);
+    if conflict_warning_changed(last_conflict, classification) {
+        let next_step = if sticky_positive {
+            "restore full external readiness and try another login, or, after independently verifying process exit, restart the listener to clear remembered evidence"
+        } else {
+            "another login may retry reconciliation"
+        };
+        log::warn!(
+            "Backend conflict: RCON={:?}, backend-port={:?}, sticky-positive={sticky_positive}; {next_step}",
+            classification.rcon,
+            classification.backend,
+        );
+    }
+}
+
+fn conflict_warning_changed(
+    last_conflict: &mut Option<ConflictClassification>,
+    classification: ConflictClassification,
+) -> bool {
+    if last_conflict.as_ref() == Some(&classification) {
+        return false;
+    }
+    *last_conflict = Some(classification);
+    true
+}
+
+async fn reconcile_startup(
+    control: &mut SupervisorControl,
+    config: &SupervisorConfig,
+    backend: &BackendEndpoint,
+    last_conflict: &mut Option<ConflictClassification>,
+) -> StartupReconciliationOutcome {
+    let ReconciliationWaitOutcome::Completed {
+        result,
+        startup_demand,
+    } = wait_for_reconciliation(control, config, backend, true).await
+    else {
+        return StartupReconciliationOutcome::Shutdown;
+    };
+    result.log_details();
+    if control.shutdown_pending() {
+        return StartupReconciliationOutcome::Shutdown;
+    }
+
+    match result.classification() {
+        ReconciliationClassification::Clean => {
+            control.publish_stopped_after_clean_reconciliation();
+            *last_conflict = None;
+            if startup_demand {
+                StartupReconciliationOutcome::Launch
+            } else {
+                StartupReconciliationOutcome::Idle
+            }
+        }
+        ReconciliationClassification::FullyReady => {
+            control.publish_external(startup_demand);
+            *last_conflict = None;
+            StartupReconciliationOutcome::Idle
+        }
+        ReconciliationClassification::Positive => {
+            publish_conflict_observation(
+                control,
+                &result,
+                ReconciliationEvidence::Positive,
+                startup_demand,
+                last_conflict,
+            );
+            StartupReconciliationOutcome::Idle
+        }
+        ReconciliationClassification::Inconclusive => {
+            publish_conflict_observation(
+                control,
+                &result,
+                ReconciliationEvidence::Inconclusive,
+                startup_demand,
+                last_conflict,
+            );
+            StartupReconciliationOutcome::Idle
+        }
+    }
+}
+
+async fn reconcile_final_gate(
+    control: &mut SupervisorControl,
+    config: &SupervisorConfig,
+    backend: &BackendEndpoint,
+    last_conflict: &mut Option<ConflictClassification>,
+) -> FinalGateOutcome {
+    let prior_evidence = control.begin_reconciliation();
+    let ReconciliationWaitOutcome::Completed { result, .. } =
+        wait_for_reconciliation(control, config, backend, false).await
+    else {
+        return FinalGateOutcome::Shutdown;
+    };
+    result.log_details();
+    if control.shutdown_pending() {
+        return FinalGateOutcome::Shutdown;
+    }
+
+    let classification = result.classification();
+    if prior_evidence == ReconciliationEvidence::Positive {
+        if classification == ReconciliationClassification::FullyReady {
+            control.publish_external(true);
+            *last_conflict = None;
+        } else {
+            publish_conflict_observation(
+                control,
+                &result,
+                ReconciliationEvidence::Positive,
+                true,
+                last_conflict,
+            );
+        }
+        return FinalGateOutcome::Blocked;
+    }
+
+    match classification {
+        ReconciliationClassification::Clean => {
+            *last_conflict = None;
+            FinalGateOutcome::Launch
+        }
+        ReconciliationClassification::FullyReady => {
+            control.publish_external(true);
+            *last_conflict = None;
+            FinalGateOutcome::Blocked
+        }
+        ReconciliationClassification::Positive => {
+            publish_conflict_observation(
+                control,
+                &result,
+                ReconciliationEvidence::Positive,
+                true,
+                last_conflict,
+            );
+            FinalGateOutcome::Blocked
+        }
+        ReconciliationClassification::Inconclusive => {
+            publish_conflict_observation(
+                control,
+                &result,
+                ReconciliationEvidence::Inconclusive,
+                true,
+                last_conflict,
+            );
+            FinalGateOutcome::Blocked
+        }
+    }
+}
+
+async fn monitor_external_server(
+    control: &mut SupervisorControl,
+    config: &SupervisorConfig,
+    backend: &BackendEndpoint,
+    last_conflict: &mut Option<ConflictClassification>,
+) -> ExternalMonitorOutcome {
+    let mut next_poll = Instant::now() + config.poll_interval;
+
+    loop {
+        if control.wake_requests.is_closed() {
+            return ExternalMonitorOutcome::Shutdown;
+        }
+
+        tokio::select! {
+            biased;
+
+            _ = &mut control.shutdown => return ExternalMonitorOutcome::Shutdown,
+            request = control.wake_requests.recv() => {
+                if request.is_none() {
+                    return ExternalMonitorOutcome::Shutdown;
+                }
+                log::debug!("Ignoring stale server wake-up request while proxying an external backend");
+                continue;
+            }
+            () = sleep_until(next_poll) => {}
+        }
+
+        let ReconciliationWaitOutcome::Completed { result, .. } =
+            wait_for_reconciliation(control, config, backend, false).await
+        else {
+            return ExternalMonitorOutcome::Shutdown;
+        };
+        result.log_details();
+        if control.shutdown_pending() {
+            return ExternalMonitorOutcome::Shutdown;
+        }
+        if result.classification() == ReconciliationClassification::FullyReady {
+            next_poll = Instant::now() + config.poll_interval;
+            continue;
+        }
+
+        publish_conflict_observation(
+            control,
+            &result,
+            ReconciliationEvidence::Positive,
+            false,
+            last_conflict,
+        );
+        return ExternalMonitorOutcome::Conflict;
+    }
+}
+
 fn failure_backoff(failure_streak: u32) -> Duration {
     assert!(failure_streak > 0, "failure streak must be nonzero");
     Duration::from_secs(match failure_streak {
@@ -350,30 +984,53 @@ pub(crate) async fn run(
     shutdown: oneshot::Receiver<()>,
     lifecycle: watch::Sender<LifecycleState>,
     config: SupervisorConfig,
+    backend: BackendEndpoint,
 ) -> Result<()> {
     let mut control = SupervisorControl {
         wake_requests,
         shutdown,
         lifecycle,
     };
-    control.lifecycle.send_replace(LifecycleState::stopped());
-    let mut launch_pending = false;
+    assert_eq!(control.current_lifecycle().phase, ServerPhase::Reconciling);
+    assert!(control.current_lifecycle().invariant_holds());
+    let mut last_conflict = None;
+    let mut launch_pending =
+        match reconcile_startup(&mut control, &config, &backend, &mut last_conflict).await {
+            StartupReconciliationOutcome::Launch => true,
+            StartupReconciliationOutcome::Idle => false,
+            StartupReconciliationOutcome::Shutdown => return Ok(()),
+        };
 
     loop {
-        if !launch_pending && !control.wait_for_wake().await {
-            control.set_phase(ServerPhase::Stopped);
+        if control.current_lifecycle().phase == ServerPhase::External {
+            match monitor_external_server(&mut control, &config, &backend, &mut last_conflict).await
+            {
+                ExternalMonitorOutcome::Conflict => {}
+                ExternalMonitorOutcome::Shutdown => return Ok(()),
+            }
+        }
+
+        if !launch_pending && !control.wait_for_reconciliation_demand().await {
+            if control.current_lifecycle().phase == ServerPhase::Stopped {
+                control.set_phase(ServerPhase::Stopped);
+            }
             return Ok(());
         }
         launch_pending = false;
 
         if control.shutdown_pending() {
-            control.set_phase(ServerPhase::Stopped);
             return Ok(());
+        }
+
+        match reconcile_final_gate(&mut control, &config, &backend, &mut last_conflict).await {
+            FinalGateOutcome::Launch => {}
+            FinalGateOutcome::Blocked => continue,
+            FinalGateOutcome::Shutdown => return Ok(()),
         }
 
         let child = match process::launch(&config.command, &config.arguments) {
             Ok(child) => {
-                control.finish_launch_attempt(ServerPhase::Starting);
+                control.record_launch_success();
                 child
             }
             Err(error) => {
@@ -997,6 +1654,7 @@ mod tests {
     const TEST_EXEC_COMMAND: i32 = 2;
     const TEST_RESPONSE_VALUE: i32 = 0;
 
+    #[derive(Debug)]
     struct TestRconPacket {
         id: i32,
         kind: i32,
@@ -1225,6 +1883,63 @@ mod tests {
         }
     }
 
+    fn test_reconciliation(
+        rcon: RconProbeClassification,
+        backend: BackendProbeClassification,
+    ) -> ReconciliationResult {
+        ReconciliationResult {
+            rcon: rcon::RconProbeResult {
+                classification: rcon,
+                detail: None,
+            },
+            backend: BackendProbeResult {
+                classification: backend,
+                detail: None,
+            },
+        }
+    }
+
+    fn scripted_backend() -> (mpsc::UnboundedSender<ReconciliationResult>, BackendEndpoint) {
+        let (probe_sender, probe_receiver) = mpsc::unbounded_channel();
+        (
+            probe_sender,
+            BackendEndpoint {
+                host: Arc::from("127.0.0.1"),
+                port: 9,
+                connect_timeout: Duration::from_secs(1),
+                scripted_probes: Some(tokio::sync::Mutex::new(probe_receiver)),
+            },
+        )
+    }
+
+    fn refused_endpoints() -> (String, BackendEndpoint) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("test should reserve an unused local port");
+        let address = listener
+            .local_addr()
+            .expect("test listener should have an address");
+        drop(listener);
+        let (probe_sender, probe_receiver) = mpsc::unbounded_channel();
+        for _ in 0..32 {
+            probe_sender
+                .send(test_reconciliation(
+                    RconProbeClassification::Refused,
+                    BackendProbeClassification::Refused,
+                ))
+                .expect("test probe script should accept a clean result");
+        }
+        drop(probe_sender);
+        (
+            address.to_string(),
+            BackendEndpoint {
+                host: Arc::from("127.0.0.1"),
+                port: address.port(),
+                connect_timeout: Duration::from_secs(1),
+                scripted_probes: Some(tokio::sync::Mutex::new(probe_receiver)),
+            },
+        )
+    }
+
     fn rapid_exit_config(rcon_address: String) -> SupervisorConfig {
         let mut config = test_config(rcon_address);
         config.arguments[2] = "supervisor::tests::rapid_exit_fixture".to_owned();
@@ -1267,12 +1982,16 @@ mod tests {
     ) {
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let (lifecycle_sender, lifecycle) = watch::channel(LifecycleState::stopped());
+        let (lifecycle_sender, lifecycle) = watch::channel(LifecycleState::reconciling());
+        let (rcon_address, backend) = refused_endpoints();
+        let mut config = launch_failure_config();
+        config.rcon_address = rcon_address;
         let supervisor = tokio::spawn(run(
             wake_receiver,
             shutdown_receiver,
             lifecycle_sender,
-            launch_failure_config(),
+            config,
+            backend,
         ));
         (wake_sender, shutdown_sender, lifecycle, supervisor)
     }
@@ -1281,10 +2000,17 @@ mod tests {
         lifecycle: &mut watch::Receiver<LifecycleState>,
         predicate: impl Fn(&LifecycleState) -> bool,
     ) {
-        lifecycle
-            .wait_for(predicate)
+        let outcome = timeout(Duration::from_secs(5), lifecycle.wait_for(predicate))
             .await
-            .expect("supervisor should keep the lifecycle source open");
+            .map(|result| result.map(|_| ()));
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => panic!("supervisor closed the lifecycle source"),
+            Err(_) => {
+                let current = *lifecycle.borrow();
+                panic!("lifecycle wait timed out in {current:?}");
+            }
+        }
     }
 
     fn wait_for_test_process_exit(process_id: u32) {
@@ -1380,6 +2106,639 @@ mod tests {
                 Duration::from_secs(expected_seconds)
             );
         }
+    }
+
+    #[test]
+    fn reconciliation_classification_requires_double_refusal_for_clean() {
+        use BackendProbeClassification::{Connected, Inconclusive as BackendInconclusive, Refused};
+        use RconProbeClassification::{
+            AcceptedFailure, Authenticated, Inconclusive as RconInconclusive,
+            Refused as RconRefused,
+        };
+
+        let cases = [
+            (
+                Authenticated,
+                Connected,
+                ReconciliationClassification::FullyReady,
+            ),
+            (RconRefused, Refused, ReconciliationClassification::Clean),
+            (
+                AcceptedFailure,
+                Refused,
+                ReconciliationClassification::Positive,
+            ),
+            (
+                Authenticated,
+                Refused,
+                ReconciliationClassification::Positive,
+            ),
+            (
+                RconRefused,
+                Connected,
+                ReconciliationClassification::Positive,
+            ),
+            (
+                RconInconclusive,
+                Refused,
+                ReconciliationClassification::Inconclusive,
+            ),
+            (
+                RconRefused,
+                BackendInconclusive,
+                ReconciliationClassification::Inconclusive,
+            ),
+        ];
+
+        for (rcon, backend, expected) in cases {
+            assert_eq!(
+                test_reconciliation(rcon, backend).classification(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn transition_helpers_establish_complete_evidence_invariants() {
+        let (_wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let (lifecycle_sender, lifecycle) =
+            watch::channel(LifecycleState::test_phase(ServerPhase::Conflict));
+        let control = SupervisorControl {
+            wake_requests: wake_receiver,
+            shutdown: shutdown_receiver,
+            lifecycle: lifecycle_sender,
+        };
+
+        assert_eq!(
+            control.begin_reconciliation(),
+            ReconciliationEvidence::Inconclusive
+        );
+        control.publish_stopped_after_clean_reconciliation();
+        assert_eq!(
+            lifecycle.borrow().reconciliation_evidence,
+            ReconciliationEvidence::None
+        );
+        control.begin_reconciliation();
+        control.record_launch_success();
+        assert_eq!(
+            lifecycle.borrow().reconciliation_evidence,
+            ReconciliationEvidence::None
+        );
+        control.set_phase(ServerPhase::Stopped);
+        control.begin_reconciliation();
+        control.publish_external(false);
+        assert_eq!(lifecycle.borrow().phase, ServerPhase::External);
+        assert_eq!(
+            lifecycle.borrow().reconciliation_evidence,
+            ReconciliationEvidence::Positive
+        );
+        control.publish_conflict(ReconciliationEvidence::Positive, false);
+        assert!(lifecycle.borrow().invariant_holds());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                control.set_phase(ServerPhase::Stopped);
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cooldown_metadata_survives_reconciliation_without_changing_the_streak() {
+        let (_wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let retry_at = Instant::now() + Duration::from_secs(5);
+        let mut cooldown = failed_lifecycle(ServerPhase::Cooldown, 3);
+        cooldown.retry_at = Some(retry_at);
+        let (lifecycle_sender, lifecycle) = watch::channel(cooldown);
+        let control = SupervisorControl {
+            wake_requests: wake_receiver,
+            shutdown: shutdown_receiver,
+            lifecycle: lifecycle_sender,
+        };
+
+        control.begin_reconciliation();
+        let reconciling = *lifecycle.borrow();
+        assert_eq!(reconciling.retry_at, Some(retry_at));
+        assert_eq!(reconciling.failure_streak, 3);
+        assert_eq!(
+            reconciling.failure,
+            Some(FailureCategory::ExitedUnexpectedly)
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_demand_requires_a_distinct_final_probe() {
+        let (probe_sender, backend) = scripted_backend();
+        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let initial = LifecycleState::reconciling();
+        let (lifecycle_sender, mut lifecycle) = watch::channel(initial);
+        wake_sender
+            .try_send(WakeRequest::observed(initial))
+            .expect("startup wake should fit");
+        probe_sender
+            .send(test_reconciliation(
+                RconProbeClassification::Refused,
+                BackendProbeClassification::Refused,
+            ))
+            .expect("startup clean result should queue");
+        let supervisor = tokio::spawn(run(
+            wake_receiver,
+            shutdown_receiver,
+            lifecycle_sender,
+            launch_failure_config(),
+            backend,
+        ));
+
+        wait_for_lifecycle(&mut lifecycle, |state| {
+            state.phase == ServerPhase::Reconciling
+                && state.phase_started_at != initial.phase_started_at
+        })
+        .await;
+        assert_eq!(lifecycle.borrow().launch_generation, 0);
+        assert_eq!(lifecycle.borrow().failure_streak, 0);
+
+        probe_sender
+            .send(test_reconciliation(
+                RconProbeClassification::Refused,
+                BackendProbeClassification::Refused,
+            ))
+            .expect("final clean result should queue");
+        wait_for_phase(&mut lifecycle, ServerPhase::Cooldown).await;
+        assert_eq!(lifecycle.borrow().launch_generation, 1);
+        shutdown_sender
+            .send(())
+            .expect("supervisor should still await shutdown");
+        supervisor
+            .await
+            .expect("supervisor task should not panic")
+            .expect("supervisor shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn blocked_startup_consumes_demand_without_automatic_retry() {
+        let (probe_sender, backend) = scripted_backend();
+        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let initial = LifecycleState::reconciling();
+        let (lifecycle_sender, mut lifecycle) = watch::channel(initial);
+        wake_sender
+            .try_send(WakeRequest::observed(initial))
+            .expect("startup wake should fit");
+        let supervisor = tokio::spawn(run(
+            wake_receiver,
+            shutdown_receiver,
+            lifecycle_sender,
+            launch_failure_config(),
+            backend,
+        ));
+        let startup_slot = wake_sender
+            .reserve()
+            .await
+            .expect("supervisor should accept startup demand");
+        drop(startup_slot);
+        probe_sender
+            .send(test_reconciliation(
+                RconProbeClassification::Inconclusive,
+                BackendProbeClassification::Refused,
+            ))
+            .expect("startup inconclusive result should queue");
+        probe_sender
+            .send(test_reconciliation(
+                RconProbeClassification::Refused,
+                BackendProbeClassification::Refused,
+            ))
+            .expect("later clean result should queue");
+
+        wait_for_phase(&mut lifecycle, ServerPhase::Conflict).await;
+        assert_eq!(lifecycle.borrow().launch_generation, 1);
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(lifecycle.borrow().phase, ServerPhase::Conflict);
+        assert_eq!(lifecycle.borrow().failure, None);
+
+        wake_sender
+            .send(WakeRequest::observed(*lifecycle.borrow()))
+            .await
+            .expect("later conflict wake should queue");
+        wait_for_phase(&mut lifecycle, ServerPhase::Cooldown).await;
+        assert_eq!(lifecycle.borrow().launch_generation, 2);
+        shutdown_sender
+            .send(())
+            .expect("supervisor should still await shutdown");
+        supervisor
+            .await
+            .expect("supervisor task should not panic")
+            .expect("supervisor shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn stale_startup_wake_drains_before_a_valid_conflict_wake() {
+        let (probe_sender, backend) = scripted_backend();
+        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let initial = LifecycleState::reconciling();
+        let (lifecycle_sender, mut lifecycle) = watch::channel(initial);
+        probe_sender
+            .send(test_reconciliation(
+                RconProbeClassification::Inconclusive,
+                BackendProbeClassification::Refused,
+            ))
+            .expect("startup inconclusive result should queue");
+        probe_sender
+            .send(test_reconciliation(
+                RconProbeClassification::Refused,
+                BackendProbeClassification::Refused,
+            ))
+            .expect("conflict clean result should queue");
+        let supervisor = tokio::spawn(run(
+            wake_receiver,
+            shutdown_receiver,
+            lifecycle_sender,
+            launch_failure_config(),
+            backend,
+        ));
+        wait_for_phase(&mut lifecycle, ServerPhase::Conflict).await;
+
+        wake_sender
+            .send(WakeRequest::observed(initial))
+            .await
+            .expect("stale startup wake should queue");
+        let permit = wake_sender
+            .reserve()
+            .await
+            .expect("supervisor should drain the stale startup wake");
+        permit.send(WakeRequest::observed(*lifecycle.borrow()));
+        wait_for_phase(&mut lifecycle, ServerPhase::Cooldown).await;
+        assert_eq!(lifecycle.borrow().launch_generation, 1);
+        shutdown_sender
+            .send(())
+            .expect("supervisor should still await shutdown");
+        supervisor
+            .await
+            .expect("supervisor task should not panic")
+            .expect("supervisor shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn blocked_final_gate_consumes_one_generation_without_launch_failure() {
+        let (probe_sender, backend) = scripted_backend();
+        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let (lifecycle_sender, mut lifecycle) = watch::channel(LifecycleState::reconciling());
+        for result in [
+            test_reconciliation(
+                RconProbeClassification::Refused,
+                BackendProbeClassification::Refused,
+            ),
+            test_reconciliation(
+                RconProbeClassification::AcceptedFailure,
+                BackendProbeClassification::Refused,
+            ),
+        ] {
+            probe_sender
+                .send(result)
+                .expect("probe result should queue");
+        }
+        let supervisor = tokio::spawn(run(
+            wake_receiver,
+            shutdown_receiver,
+            lifecycle_sender,
+            launch_failure_config(),
+            backend,
+        ));
+        wait_for_phase(&mut lifecycle, ServerPhase::Stopped).await;
+        wake_sender
+            .send(WakeRequest::observed(*lifecycle.borrow()))
+            .await
+            .expect("stopped wake should queue");
+        wait_for_phase(&mut lifecycle, ServerPhase::Conflict).await;
+
+        assert_eq!(lifecycle.borrow().launch_generation, 1);
+        assert_eq!(lifecycle.borrow().failure, None);
+        assert_eq!(lifecycle.borrow().failure_streak, 0);
+        shutdown_sender
+            .send(())
+            .expect("supervisor should still await shutdown");
+        supervisor
+            .await
+            .expect("supervisor task should not panic")
+            .expect("supervisor shutdown should succeed");
+    }
+
+    #[tokio::test]
+    async fn positive_evidence_remains_sticky_after_double_refusal() {
+        let (probe_sender, backend) = scripted_backend();
+        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let (lifecycle_sender, mut lifecycle) = watch::channel(LifecycleState::reconciling());
+        for result in [
+            test_reconciliation(
+                RconProbeClassification::AcceptedFailure,
+                BackendProbeClassification::Refused,
+            ),
+            test_reconciliation(
+                RconProbeClassification::Refused,
+                BackendProbeClassification::Refused,
+            ),
+            test_reconciliation(
+                RconProbeClassification::Authenticated,
+                BackendProbeClassification::Connected,
+            ),
+        ] {
+            probe_sender
+                .send(result)
+                .expect("probe result should queue");
+        }
+        let supervisor = tokio::spawn(run(
+            wake_receiver,
+            shutdown_receiver,
+            lifecycle_sender,
+            launch_failure_config(),
+            backend,
+        ));
+        wait_for_phase(&mut lifecycle, ServerPhase::Conflict).await;
+        assert_eq!(
+            lifecycle.borrow().reconciliation_evidence,
+            ReconciliationEvidence::Positive
+        );
+        wake_sender
+            .send(WakeRequest::observed(*lifecycle.borrow()))
+            .await
+            .expect("conflict wake should queue");
+        wait_for_lifecycle(&mut lifecycle, |state| state.launch_generation == 1).await;
+
+        assert_eq!(lifecycle.borrow().phase, ServerPhase::Conflict);
+        assert_eq!(
+            lifecycle.borrow().reconciliation_evidence,
+            ReconciliationEvidence::Positive
+        );
+        assert_eq!(lifecycle.borrow().failure, None);
+        wake_sender
+            .send(WakeRequest::observed(*lifecycle.borrow()))
+            .await
+            .expect("sticky conflict wake should queue");
+        wait_for_phase(&mut lifecycle, ServerPhase::External).await;
+        assert_eq!(lifecycle.borrow().launch_generation, 2);
+        shutdown_sender
+            .send(())
+            .expect("supervisor should still await shutdown");
+        supervisor
+            .await
+            .expect("supervisor task should not panic")
+            .expect("supervisor shutdown should succeed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_external_wake_does_not_probe_before_poll_interval() {
+        let (probe_sender, backend) = scripted_backend();
+        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let initial = LifecycleState::reconciling();
+        let (lifecycle_sender, mut lifecycle) = watch::channel(initial);
+        probe_sender
+            .send(test_reconciliation(
+                RconProbeClassification::Authenticated,
+                BackendProbeClassification::Connected,
+            ))
+            .expect("startup ready result should queue");
+        let config = launch_failure_config();
+        let poll_interval = config.poll_interval;
+        let supervisor = tokio::spawn(run(
+            wake_receiver,
+            shutdown_receiver,
+            lifecycle_sender,
+            config,
+            backend,
+        ));
+        wait_for_phase(&mut lifecycle, ServerPhase::External).await;
+
+        wake_sender
+            .send(WakeRequest::observed(initial))
+            .await
+            .expect("stale startup wake should queue");
+        let permit = wake_sender
+            .reserve()
+            .await
+            .expect("external monitor should drain the stale wake");
+        drop(permit);
+        probe_sender
+            .send(test_reconciliation(
+                RconProbeClassification::Refused,
+                BackendProbeClassification::Refused,
+            ))
+            .expect("periodic probe result should queue");
+        tokio::task::yield_now().await;
+        assert_eq!(lifecycle.borrow().phase, ServerPhase::External);
+
+        tokio::time::advance(
+            poll_interval
+                .checked_sub(Duration::from_secs(1))
+                .expect("poll interval should exceed one second"),
+        )
+        .await;
+        tokio::task::yield_now().await;
+        assert_eq!(lifecycle.borrow().phase, ServerPhase::External);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        wait_for_phase(&mut lifecycle, ServerPhase::Conflict).await;
+
+        shutdown_sender
+            .send(())
+            .expect("supervisor should still await shutdown");
+        supervisor
+            .await
+            .expect("supervisor task should not panic")
+            .expect("external shutdown should not touch a process");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn external_poll_loss_enters_sticky_conflict_without_launching() {
+        let (probe_sender, backend) = scripted_backend();
+        let (_wake_sender, wake_receiver) = mpsc::channel(1);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let (lifecycle_sender, mut lifecycle) = watch::channel(LifecycleState::reconciling());
+        probe_sender
+            .send(test_reconciliation(
+                RconProbeClassification::Authenticated,
+                BackendProbeClassification::Connected,
+            ))
+            .expect("startup ready result should queue");
+        let supervisor = tokio::spawn(run(
+            wake_receiver,
+            shutdown_receiver,
+            lifecycle_sender,
+            launch_failure_config(),
+            backend,
+        ));
+        wait_for_phase(&mut lifecycle, ServerPhase::External).await;
+        tokio::time::advance(Duration::from_secs(29)).await;
+        assert_eq!(lifecycle.borrow().phase, ServerPhase::External);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(lifecycle.borrow().phase, ServerPhase::External);
+        probe_sender
+            .send(test_reconciliation(
+                RconProbeClassification::Refused,
+                BackendProbeClassification::Refused,
+            ))
+            .expect("lost external result should queue");
+        wait_for_phase(&mut lifecycle, ServerPhase::Conflict).await;
+
+        assert_eq!(lifecycle.borrow().launch_generation, 0);
+        assert_eq!(lifecycle.borrow().failure, None);
+        assert_eq!(
+            lifecycle.borrow().reconciliation_evidence,
+            ReconciliationEvidence::Positive
+        );
+        shutdown_sender
+            .send(())
+            .expect("supervisor should still await shutdown");
+        supervisor
+            .await
+            .expect("supervisor task should not panic")
+            .expect("external shutdown should not touch a process");
+    }
+
+    #[tokio::test]
+    async fn external_shutdown_sends_no_rcon_stop_and_launches_no_process() {
+        let rcon_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test RCON listener should bind");
+        let rcon_address = rcon_listener
+            .local_addr()
+            .expect("RCON listener should have an address")
+            .to_string();
+        let rcon_server = tokio::spawn(async move {
+            let (mut stream, _) = rcon_listener
+                .accept()
+                .await
+                .expect("reconciliation should connect to RCON");
+            let auth = read_test_rcon_packet(&mut stream).await;
+            assert_eq!(auth.kind, TEST_AUTH);
+            write_test_rcon_packet(&mut stream, auth.id, TEST_AUTH_RESPONSE, b"").await;
+            let error = try_read_test_rcon_packet(&mut stream)
+                .await
+                .expect_err("external shutdown must not send an RCON command");
+            assert!(matches!(
+                error.kind(),
+                ErrorKind::UnexpectedEof
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+            ));
+        });
+
+        let backend_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test backend listener should bind");
+        let backend_address = backend_listener
+            .local_addr()
+            .expect("backend listener should have an address");
+        let backend_server = tokio::spawn(async move {
+            let _ = backend_listener
+                .accept()
+                .await
+                .expect("reconciliation should connect to the backend");
+        });
+
+        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let (lifecycle_sender, mut lifecycle) = watch::channel(LifecycleState::reconciling());
+        let mut config = launch_failure_config();
+        config.rcon_address = rcon_address;
+        let supervisor = tokio::spawn(run(
+            wake_receiver,
+            shutdown_receiver,
+            lifecycle_sender,
+            config,
+            BackendEndpoint::network(
+                Arc::from("127.0.0.1"),
+                backend_address.port(),
+                Duration::from_secs(1),
+            ),
+        ));
+        wait_for_phase(&mut lifecycle, ServerPhase::External).await;
+        assert_eq!(lifecycle.borrow().launch_generation, 0);
+        assert_eq!(lifecycle.borrow().failure, None);
+
+        shutdown_sender
+            .send(())
+            .expect("supervisor should still await shutdown");
+        drop(wake_sender);
+        supervisor
+            .await
+            .expect("supervisor task should not panic")
+            .expect("external shutdown should succeed");
+        rcon_server
+            .await
+            .expect("test RCON server should not panic");
+        backend_server
+            .await
+            .expect("test backend server should not panic");
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_startup_or_final_reconciliation_prevents_launch() {
+        for during_final in [false, true] {
+            let (probe_sender, backend) = scripted_backend();
+            let (wake_sender, wake_receiver) = mpsc::channel(1);
+            let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+            let (lifecycle_sender, mut lifecycle) = watch::channel(LifecycleState::reconciling());
+            if during_final {
+                probe_sender
+                    .send(test_reconciliation(
+                        RconProbeClassification::Refused,
+                        BackendProbeClassification::Refused,
+                    ))
+                    .expect("startup clean result should queue");
+            }
+            let supervisor = tokio::spawn(run(
+                wake_receiver,
+                shutdown_receiver,
+                lifecycle_sender,
+                launch_failure_config(),
+                backend,
+            ));
+            if during_final {
+                wait_for_phase(&mut lifecycle, ServerPhase::Stopped).await;
+                wake_sender
+                    .send(WakeRequest::observed(*lifecycle.borrow()))
+                    .await
+                    .expect("stopped wake should queue");
+                wait_for_phase(&mut lifecycle, ServerPhase::Reconciling).await;
+            } else {
+                tokio::task::yield_now().await;
+            }
+            shutdown_sender
+                .send(())
+                .expect("supervisor should still await shutdown");
+            supervisor
+                .await
+                .expect("supervisor task should not panic")
+                .expect("reconciliation shutdown should succeed");
+            assert_eq!(lifecycle.borrow().launch_generation, 0);
+            assert_eq!(lifecycle.borrow().failure, None);
+        }
+    }
+
+    #[test]
+    fn conflict_warning_key_changes_only_with_classification() {
+        let inconclusive = test_reconciliation(
+            RconProbeClassification::Inconclusive,
+            BackendProbeClassification::Refused,
+        )
+        .conflict_classification(false);
+        let positive = test_reconciliation(
+            RconProbeClassification::AcceptedFailure,
+            BackendProbeClassification::Refused,
+        )
+        .conflict_classification(true);
+        let mut last = None;
+
+        assert!(conflict_warning_changed(&mut last, inconclusive));
+        assert!(!conflict_warning_changed(&mut last, inconclusive));
+        assert!(conflict_warning_changed(&mut last, positive));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1687,8 +3046,9 @@ mod tests {
     async fn startup_timeout_enters_retryable_failure_cleanup() {
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let (lifecycle_sender, mut lifecycle) = watch::channel(LifecycleState::stopped());
-        let mut config = test_config("127.0.0.1:9".to_owned());
+        let (lifecycle_sender, mut lifecycle) = watch::channel(LifecycleState::reconciling());
+        let (rcon_address, backend) = refused_endpoints();
+        let mut config = test_config(rcon_address);
         config.startup_timeout = Duration::from_millis(50);
         config.command_timeout = Duration::from_millis(10);
         config.retry_interval = Duration::from_millis(10);
@@ -1697,6 +3057,7 @@ mod tests {
             shutdown_receiver,
             lifecycle_sender,
             config,
+            backend,
         ));
 
         wake_sender
@@ -1733,13 +3094,13 @@ mod tests {
             .expect("short-lived test server should launch");
         let (_wake_sender, wake_receiver) = mpsc::channel(1);
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let (lifecycle_sender, lifecycle) = watch::channel(LifecycleState::stopped());
+        let (lifecycle_sender, lifecycle) = watch::channel(LifecycleState::reconciling());
         let mut control = SupervisorControl {
             wake_requests: wake_receiver,
             shutdown: shutdown_receiver,
             lifecycle: lifecycle_sender,
         };
-        control.finish_launch_attempt(ServerPhase::Starting);
+        control.record_launch_success();
 
         let outcome = run_server_cycle(child, &mut control, &config)
             .await
@@ -1775,7 +3136,8 @@ mod tests {
             let config = rapid_exit_config(rcon_address);
             let child = process::launch(&config.command, &config.arguments)
                 .expect("short-lived test server should launch");
-            control.finish_launch_attempt(ServerPhase::Starting);
+            control.begin_reconciliation();
+            control.record_launch_success();
 
             let outcome = run_server_cycle(child, &mut control, &config)
                 .await
@@ -2060,25 +3422,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closed_shutdown_source_precedes_queued_wake_while_stopped() {
+    async fn closed_shutdown_source_precedes_queued_startup_wake() {
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let (lifecycle_sender, lifecycle) = watch::channel(LifecycleState::stopped());
+        let (lifecycle_sender, lifecycle) = watch::channel(LifecycleState::reconciling());
         wake_sender
             .try_send(WakeRequest::observed(*lifecycle.borrow()))
             .expect("first wake request should fit");
         drop(shutdown_sender);
 
+        let (rcon_address, backend) = refused_endpoints();
         run(
             wake_receiver,
             shutdown_receiver,
             lifecycle_sender,
-            test_config("127.0.0.1:9".to_owned()),
+            test_config(rcon_address),
+            backend,
         )
         .await
         .expect("supervisor shutdown should succeed");
 
-        assert_eq!(lifecycle.borrow().phase, ServerPhase::Stopped);
+        assert_eq!(lifecycle.borrow().phase, ServerPhase::Reconciling);
         assert_eq!(lifecycle.borrow().launch_generation, 0);
     }
 
@@ -2086,12 +3450,14 @@ mod tests {
     async fn closed_wake_source_stops_and_reaps_an_active_child() {
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let (lifecycle_sender, mut lifecycle) = watch::channel(LifecycleState::stopped());
+        let (lifecycle_sender, mut lifecycle) = watch::channel(LifecycleState::reconciling());
+        let (rcon_address, backend) = refused_endpoints();
         let supervisor = tokio::spawn(run(
             wake_receiver,
             shutdown_receiver,
             lifecycle_sender,
-            test_config("127.0.0.1:9".to_owned()),
+            test_config(rcon_address),
+            backend,
         ));
 
         wake_sender
@@ -2114,7 +3480,7 @@ mod tests {
     async fn stopped_and_starting_wake_bursts_launch_only_one_child() {
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let (lifecycle_sender, mut lifecycle) = watch::channel(LifecycleState::stopped());
+        let (lifecycle_sender, mut lifecycle) = watch::channel(LifecycleState::reconciling());
         let initial = *lifecycle.borrow();
         wake_sender
             .try_send(WakeRequest::observed(initial))
@@ -2128,11 +3494,13 @@ mod tests {
                 "a stopped-phase wake burst should occupy one pending slot"
             );
         }
+        let (rcon_address, backend) = refused_endpoints();
         let supervisor = tokio::spawn(run(
             wake_receiver,
             shutdown_receiver,
             lifecycle_sender,
-            test_config("127.0.0.1:9".to_owned()),
+            test_config(rcon_address),
+            backend,
         ));
 
         wait_for_phase(&mut lifecycle, ServerPhase::Starting).await;

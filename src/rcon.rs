@@ -1,6 +1,10 @@
-use anyhow::{Context, Result, bail, ensure};
+use std::io::ErrorKind;
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::time::{Instant, timeout_at};
 
 const AUTH: i32 = 3;
 const AUTH_RESPONSE: i32 = 2;
@@ -16,12 +20,30 @@ pub struct RconClient {
     next_request_id: i32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RconProbeClassification {
+    Authenticated,
+    Refused,
+    AcceptedFailure,
+    Inconclusive,
+}
+
+#[derive(Debug)]
+pub(crate) struct RconProbeResult {
+    pub(crate) classification: RconProbeClassification,
+    pub(crate) detail: Option<anyhow::Error>,
+}
+
 impl RconClient {
     pub async fn connect(address: &str, password: &str) -> Result<Self> {
         validate_body(password, "RCON password")?;
         let stream = TcpStream::connect(address)
             .await
             .with_context(|| format!("failed to connect to RCON at {address}"))?;
+        Self::authenticate(stream, password).await
+    }
+
+    async fn authenticate(stream: TcpStream, password: &str) -> Result<Self> {
         stream
             .set_nodelay(true)
             .context("failed to enable TCP_NODELAY for RCON")?;
@@ -117,6 +139,59 @@ impl RconClient {
             .await
             .context("RCON connection closed during a packet")?;
         decode_payload(&payload)
+    }
+}
+
+pub(crate) async fn probe(
+    address: &str,
+    password: &str,
+    command_timeout: Duration,
+) -> RconProbeResult {
+    if let Err(error) = validate_body(password, "RCON password") {
+        return RconProbeResult {
+            classification: RconProbeClassification::Inconclusive,
+            detail: Some(error),
+        };
+    }
+
+    let deadline = Instant::now() + command_timeout;
+    let stream = match timeout_at(deadline, TcpStream::connect(address)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) if error.kind() == ErrorKind::ConnectionRefused => {
+            return RconProbeResult {
+                classification: RconProbeClassification::Refused,
+                detail: Some(error.into()),
+            };
+        }
+        Ok(Err(error)) => {
+            return RconProbeResult {
+                classification: RconProbeClassification::Inconclusive,
+                detail: Some(error.into()),
+            };
+        }
+        Err(_) => {
+            return RconProbeResult {
+                classification: RconProbeClassification::Inconclusive,
+                detail: Some(anyhow!("RCON TCP connection timed out")),
+            };
+        }
+    };
+
+    match timeout_at(deadline, RconClient::authenticate(stream, password)).await {
+        Ok(Ok(_)) => RconProbeResult {
+            classification: RconProbeClassification::Authenticated,
+            detail: None,
+        },
+        Ok(Err(error)) => RconProbeResult {
+            classification: RconProbeClassification::AcceptedFailure,
+            detail: Some(error),
+        },
+        Err(_) => RconProbeResult {
+            classification: RconProbeClassification::AcceptedFailure,
+            detail: Some(anyhow!(
+                "RCON authentication did not finish before the command deadline"
+            )),
+        },
     }
 }
 
@@ -265,5 +340,99 @@ mod tests {
         assert_eq!(response, "There are 2 of a max of 20 players online: a, b");
         client.stop().await.expect("stop command should be sent");
         server.await.expect("test RCON server should not panic");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn probe_retains_tcp_acceptance_when_authentication_reaches_the_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test RCON listener should bind");
+        let address = listener.local_addr().expect("listener has an address");
+        let (accepted_sender, accepted_receiver) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("probe should connect");
+            let auth = receive_test_packet(&mut stream).await;
+            assert_eq!(auth.kind, AUTH);
+            accepted_sender
+                .send(())
+                .expect("test should await TCP acceptance");
+            std::future::pending::<()>().await;
+        });
+        let probing = tokio::spawn(async move {
+            probe(&address.to_string(), "secret", Duration::from_secs(5)).await
+        });
+
+        accepted_receiver
+            .await
+            .expect("probe should reach authentication");
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let result = probing.await.expect("probe task should not panic");
+        assert_eq!(
+            result.classification,
+            RconProbeClassification::AcceptedFailure
+        );
+        assert!(
+            result
+                .detail
+                .expect("timeout detail should be retained")
+                .to_string()
+                .contains("authentication")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn probe_classifies_authentication_failure_after_tcp_acceptance() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test RCON listener should bind");
+        let address = listener.local_addr().expect("listener has an address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("probe should connect");
+            let _auth = receive_test_packet(&mut stream).await;
+            send_test_packet(&mut stream, -1, AUTH_RESPONSE, b"").await;
+        });
+
+        let result = probe(&address.to_string(), "secret", Duration::from_secs(1)).await;
+        assert_eq!(
+            result.classification,
+            RconProbeClassification::AcceptedFailure
+        );
+        assert!(
+            result
+                .detail
+                .expect("authentication failure detail should be retained")
+                .to_string()
+                .contains("authentication failed")
+        );
+        server.await.expect("test RCON server should not panic");
+    }
+
+    #[tokio::test]
+    async fn probe_classifies_protocol_failure_and_eof_after_tcp_acceptance() {
+        for response in [Some(5_i32.to_le_bytes()), None] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("test RCON listener should bind");
+            let address = listener.local_addr().expect("listener has an address");
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("probe should connect");
+                let _auth = receive_test_packet(&mut stream).await;
+                if let Some(bytes) = response {
+                    stream
+                        .write_all(&bytes)
+                        .await
+                        .expect("malformed packet length should write");
+                }
+            });
+
+            let result = probe(&address.to_string(), "secret", Duration::from_secs(1)).await;
+            assert_eq!(
+                result.classification,
+                RconProbeClassification::AcceptedFailure
+            );
+            assert!(result.detail.is_some());
+            server.await.expect("test RCON server should not panic");
+        }
     }
 }
