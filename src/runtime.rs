@@ -470,6 +470,7 @@ mod tests {
 
     use super::*;
     use crate::config::Config;
+    use crate::supervisor::RconConfig;
 
     fn runtime_config(
         command: String,
@@ -487,8 +488,10 @@ mod tests {
             supervisor: SupervisorConfig {
                 command,
                 arguments,
-                rcon_address,
-                rcon_password: "secret".to_owned(),
+                rcon: Some(RconConfig {
+                    endpoint: rcon_address,
+                    password: "secret".to_owned(),
+                }),
                 poll_interval: Duration::from_secs(30),
                 idle_timeout: Duration::from_secs(30),
                 startup_timeout: Duration::from_secs(30),

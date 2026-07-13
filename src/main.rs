@@ -7,7 +7,7 @@ use mcservernap::config::{self, Config};
 use mcservernap::minecraft::MinecraftResponder;
 use mcservernap::rcon::RconClient;
 use mcservernap::runtime::{ServerRuntime, ServerRuntimeConfig};
-use mcservernap::supervisor::SupervisorConfig;
+use mcservernap::supervisor::{RconConfig, SupervisorConfig};
 use tokio::time::timeout;
 
 #[derive(Parser)]
@@ -166,8 +166,10 @@ fn runtime_config(options: ListenOptions, settings: &Config) -> ServerRuntimeCon
         supervisor: SupervisorConfig {
             command: options.command,
             arguments: options.arguments,
-            rcon_address: options.rcon_address,
-            rcon_password: options.rcon_password,
+            rcon: Some(RconConfig {
+                endpoint: options.rcon_address,
+                password: options.rcon_password,
+            }),
             poll_interval: Duration::from_secs(settings.rcon_poll_interval_seconds),
             idle_timeout: Duration::from_secs(settings.rcon_idle_timeout_seconds),
             startup_timeout: Duration::from_secs(settings.rcon_startup_timeout_seconds),
