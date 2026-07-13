@@ -3,12 +3,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use tokio::io::AsyncWriteExt as _;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, TryAcquireError, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{Instant, sleep, sleep_until, timeout};
 
-use crate::minecraft::{ClientRequest, MinecraftResponder};
+use crate::minecraft::{ClientRequest, ConnectionEnvelope, MinecraftResponder};
 use crate::supervisor::{
     self, BackendEndpoint, LifecycleState, ServerPhase, SupervisorConfig, WakeRequest,
 };
@@ -199,19 +200,40 @@ async fn await_supervisor_shutdown(
 }
 
 async fn handle_client(
-    mut socket: TcpStream,
+    socket: TcpStream,
     peer: std::net::SocketAddr,
     context: ClientContext,
 ) -> Result<()> {
     socket
         .set_nodelay(true)
         .context("failed to enable TCP_NODELAY for client")?;
+    let initial_deadline = Instant::now() + context.handshake_timeout;
+    let connection = ConnectionEnvelope::read(socket, initial_deadline).await?;
+
+    // A future routing lookup belongs here, before this runtime's state is sampled.
     let observed_lifecycle = *context.lifecycle.borrow();
+    handle_sampled_connection(
+        connection,
+        peer,
+        context,
+        observed_lifecycle,
+        initial_deadline,
+    )
+    .await
+}
+
+async fn handle_sampled_connection(
+    mut connection: ConnectionEnvelope,
+    peer: std::net::SocketAddr,
+    context: ClientContext,
+    observed_lifecycle: LifecycleState,
+    initial_deadline: Instant,
+) -> Result<()> {
     let current_phase = observed_lifecycle.phase();
 
     if matches!(current_phase, ServerPhase::Running | ServerPhase::External) {
         return proxy_connection(
-            socket,
+            connection,
             peer,
             &context.server_host,
             context.server_port,
@@ -221,25 +243,26 @@ async fn handle_client(
     }
 
     let operation_timeout = context.handshake_timeout;
-    let request = timeout(
-        operation_timeout,
-        context.responder.read_client_request(&mut socket),
-    )
-    .await
-    .context("initial Minecraft exchange timed out")??;
+    let Some(request) = context
+        .responder
+        .read_sleeping_request(&mut connection, initial_deadline)
+        .await?
+    else {
+        return Ok(());
+    };
 
     match request {
         ClientRequest::Status => {
             context
                 .responder
-                .serve_status(&mut socket, operation_timeout)
+                .serve_status(connection.socket_mut(), operation_timeout)
                 .await?;
         }
         ClientRequest::UnsupportedProtocol { protocol_version } => {
             log::info!("Rejected login from {peer}: protocol {protocol_version} is not supported");
             context
                 .responder
-                .send_incompatible_disconnect(&mut socket, operation_timeout)
+                .send_incompatible_disconnect(connection.socket_mut(), operation_timeout)
                 .await?;
         }
         ClientRequest::Login { intent } => {
@@ -268,12 +291,12 @@ async fn handle_client(
             if current_phase == ServerPhase::Conflict {
                 context
                     .responder
-                    .send_conflict_disconnect(&mut socket, operation_timeout)
+                    .send_conflict_disconnect(connection.socket_mut(), operation_timeout)
                     .await?;
             } else {
                 context
                     .responder
-                    .send_login_disconnect(&mut socket, operation_timeout)
+                    .send_login_disconnect(connection.socket_mut(), operation_timeout)
                     .await?;
             }
         }
@@ -283,22 +306,30 @@ async fn handle_client(
 }
 
 async fn proxy_connection(
-    mut client: TcpStream,
+    connection: ConnectionEnvelope,
     peer: std::net::SocketAddr,
     server_host: &str,
     server_port: u16,
     connect_timeout: Duration,
 ) -> Result<()> {
+    let (mut client, framed_handshake) = connection.into_proxy_parts();
     let mut backend = connect_backend(server_host, server_port, connect_timeout).await?;
     backend
         .set_nodelay(true)
         .context("failed to enable TCP_NODELAY for backend")?;
     log::debug!("Proxying {peer} to {server_host}:{server_port}");
 
+    backend
+        .write_all(&framed_handshake)
+        .await
+        .with_context(|| format!("failed to replay Minecraft handshake for {peer}"))?;
+
     let (client_to_server, server_to_client) =
         tokio::io::copy_bidirectional(&mut client, &mut backend)
             .await
             .with_context(|| format!("proxy I/O failed for {peer}"))?;
+    let client_to_server = client_to_server
+        + u64::try_from(framed_handshake.len()).expect("handshake length fits in u64");
     log::debug!(
         "Proxy for {peer} closed ({client_to_server} bytes upstream, {server_to_client} downstream)"
     );
@@ -398,15 +429,19 @@ mod tests {
         packet
     }
 
-    fn login_exchange() -> Vec<u8> {
-        let version = crate::minecraft::MinecraftVersion::latest();
+    fn handshake_frame(protocol_version: i32, intent: i32) -> Vec<u8> {
         let mut handshake = Vec::new();
         write_varint(0, &mut handshake);
-        write_varint(version.protocol(), &mut handshake);
+        write_varint(protocol_version, &mut handshake);
         write_varint(9, &mut handshake);
         handshake.extend_from_slice(b"localhost");
         handshake.extend_from_slice(&25565_u16.to_be_bytes());
-        write_varint(2, &mut handshake);
+        write_varint(intent, &mut handshake);
+        frame_packet(&handshake)
+    }
+
+    fn login_exchange_with_intent(intent: i32) -> Vec<u8> {
+        let version = crate::minecraft::MinecraftVersion::latest();
 
         let mut login = Vec::new();
         write_varint(0, &mut login);
@@ -414,9 +449,24 @@ mod tests {
         login.extend_from_slice(b"player");
         login.extend_from_slice(&[7; 16]);
 
-        let mut exchange = frame_packet(&handshake);
+        let mut exchange = handshake_frame(version.protocol(), intent);
         exchange.extend_from_slice(&frame_packet(&login));
         exchange
+    }
+
+    fn login_exchange() -> Vec<u8> {
+        login_exchange_with_intent(2)
+    }
+
+    fn non_minimal_unknown_handshake() -> Vec<u8> {
+        let mut body = vec![0x80, 0x00, 0xfb, 0x00, 0x89, 0x00];
+        body.extend_from_slice(b"localhost");
+        body.extend_from_slice(&25_565_u16.to_be_bytes());
+        body.extend_from_slice(&[0xcd, 0x00]);
+        let body_length = u8::try_from(body.len()).expect("test body length fits in one byte");
+        let mut framed = vec![body_length | 0x80, 0x80, 0x00];
+        framed.extend_from_slice(&body);
+        framed
     }
 
     async fn connected_pair() -> (TcpStream, TcpStream) {
@@ -431,13 +481,28 @@ mod tests {
         )
     }
 
+    fn assert_no_wake(wake_receiver: &mut mpsc::Receiver<WakeRequest>) {
+        assert!(matches!(
+            wake_receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)
+        ));
+    }
+
     fn client_context(
         phase: ServerPhase,
         wake_requests: mpsc::Sender<WakeRequest>,
         backend_port: u16,
     ) -> ClientContext {
-        let (_lifecycle_sender, lifecycle) = watch::channel(LifecycleState::test_phase(phase));
-        ClientContext {
+        client_context_with_lifecycle(phase, wake_requests, backend_port).0
+    }
+
+    fn client_context_with_lifecycle(
+        phase: ServerPhase,
+        wake_requests: mpsc::Sender<WakeRequest>,
+        backend_port: u16,
+    ) -> (ClientContext, watch::Sender<LifecycleState>) {
+        let (lifecycle_sender, lifecycle) = watch::channel(LifecycleState::test_phase(phase));
+        let context = ClientContext {
             lifecycle,
             wake_requests,
             responder: Arc::new(
@@ -448,7 +513,8 @@ mod tests {
             server_port: backend_port,
             handshake_timeout: Duration::from_secs(1),
             proxy_connect_timeout: Duration::from_secs(1),
-        }
+        };
+        (context, lifecycle_sender)
     }
 
     async fn assert_phase_proxies_exact_bytes(phase: ServerPhase) {
@@ -459,30 +525,36 @@ mod tests {
             .local_addr()
             .expect("backend listener has an address")
             .port();
-        let (wake_sender, _wake_receiver) = mpsc::channel(1);
+        let (wake_sender, mut wake_receiver) = mpsc::channel(1);
         let context = client_context(phase, wake_sender, backend_port);
         let (mut client, server) = connected_pair().await;
         let peer = server.peer_addr().expect("client peer address");
         let handler = tokio::spawn(handle_client(server, peer, context));
+        let framed_handshake = non_minimal_unknown_handshake();
+        let following_bytes = vec![0, 1, 2, 0xff, 4, 5, 6];
+        let mut expected = framed_handshake.clone();
+        expected.extend_from_slice(&following_bytes);
         let backend = tokio::spawn(async move {
             let (mut stream, _) = backend_listener
                 .accept()
                 .await
                 .expect("proxy should connect to backend");
-            let mut received = [0; 7];
+            let mut received = vec![0; expected.len()];
             stream
                 .read_exact(&mut received)
                 .await
                 .expect("proxy bytes should arrive");
-            assert_eq!(received, [0, 1, 2, 0xff, 4, 5, 6]);
+            assert_eq!(received, expected);
             stream
                 .write_all(b"backend")
                 .await
                 .expect("backend response should write");
         });
 
+        let mut exchange = framed_handshake;
+        exchange.extend_from_slice(&following_bytes);
         client
-            .write_all(&[0, 1, 2, 0xff, 4, 5, 6])
+            .write_all(&exchange)
             .await
             .expect("client bytes should write");
         let mut response = [0; 7];
@@ -498,12 +570,273 @@ mod tests {
             .expect("proxy task should finish")
             .expect("proxy task should not panic")
             .expect("proxy should succeed");
+        assert_no_wake(&mut wake_receiver);
     }
 
     #[tokio::test]
     async fn running_and_external_forward_exact_original_bytes() {
         assert_phase_proxies_exact_bytes(ServerPhase::Running).await;
         assert_phase_proxies_exact_bytes(ServerPhase::External).await;
+    }
+
+    #[tokio::test]
+    async fn sleeping_unknown_intent_closes_without_response_or_wake() {
+        let (wake_sender, mut wake_receiver) = mpsc::channel(1);
+        let context = client_context(ServerPhase::Stopped, wake_sender, 9);
+        let (mut client, server) = connected_pair().await;
+        let peer = server.peer_addr().expect("client peer address");
+        let handler = tokio::spawn(handle_client(server, peer, context));
+
+        client
+            .write_all(&handshake_frame(12_345, 77))
+            .await
+            .expect("unknown-intent handshake should write");
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("connection should close cleanly");
+        handler
+            .await
+            .expect("client task should not panic")
+            .expect("unknown sleeping intent should close cleanly");
+
+        assert!(response.is_empty());
+        assert_no_wake(&mut wake_receiver);
+    }
+
+    #[tokio::test]
+    async fn sleeping_incompatible_login_disconnects_without_login_start_or_wake() {
+        let version = crate::minecraft::MinecraftVersion::latest();
+        let unsupported_protocol = version.protocol() - 1;
+        let (wake_sender, mut wake_receiver) = mpsc::channel(1);
+        let context = client_context(ServerPhase::Stopped, wake_sender, 9);
+        let (mut client, server) = connected_pair().await;
+        let peer = server.peer_addr().expect("client peer address");
+        let handler = tokio::spawn(handle_client(server, peer, context));
+
+        client
+            .write_all(&handshake_frame(unsupported_protocol, 2))
+            .await
+            .expect("incompatible handshake should write");
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("incompatible disconnect should arrive");
+        handler
+            .await
+            .expect("client task should not panic")
+            .expect("incompatible login should be handled");
+
+        assert!(String::from_utf8_lossy(&response).contains("This server requires"));
+        assert_no_wake(&mut wake_receiver);
+    }
+
+    #[tokio::test]
+    async fn login_transfer_and_cooldown_requests_preserve_wake_semantics() {
+        for (phase, intent) in [
+            (ServerPhase::Stopped, 2),
+            (ServerPhase::Stopped, 3),
+            (ServerPhase::Cooldown, 2),
+        ] {
+            let (wake_sender, mut wake_receiver) = mpsc::channel(1);
+            let context = client_context(phase, wake_sender, 9);
+            let observed = *context.lifecycle.borrow();
+            let (mut client, server) = connected_pair().await;
+            let peer = server.peer_addr().expect("client peer address");
+            let handler = tokio::spawn(handle_client(server, peer, context));
+
+            client
+                .write_all(&login_exchange_with_intent(intent))
+                .await
+                .expect("login exchange should write");
+            let mut response = Vec::new();
+            client
+                .read_to_end(&mut response)
+                .await
+                .expect("login disconnect should arrive");
+            handler
+                .await
+                .expect("client task should not panic")
+                .expect("sleeping login should be handled");
+
+            assert!(!response.is_empty());
+            assert_eq!(
+                wake_receiver.try_recv().expect("wake should be queued"),
+                WakeRequest::observed(observed)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_change_from_stopped_to_running_during_handshake_proxies() {
+        let backend_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("backend listener should bind");
+        let backend_port = backend_listener
+            .local_addr()
+            .expect("backend listener has an address")
+            .port();
+        let (wake_sender, mut wake_receiver) = mpsc::channel(1);
+        let (context, lifecycle_sender) =
+            client_context_with_lifecycle(ServerPhase::Stopped, wake_sender, backend_port);
+        let (mut client, server) = connected_pair().await;
+        let peer = server.peer_addr().expect("client peer address");
+        let handler = tokio::spawn(handle_client(server, peer, context));
+        let handshake = handshake_frame(12_345, 77);
+        let expected = handshake.clone();
+
+        client
+            .write_all(&handshake[..1])
+            .await
+            .expect("first handshake byte should write");
+        lifecycle_sender.send_replace(LifecycleState::test_phase(ServerPhase::Running));
+        client
+            .write_all(&handshake[1..])
+            .await
+            .expect("remaining handshake should write");
+
+        let (mut backend, _) = timeout(Duration::from_secs(1), backend_listener.accept())
+            .await
+            .expect("running lifecycle should connect to backend")
+            .expect("backend should accept proxy");
+        let mut replayed = vec![0; expected.len()];
+        backend
+            .read_exact(&mut replayed)
+            .await
+            .expect("handshake replay should arrive");
+        assert_eq!(replayed, expected);
+        backend
+            .write_all(b"running")
+            .await
+            .expect("backend response should write");
+        let mut response = [0; 7];
+        client
+            .read_exact(&mut response)
+            .await
+            .expect("backend response should arrive");
+        assert_eq!(&response, b"running");
+        drop((client, backend));
+        handler
+            .await
+            .expect("client task should not panic")
+            .expect("connection should proxy");
+        assert_no_wake(&mut wake_receiver);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_change_from_running_to_stopped_during_handshake_sleeps() {
+        let backend_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("backend listener should bind");
+        let backend_port = backend_listener
+            .local_addr()
+            .expect("backend listener has an address")
+            .port();
+        let (wake_sender, mut wake_receiver) = mpsc::channel(1);
+        let (context, lifecycle_sender) =
+            client_context_with_lifecycle(ServerPhase::Running, wake_sender, backend_port);
+        let (mut client, server) = connected_pair().await;
+        let peer = server.peer_addr().expect("client peer address");
+        let handler = tokio::spawn(handle_client(server, peer, context));
+        let exchange = login_exchange();
+        let stopped = LifecycleState::test_phase(ServerPhase::Stopped);
+
+        client
+            .write_all(&exchange[..1])
+            .await
+            .expect("first handshake byte should write");
+        lifecycle_sender.send_replace(stopped);
+        client
+            .write_all(&exchange[1..])
+            .await
+            .expect("remaining exchange should write");
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("sleeping disconnect should arrive");
+        handler
+            .await
+            .expect("client task should not panic")
+            .expect("connection should use sleeping behavior");
+
+        assert!(!response.is_empty());
+        assert_eq!(
+            wake_receiver.try_recv().expect("wake should be queued"),
+            WakeRequest::observed(stopped)
+        );
+        assert!(
+            timeout(Duration::from_millis(100), backend_listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_snapshot_remains_frozen_after_sampling() {
+        let (wake_sender, mut wake_receiver) = mpsc::channel(1);
+        let (context, lifecycle_sender) =
+            client_context_with_lifecycle(ServerPhase::Stopped, wake_sender, 9);
+        let (mut client, server) = connected_pair().await;
+        let peer = server.peer_addr().expect("client peer address");
+        let deadline = Instant::now() + context.handshake_timeout;
+        client
+            .write_all(&login_exchange())
+            .await
+            .expect("login exchange should write");
+        let connection = ConnectionEnvelope::read(server, deadline)
+            .await
+            .expect("handshake should parse");
+        let observed = *context.lifecycle.borrow();
+        lifecycle_sender.send_replace(LifecycleState::test_phase(ServerPhase::Running));
+        let handler = tokio::spawn(handle_sampled_connection(
+            connection, peer, context, observed, deadline,
+        ));
+
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("frozen sleeping disconnect should arrive");
+        handler
+            .await
+            .expect("client task should not panic")
+            .expect("frozen snapshot should be handled");
+        assert!(!response.is_empty());
+        assert_eq!(
+            wake_receiver.try_recv().expect("wake should be queued"),
+            WakeRequest::observed(observed)
+        );
+    }
+
+    #[tokio::test]
+    async fn active_backend_failure_does_not_fall_back_or_wake() {
+        let (wake_sender, mut wake_receiver) = mpsc::channel(1);
+        let mut context = client_context(ServerPhase::Running, wake_sender, 0);
+        context.proxy_connect_timeout = Duration::from_millis(25);
+        let (mut client, server) = connected_pair().await;
+        let peer = server.peer_addr().expect("client peer address");
+        let handler = tokio::spawn(handle_client(server, peer, context));
+
+        client
+            .write_all(&handshake_frame(12_345, 77))
+            .await
+            .expect("active handshake should write");
+        let mut response = Vec::new();
+        client
+            .read_to_end(&mut response)
+            .await
+            .expect("failed proxy should close the client");
+        let error = handler
+            .await
+            .expect("client task should not panic")
+            .expect_err("backend connection should fail");
+
+        assert!(error.to_string().contains("could not connect"));
+        assert!(response.is_empty());
+        assert_no_wake(&mut wake_receiver);
     }
 
     #[tokio::test]

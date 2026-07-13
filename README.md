@@ -83,7 +83,7 @@ Existing configurations must set `schema_version = 2` and add the matching `mine
 | `rcon_retry_interval_seconds`   |      `2` | Delay between failed RCON connections.                   |
 | `rcon_command_timeout_seconds`  |     `10` | Timeout for an RCON connection or command.               |
 | `shutdown_timeout_seconds`      |     `30` | Graceful shutdown time before forced termination.        |
-| `handshake_timeout_seconds`     |      `5` | Timeout for a sleeping client's initial packets.         |
+| `handshake_timeout_seconds`     |      `5` | Total deadline for handshake and required sleeping packet. |
 | `proxy_connect_timeout_seconds` |     `10` | Time allowed to connect to the backend.                  |
 | `max_connections`               |    `512` | Maximum concurrent client tasks.                         |
 | `motd_*`                        |        — | Sleeping server-list message and style.                  |

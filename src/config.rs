@@ -36,7 +36,7 @@ pub struct Config {
     pub rcon_command_timeout_seconds: u64,
     /// Seconds to wait after `stop` before forcefully terminating the process.
     pub shutdown_timeout_seconds: u64,
-    /// Seconds allowed for a sleeping client to complete its initial packets.
+    /// Total seconds to receive the handshake and any required sleeping packet.
     pub handshake_timeout_seconds: u64,
     /// Seconds allowed for a proxy connection to reach the backend server.
     pub proxy_connect_timeout_seconds: u64,
