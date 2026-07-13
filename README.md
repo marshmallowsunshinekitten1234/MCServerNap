@@ -67,7 +67,7 @@ Status connections do not reset the activity timer. They are best-effort at the 
 
 If the server fails to start or later exits unexpectedly, MCServerNap does not keep restarting it on its own. A new login attempt schedules one more start after a cooldown; consecutive failures increase the cooldown through 5, 10, 20, 40, and at most 60 seconds.
 
-Launch commands inherit MCServerNap's working directory. A launch script should change to the server directory and remain attached to Java until it exits. On Unix, finish with `exec java ...`; on Windows, do not use `start` or `Start-Process`.
+Launch commands inherit MCServerNap's working directory. MCServerNap owns the launch command's stdin and may send `stop\n` through it when RCON shutdown fails, so launch wrappers must preserve stdin through to Java. A launch script should change to the server directory and remain attached to Java until it exits. On Unix, finish with `exec java ...`; on Windows, do not use `start` or `Start-Process`.
 
 Start `mcservernap listen` only when the backend is fully stopped or ready, and do not start the same server another way while the listener is running. MCServerNap can proxy an already-running server, but it will not stop it. If the backend state is uncertain, it will not launch. Restarting the listener clears what it remembers, so do that only after confirming the backend is fully stopped or ready.
 
