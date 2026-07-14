@@ -12,6 +12,7 @@ use tokio::time::{Instant, sleep, sleep_until, timeout};
 use crate::backend_use::{
     BackendCycle, BackendUseCoordinator, BackendUseLease, LoginTransferProxySession,
 };
+use crate::context::ServerContext;
 use crate::endpoint::Endpoint;
 use crate::minecraft::{ClientRequest, ConnectionEnvelope, HandshakeIntent, MinecraftResponder};
 use crate::supervisor::{
@@ -29,7 +30,7 @@ fn supervisor_shutdown_wait_limit(
         .checked_add(shutdown_timeout)
         .and_then(|combined| combined.checked_add(SUPERVISOR_SHUTDOWN_MARGIN))
         .context(
-            "rcon_command_timeout_seconds plus shutdown_timeout_seconds and the supervisor shutdown margin exceed the supported duration; reduce one of the timeout settings",
+            "command_timeout_seconds plus shutdown_timeout_seconds and the supervisor shutdown margin exceed the supported duration; reduce one of the timeout settings",
         )
 }
 
@@ -42,6 +43,7 @@ pub struct ServerRuntimeConfig {
 }
 
 struct PreparedRuntimeInputs {
+    context: ServerContext,
     backend_endpoint: Endpoint,
     handshake_timeout: Duration,
     proxy_connect_timeout: Duration,
@@ -63,6 +65,7 @@ pub struct BoundServerRuntime {
 }
 
 pub struct ServerRuntime {
+    context: ServerContext,
     listener: TcpListener,
     client_context: ClientContext,
     connection_limit: Arc<Semaphore>,
@@ -74,6 +77,7 @@ pub struct ServerRuntime {
 
 #[derive(Clone)]
 struct ClientContext {
+    context: ServerContext,
     lifecycle: watch::Receiver<LifecycleState>,
     wake_requests: mpsc::Sender<WakeRequest>,
     backend_use: Arc<BackendUseCoordinator>,
@@ -86,9 +90,18 @@ struct ClientContext {
 enum RunExit {
     Shutdown(Result<()>),
     Supervisor(std::result::Result<Result<()>, tokio::task::JoinError>),
+    ClientTaskPanic(tokio::task::JoinError),
 }
 
 impl ServerRuntime {
+    #[cfg(test)]
+    pub(crate) fn replace_supervisor_with_panic(&mut self) {
+        self.supervisor.abort();
+        self.supervisor = tokio::spawn(async {
+            panic!("intentional coordinator supervisor panic");
+        });
+    }
+
     pub fn prepare(
         config: ServerRuntimeConfig,
         responder: MinecraftResponder,
@@ -109,6 +122,7 @@ impl ServerRuntime {
         Ok(PreparedServerRuntime {
             bind_endpoint,
             inputs: PreparedRuntimeInputs {
+                context: supervisor_config.context.clone(),
                 backend_endpoint,
                 handshake_timeout,
                 proxy_connect_timeout,
@@ -134,14 +148,14 @@ impl ServerRuntime {
                 result = &mut shutdown => break RunExit::Shutdown(result),
                 completed = self.connections.join_next(), if !self.connections.is_empty() => {
                     if let Some(Err(error)) = completed {
-                        log::warn!("Client task failed: {error}");
+                        break RunExit::ClientTaskPanic(error);
                     }
                 }
                 accepted = self.listener.accept() => {
                     let (socket, peer) = match accepted {
                         Ok(connection) => connection,
                         Err(error) => {
-                            log::warn!("Failed to accept a client connection: {error}");
+                            log::warn!("[server={}] Failed to accept a client connection: {error}", self.context);
                             sleep(Duration::from_millis(100)).await;
                             continue;
                         }
@@ -150,7 +164,7 @@ impl ServerRuntime {
                     let permit = match Arc::clone(&self.connection_limit).try_acquire_owned() {
                         Ok(permit) => permit,
                         Err(TryAcquireError::NoPermits) => {
-                            log::warn!("Dropping connection from {peer}: connection limit reached");
+                            log::warn!("[server={}] Dropping connection from {peer}: connection limit reached", self.context);
                             continue;
                         }
                         Err(TryAcquireError::Closed) => {
@@ -163,8 +177,9 @@ impl ServerRuntime {
                     let context = self.client_context.clone();
                     self.connections.spawn(async move {
                         let _permit = permit;
+                        let server_context = context.context.clone();
                         if let Err(error) = handle_client(socket, peer, context).await {
-                            log::debug!("Connection from {peer} ended: {error:#}");
+                            log::debug!("[server={server_context}] Connection from {peer} ended: {error:#}");
                         }
                     });
                 }
@@ -172,31 +187,66 @@ impl ServerRuntime {
         };
 
         self.connections.abort_all();
-        while self.connections.join_next().await.is_some() {}
+        let mut cleanup_client_panic = None;
+        while let Some(completed) = self.connections.join_next().await {
+            if let Err(error) = completed
+                && error.is_panic()
+                && cleanup_client_panic.is_none()
+            {
+                cleanup_client_panic = Some(anyhow::anyhow!("client task panicked: {error}"));
+            }
+        }
 
         match exit {
-            RunExit::Supervisor(result) => {
-                result.context("server supervisor task failed")??;
-                bail!("server supervisor stopped unexpectedly")
-            }
+            RunExit::Supervisor(result) => combine_runtime_errors(
+                match result {
+                    Err(error) => Err(anyhow::anyhow!(
+                        "supervisor panicked; cleanup of this runtime is uncertain: {error}"
+                    )),
+                    Ok(Err(error)) => Err(error).context("server supervisor failed"),
+                    Ok(Ok(())) => Err(anyhow::anyhow!("server supervisor stopped unexpectedly")),
+                },
+                cleanup_client_panic,
+            ),
             RunExit::Shutdown(shutdown_result) => {
-                let shutdown_requested = self.supervisor_shutdown.send(()).is_ok();
-                let mut cleanup_result =
-                    await_supervisor_shutdown(&mut self.supervisor, self.supervisor_wait_limit)
-                        .await;
-                if !shutdown_requested && cleanup_result.is_ok() {
-                    cleanup_result = Err(anyhow::anyhow!(
-                        "server supervisor stopped before shutdown was requested"
-                    ));
-                }
-
-                match (shutdown_result, cleanup_result) {
-                    (Ok(()), Ok(())) => Ok(()),
-                    (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-                    (Err(shutdown_error), Err(cleanup_error)) => Err(shutdown_error
-                        .context(format!("runtime cleanup also failed: {cleanup_error:#}"))),
-                }
+                let shutdown_result = combine_runtime_errors(shutdown_result, cleanup_client_panic);
+                self.finish_shutdown(shutdown_result).await
             }
+            RunExit::ClientTaskPanic(error) => {
+                let client_panic = Err(anyhow::anyhow!("client task panicked: {error}"));
+                self.finish_shutdown(combine_runtime_errors(client_panic, cleanup_client_panic))
+                    .await
+            }
+        }
+    }
+
+    async fn finish_shutdown(mut self, shutdown_result: Result<()>) -> Result<()> {
+        let shutdown_requested = self.supervisor_shutdown.send(()).is_ok();
+        let mut cleanup_result =
+            await_supervisor_shutdown(&mut self.supervisor, self.supervisor_wait_limit).await;
+        if !shutdown_requested && cleanup_result.is_ok() {
+            cleanup_result = Err(anyhow::anyhow!(
+                "server supervisor stopped before shutdown was requested"
+            ));
+        }
+
+        match (shutdown_result, cleanup_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(shutdown_error), Err(cleanup_error)) => {
+                Err(shutdown_error
+                    .context(format!("runtime cleanup also failed: {cleanup_error:#}")))
+            }
+        }
+    }
+}
+
+fn combine_runtime_errors(primary: Result<()>, additional: Option<anyhow::Error>) -> Result<()> {
+    match (primary, additional) {
+        (result, None) => result,
+        (Ok(()), Some(error)) => Err(error),
+        (Err(primary), Some(additional)) => {
+            Err(primary.context(format!("another runtime failure occurred: {additional:#}")))
         }
     }
 }
@@ -224,6 +274,7 @@ impl BoundServerRuntime {
             inputs,
         } = self;
         let PreparedRuntimeInputs {
+            context,
             backend_endpoint,
             handshake_timeout,
             proxy_connect_timeout,
@@ -246,6 +297,7 @@ impl BoundServerRuntime {
             Arc::clone(&backend_use),
         ));
         let client_context = ClientContext {
+            context: context.clone(),
             lifecycle,
             wake_requests,
             backend_use,
@@ -255,9 +307,10 @@ impl BoundServerRuntime {
             proxy_connect_timeout,
         };
 
-        log::info!("Listening for Minecraft clients on {bind_endpoint}");
+        log::info!("[server={context}] Listening on {bind_endpoint}");
 
         ServerRuntime {
+            context,
             listener,
             client_context,
             connection_limit,
@@ -342,14 +395,20 @@ async fn handle_sampled_connection(
                 .await?;
         }
         ClientRequest::UnsupportedProtocol { protocol_version } => {
-            log::info!("Rejected login from {peer}: protocol {protocol_version} is not supported");
+            log::info!(
+                "[server={}] Rejected login from {peer}: protocol {protocol_version} is not supported",
+                context.context
+            );
             context
                 .responder
                 .send_incompatible_disconnect(connection.socket_mut(), operation_timeout)
                 .await?;
         }
         ClientRequest::Login { intent } => {
-            log::info!("Minecraft {intent:?} request from {peer}");
+            log::info!(
+                "[server={}] Minecraft {intent:?} request from {peer}",
+                context.context
+            );
             if matches!(
                 current_phase,
                 ServerPhase::Reconciling
@@ -362,9 +421,15 @@ async fn handle_sampled_connection(
                     .wake_requests
                     .try_send(WakeRequest::observed(observed_lifecycle))
                 {
-                    Ok(()) => log::info!("Queued server wake-up request from {peer}"),
+                    Ok(()) => log::info!(
+                        "[server={}] Queued server wake-up request from {peer}",
+                        context.context
+                    ),
                     Err(mpsc::error::TrySendError::Full(_)) => {
-                        log::debug!("Wake-up request already pending");
+                        log::debug!(
+                            "[server={}] Wake-up request already pending",
+                            context.context
+                        );
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         bail!("server supervisor wake channel is closed");
@@ -414,14 +479,25 @@ async fn proxy_connected_owned(
     ensure_current_owned_cycle(&context.lifecycle, cycle)?;
     let intent = connection.intent();
     let (mut client, framed_handshake) = connection.into_proxy_parts();
-    log::debug!("Proxying {peer} to {}", context.backend_endpoint);
+    log::debug!(
+        "[server={}] Proxying {peer} to {}",
+        context.context,
+        context.backend_endpoint
+    );
 
     backend
         .write_all(&framed_handshake)
         .await
         .with_context(|| format!("failed to replay Minecraft handshake for {peer}"))?;
     let _session = establish_owned_proxy_activity(context, cycle, intent, lease)?;
-    proxy_streams(&mut client, &mut backend, peer, framed_handshake.len()).await
+    proxy_streams(
+        &mut client,
+        &mut backend,
+        peer,
+        &context.context,
+        framed_handshake.len(),
+    )
+    .await
 }
 
 fn establish_owned_proxy_activity(
@@ -459,12 +535,23 @@ async fn proxy_external_connection(
     backend
         .set_nodelay(true)
         .context("failed to enable TCP_NODELAY for backend")?;
-    log::debug!("Proxying {peer} to {}", context.backend_endpoint);
+    log::debug!(
+        "[server={}] Proxying {peer} to {}",
+        context.context,
+        context.backend_endpoint
+    );
     backend
         .write_all(&framed_handshake)
         .await
         .with_context(|| format!("failed to replay Minecraft handshake for {peer}"))?;
-    proxy_streams(&mut client, &mut backend, peer, framed_handshake.len()).await
+    proxy_streams(
+        &mut client,
+        &mut backend,
+        peer,
+        &context.context,
+        framed_handshake.len(),
+    )
+    .await
 }
 
 fn ensure_current_owned_cycle(
@@ -486,6 +573,7 @@ async fn proxy_streams(
     client: &mut TcpStream,
     backend: &mut TcpStream,
     peer: std::net::SocketAddr,
+    context: &ServerContext,
     replayed_handshake_bytes: usize,
 ) -> Result<()> {
     let (client_to_server, server_to_client) = tokio::io::copy_bidirectional(client, backend)
@@ -494,7 +582,7 @@ async fn proxy_streams(
     let client_to_server = client_to_server
         + u64::try_from(replayed_handshake_bytes).expect("handshake length fits in u64");
     log::debug!(
-        "Proxy for {peer} closed ({client_to_server} bytes upstream, {server_to_client} downstream)"
+        "[server={context}] Proxy for {peer} closed ({client_to_server} bytes upstream, {server_to_client} downstream)"
     );
     Ok(())
 }
@@ -538,6 +626,7 @@ mod tests {
     use super::*;
     use crate::minecraft::{MinecraftResponderSettings, MinecraftVersion};
     use crate::process::LaunchCommand;
+    use crate::rcon::RconSecret;
     use crate::supervisor::RconConfig;
 
     fn runtime_config(
@@ -551,6 +640,7 @@ mod tests {
             handshake_timeout: Duration::from_secs(30),
             proxy_connect_timeout: Duration::from_secs(1),
             supervisor: SupervisorConfig {
+                context: ServerContext::new("test".to_owned()),
                 launch: LaunchCommand::new(
                     OsString::from(command),
                     arguments.into_iter().map(OsString::from).collect(),
@@ -558,7 +648,7 @@ mod tests {
                 ),
                 rcon: Some(RconConfig {
                     endpoint: rcon_endpoint,
-                    password: "secret".to_owned(),
+                    password: RconSecret::new("secret".to_owned()).unwrap(),
                 }),
                 poll_interval: Duration::from_secs(30),
                 idle_timeout: Duration::from_secs(30),
@@ -758,6 +848,7 @@ mod tests {
             backend_use.begin_cycle(cycle, Instant::now());
         }
         let context = ClientContext {
+            context: ServerContext::new("test".to_owned()),
             lifecycle,
             wake_requests,
             backend_use,
@@ -1600,7 +1691,7 @@ mod tests {
         else {
             panic!("overflowing watchdog should fail preparation");
         };
-        assert!(error.to_string().contains("rcon_command_timeout_seconds"));
+        assert!(error.to_string().contains("command_timeout_seconds"));
 
         drop(reserved_listener);
         TcpListener::bind(reserved_address)
@@ -1775,6 +1866,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_task_panic_is_fatal_after_normal_runtime_cleanup() {
+        let executable = std::env::current_exe().unwrap();
+        let mut runtime = bind_test_runtime(runtime_config(
+            executable.to_string_lossy().into_owned(),
+            Vec::new(),
+            Endpoint::new("127.0.0.1", 9),
+        ))
+        .await;
+        runtime.connections.spawn(async {
+            panic!("intentional client task panic");
+        });
+
+        let error = timeout(
+            Duration::from_secs(2),
+            runtime.run_until(std::future::pending()),
+        )
+        .await
+        .expect("fatal client panic cleanup should be bounded")
+        .expect_err("client panic must fail the runtime");
+        assert!(error.to_string().contains("client task panicked"));
+    }
+
+    #[tokio::test]
+    async fn client_panic_racing_shutdown_remains_fatal() {
+        let executable = std::env::current_exe().unwrap();
+        let mut runtime = bind_test_runtime(runtime_config(
+            executable.to_string_lossy().into_owned(),
+            Vec::new(),
+            Endpoint::new("127.0.0.1", 9),
+        ))
+        .await;
+        let (panic_sender, panic_receiver) = oneshot::channel();
+        let client_task = runtime.connections.spawn(async {
+            panic_receiver.await.unwrap();
+            panic!("intentional shutdown-race panic");
+        });
+
+        let error = runtime
+            .run_until(async move {
+                panic_sender.send(()).unwrap();
+                while !client_task.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+                Ok(())
+            })
+            .await
+            .expect_err("a client panic concurrent with shutdown must remain fatal");
+        assert!(error.to_string().contains("client task panicked"));
+    }
+
+    #[tokio::test]
+    async fn supervisor_panic_reports_uncertain_cleanup() {
+        let executable = std::env::current_exe().unwrap();
+        let mut runtime = bind_test_runtime(runtime_config(
+            executable.to_string_lossy().into_owned(),
+            Vec::new(),
+            Endpoint::new("127.0.0.1", 9),
+        ))
+        .await;
+        runtime.supervisor.abort();
+        let _ = (&mut runtime.supervisor).await;
+        runtime.supervisor = tokio::spawn(async {
+            panic!("intentional supervisor panic");
+        });
+
+        let error = timeout(
+            Duration::from_secs(2),
+            runtime.run_until(std::future::pending()),
+        )
+        .await
+        .expect("supervisor panic should be observed")
+        .expect_err("supervisor panic must fail the runtime");
+        assert!(error.to_string().contains("supervisor panicked"));
+        assert!(
+            error
+                .to_string()
+                .contains("cleanup of this runtime is uncertain")
+        );
+    }
+
+    #[tokio::test]
     async fn caller_shutdown_releases_listener_and_client_tasks() {
         let executable = std::env::current_exe().expect("test executable path should be known");
         let runtime = bind_test_runtime(runtime_config(
@@ -1857,7 +2029,7 @@ mod tests {
             .expect_err("overflowing shutdown budgets must be rejected");
         let message = error.to_string();
 
-        assert!(message.contains("rcon_command_timeout_seconds"));
+        assert!(message.contains("command_timeout_seconds"));
         assert!(message.contains("shutdown_timeout_seconds"));
         assert!(message.contains("reduce"));
     }

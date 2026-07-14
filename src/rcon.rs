@@ -16,6 +16,20 @@ const MAX_COMMAND_BYTES: usize = 1_413;
 const MAX_PACKET_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
+pub struct RconSecret(String);
+
+impl RconSecret {
+    pub(crate) fn new(value: String) -> Result<Self> {
+        validate_body(&value, "RCON password")?;
+        ensure!(!value.is_empty(), "RCON password must not be empty");
+        Ok(Self(value))
+    }
+
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Minimal asynchronous client for Minecraft's Source RCON transport.
 pub struct RconClient {
     stream: TcpStream,
