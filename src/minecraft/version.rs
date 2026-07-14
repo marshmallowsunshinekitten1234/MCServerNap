@@ -81,6 +81,7 @@ impl MinecraftVersion {
         SUPPORTED_VERSIONS.iter().copied().map(Self)
     }
 
+    #[cfg(test)]
     pub(crate) const fn latest() -> Self {
         Self(SUPPORTED_VERSIONS[SUPPORTED_VERSIONS.len() - 1])
     }

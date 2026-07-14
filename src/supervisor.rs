@@ -11,11 +11,36 @@ use tokio::sync::{OwnedRwLockWriteGuard, mpsc, oneshot, watch};
 use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 
 use crate::backend_use::{BackendCycle, BackendUseCoordinator, CurrentCycleActivity};
+use crate::context::ServerContext;
 use crate::endpoint::Endpoint;
 use crate::process::{self, LaunchCommand, OwnedProcess};
-use crate::rcon::{self, RconClient, RconProbeClassification};
+use crate::rcon::{self, RconClient, RconProbeClassification, RconSecret};
 
 const STABILITY_WINDOW: Duration = Duration::from_secs(60);
+
+macro_rules! server_debug {
+    ($config:expr, $($argument:tt)*) => {
+        log::debug!("[server={}] {}", $config.context, format_args!($($argument)*))
+    };
+}
+
+macro_rules! server_info {
+    ($config:expr, $($argument:tt)*) => {
+        log::info!("[server={}] {}", $config.context, format_args!($($argument)*))
+    };
+}
+
+macro_rules! server_warn {
+    ($config:expr, $($argument:tt)*) => {
+        log::warn!("[server={}] {}", $config.context, format_args!($($argument)*))
+    };
+}
+
+macro_rules! server_error {
+    ($config:expr, $($argument:tt)*) => {
+        log::error!("[server={}] {}", $config.context, format_args!($($argument)*))
+    };
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServerPhase {
@@ -170,6 +195,7 @@ impl WakeRequest {
 }
 
 pub struct SupervisorConfig {
+    pub context: ServerContext,
     pub launch: LaunchCommand,
     pub rcon: Option<RconConfig>,
     pub poll_interval: Duration,
@@ -182,7 +208,7 @@ pub struct SupervisorConfig {
 
 pub struct RconConfig {
     pub endpoint: Endpoint,
-    pub password: String,
+    pub password: RconSecret,
 }
 
 pub(crate) struct BackendEndpoint {
@@ -307,16 +333,16 @@ impl ReconciliationResult {
         }
     }
 
-    fn log_details(&self) {
+    fn log_details(&self, config: &SupervisorConfig) {
         let (rcon_detail, backend) = match self {
             Self::ConfiguredRcon { rcon, backend } => (rcon.detail.as_ref(), backend),
             Self::BackendOnly(backend) => (None, backend),
         };
         if let Some(error) = rcon_detail {
-            log::debug!("RCON reconciliation detail: {error:#}");
+            server_debug!(config, "RCON reconciliation detail: {error:#}");
         }
         if let Some(error) = &backend.detail {
-            log::debug!("Minecraft backend reconciliation detail: {error:#}");
+            server_debug!(config, "Minecraft backend reconciliation detail: {error:#}");
         }
     }
 }
@@ -349,7 +375,6 @@ impl SupervisorControl {
                     {
                         return true;
                     }
-                    log::debug!("Ignoring stale server wake-up request");
                 }
             }
         }
@@ -410,7 +435,6 @@ impl SupervisorControl {
             retry_at: Some(retry_at),
             reconciliation_evidence: ReconciliationEvidence::None,
         });
-        log_failure_cooldown(FailureCategory::LaunchFailed, failure_streak, retry_delay);
         retry_at
     }
 
@@ -437,7 +461,6 @@ impl SupervisorControl {
             retry_at: Some(retry_at),
             reconciliation_evidence: ReconciliationEvidence::None,
         });
-        log_failure_cooldown(failure, failure_streak, retry_delay);
         retry_at
     }
 
@@ -479,13 +502,6 @@ impl SupervisorControl {
             retry_at: Some(retry_at),
             reconciliation_evidence: ReconciliationEvidence::None,
         });
-        log_failure_cooldown(
-            current
-                .failure
-                .expect("failed-process cleanup must have a failure category"),
-            current.failure_streak,
-            retry_delay,
-        );
         retry_at
     }
 
@@ -606,7 +622,6 @@ impl SupervisorControl {
             current.phase,
             ServerPhase::Reconciling | ServerPhase::External
         ));
-        let entering_external = current.phase != ServerPhase::External;
         self.publish(LifecycleState {
             phase: ServerPhase::External,
             launch_generation: if consume_demand {
@@ -620,11 +635,6 @@ impl SupervisorControl {
             retry_at: None,
             reconciliation_evidence: ReconciliationEvidence::Positive,
         });
-        if entering_external {
-            log::info!(
-                "Detected a ready external backend; proxying without process ownership or automatic shutdown."
-            );
-        }
     }
 
     fn publish_conflict(&self, evidence: ReconciliationEvidence, consume_demand: bool) {
@@ -680,15 +690,8 @@ impl SupervisorControl {
                         self.set_phase(ServerPhase::Stopped);
                         return CooldownOutcome::Shutdown;
                     };
-                    if request.requests_retry(self.current_lifecycle()) {
-                        if retry_pending {
-                            log::debug!("Coalescing additional demand into the pending server retry");
-                        } else {
-                            retry_pending = true;
-                            log::info!("Latched one server retry for the end of the failure cooldown");
-                        }
-                    } else {
-                        log::debug!("Ignoring stale server wake-up request during failure cooldown");
+                    if request.requests_retry(self.current_lifecycle()) && !retry_pending {
+                        retry_pending = true;
                     }
                 }
                 () = sleep_until(retry_at) => {}
@@ -771,7 +774,7 @@ async fn reconciliation_probe(
         let (rcon, backend) = tokio::join!(
             rcon::probe(
                 &rcon_config.endpoint,
-                &rcon_config.password,
+                rcon_config.password.expose(),
                 config.command_timeout,
             ),
             probe_backend(backend),
@@ -818,9 +821,9 @@ async fn wait_for_reconciliation(
                     && request.observed == control.current_lifecycle()
                 {
                     startup_demand = true;
-                    log::info!("Latched one server wake-up request during startup reconciliation");
+                    server_info!(config, "Latched one server wake-up request during startup reconciliation");
                 } else {
-                    log::debug!("Ignoring coalesced server wake-up request during reconciliation");
+                    server_debug!(config, "Ignoring coalesced server wake-up request during reconciliation");
                 }
             }
         }
@@ -829,6 +832,7 @@ async fn wait_for_reconciliation(
 
 fn publish_conflict_observation(
     control: &SupervisorControl,
+    config: &SupervisorConfig,
     result: &ReconciliationResult,
     evidence: ReconciliationEvidence,
     consume_demand: bool,
@@ -844,12 +848,14 @@ fn publish_conflict_observation(
             "another login may retry reconciliation"
         };
         if let Some(rcon) = classification.rcon {
-            log::warn!(
+            server_warn!(
+                config,
                 "Backend conflict: RCON={rcon:?}, backend-port={:?}, sticky-positive={sticky_positive}; {next_step}",
                 classification.backend,
             );
         } else {
-            log::warn!(
+            server_warn!(
+                config,
                 "Backend conflict: RCON=not-configured, backend-port={:?}, sticky-positive={sticky_positive}; {next_step}",
                 classification.backend,
             );
@@ -881,7 +887,7 @@ async fn reconcile_startup(
     else {
         return StartupReconciliationOutcome::Shutdown;
     };
-    result.log_details();
+    result.log_details(config);
     if control.shutdown_pending() {
         return StartupReconciliationOutcome::Shutdown;
     }
@@ -898,12 +904,17 @@ async fn reconcile_startup(
         }
         ReconciliationClassification::FullyReady => {
             control.publish_external(startup_demand);
+            server_info!(
+                config,
+                "Detected a ready external backend; proxying without process ownership or automatic shutdown"
+            );
             *last_conflict = None;
             StartupReconciliationOutcome::Idle
         }
         ReconciliationClassification::Positive => {
             publish_conflict_observation(
                 control,
+                config,
                 &result,
                 ReconciliationEvidence::Positive,
                 startup_demand,
@@ -914,6 +925,7 @@ async fn reconcile_startup(
         ReconciliationClassification::Inconclusive => {
             publish_conflict_observation(
                 control,
+                config,
                 &result,
                 ReconciliationEvidence::Inconclusive,
                 startup_demand,
@@ -936,7 +948,7 @@ async fn reconcile_final_gate(
     else {
         return FinalGateOutcome::Shutdown;
     };
-    result.log_details();
+    result.log_details(config);
     if control.shutdown_pending() {
         return FinalGateOutcome::Shutdown;
     }
@@ -945,10 +957,15 @@ async fn reconcile_final_gate(
     if prior_evidence == ReconciliationEvidence::Positive {
         if classification == ReconciliationClassification::FullyReady {
             control.publish_external(true);
+            server_info!(
+                config,
+                "Detected a ready external backend; proxying without process ownership or automatic shutdown"
+            );
             *last_conflict = None;
         } else {
             publish_conflict_observation(
                 control,
+                config,
                 &result,
                 ReconciliationEvidence::Positive,
                 true,
@@ -965,12 +982,17 @@ async fn reconcile_final_gate(
         }
         ReconciliationClassification::FullyReady => {
             control.publish_external(true);
+            server_info!(
+                config,
+                "Detected a ready external backend; proxying without process ownership or automatic shutdown"
+            );
             *last_conflict = None;
             FinalGateOutcome::Blocked
         }
         ReconciliationClassification::Positive => {
             publish_conflict_observation(
                 control,
+                config,
                 &result,
                 ReconciliationEvidence::Positive,
                 true,
@@ -981,6 +1003,7 @@ async fn reconcile_final_gate(
         ReconciliationClassification::Inconclusive => {
             publish_conflict_observation(
                 control,
+                config,
                 &result,
                 ReconciliationEvidence::Inconclusive,
                 true,
@@ -1012,7 +1035,7 @@ async fn monitor_external_server(
                 if request.is_none() {
                     return ExternalMonitorOutcome::Shutdown;
                 }
-                log::debug!("Ignoring stale server wake-up request while proxying an external backend");
+                server_debug!(config, "Ignoring stale server wake-up request while proxying an external backend");
                 continue;
             }
             () = sleep_until(next_poll) => {}
@@ -1023,7 +1046,7 @@ async fn monitor_external_server(
         else {
             return ExternalMonitorOutcome::Shutdown;
         };
-        result.log_details();
+        result.log_details(config);
         if control.shutdown_pending() {
             return ExternalMonitorOutcome::Shutdown;
         }
@@ -1034,6 +1057,7 @@ async fn monitor_external_server(
 
         publish_conflict_observation(
             control,
+            config,
             &result,
             ReconciliationEvidence::Positive,
             false,
@@ -1054,9 +1078,19 @@ fn failure_backoff(failure_streak: u32) -> Duration {
     })
 }
 
-fn log_failure_cooldown(failure: FailureCategory, failure_streak: u32, retry_delay: Duration) {
-    log::warn!(
-        "Server entered a {retry_delay:?} cooldown after {failure:?} (failure streak {failure_streak})"
+fn log_current_failure_cooldown(config: &SupervisorConfig, control: &SupervisorControl) {
+    let lifecycle = control.current_lifecycle();
+    let failure = lifecycle
+        .failure
+        .expect("failure cooldown must retain its failure category");
+    let retry_at = lifecycle
+        .retry_at
+        .expect("failure cooldown must retain its retry deadline");
+    let retry_delay = retry_at.saturating_duration_since(lifecycle.phase_started_at);
+    server_warn!(
+        config,
+        "Server entered a {retry_delay:?} cooldown after {failure:?} (failure streak {})",
+        lifecycle.failure_streak
     );
 }
 
@@ -1112,12 +1146,19 @@ pub(crate) async fn run(
 
         let child = match process::launch(&config.launch) {
             Ok(child) => {
+                server_info!(
+                    config,
+                    "Launched server command {:?} {:?}",
+                    config.launch.program,
+                    config.launch.arguments
+                );
                 control.record_launch_success();
                 child
             }
             Err(error) => {
-                log::error!("Unable to start the Minecraft server: {error:#}");
+                server_error!(config, "Unable to start the Minecraft server: {error:#}");
                 let retry_at = control.record_launch_failure();
+                log_current_failure_cooldown(&config, &control);
                 match control.wait_for_cooldown(retry_at, false).await {
                     CooldownOutcome::Launch => launch_pending = true,
                     CooldownOutcome::Stopped => {}
@@ -1132,7 +1173,7 @@ pub(crate) async fn run(
         match outcome {
             CycleOutcome::Stopped => {
                 control.set_phase(ServerPhase::Stopped);
-                log::info!("Minecraft server is stopped and ready to nap");
+                server_info!(config, "Minecraft server is stopped and ready to nap");
             }
             CycleOutcome::Restart => {
                 control.set_phase(ServerPhase::Stopped);
@@ -1141,11 +1182,14 @@ pub(crate) async fn run(
             CycleOutcome::Failed {
                 retry_at,
                 retry_pending,
-            } => match control.wait_for_cooldown(retry_at, retry_pending).await {
-                CooldownOutcome::Launch => launch_pending = true,
-                CooldownOutcome::Stopped => {}
-                CooldownOutcome::Shutdown => return Ok(()),
-            },
+            } => {
+                log_current_failure_cooldown(&config, &control);
+                match control.wait_for_cooldown(retry_at, retry_pending).await {
+                    CooldownOutcome::Launch => launch_pending = true,
+                    CooldownOutcome::Stopped => {}
+                    CooldownOutcome::Shutdown => return Ok(()),
+                }
+            }
             CycleOutcome::Shutdown => {
                 control.set_phase(ServerPhase::Stopped);
                 return Ok(());
@@ -1170,7 +1214,8 @@ async fn run_server_cycle(
             } else {
                 "the Minecraft backend TCP port"
             };
-            log::error!(
+            server_error!(
+                config,
                 "{readiness_source} did not become ready within {:?}; terminating the server",
                 config.startup_timeout
             );
@@ -1180,6 +1225,7 @@ async fn run_server_cycle(
         ReadinessOutcome::Exited(status) => {
             return Ok(reaped_failure(
                 control,
+                config,
                 FailureCategory::ExitedBeforeReady,
                 status,
             ));
@@ -1196,9 +1242,9 @@ async fn run_server_cycle(
         return stop_for_shutdown(child, control, config).await;
     }
     if let Some(rcon) = &config.rcon {
-        log::info!("RCON is ready at {}", rcon.endpoint);
+        server_info!(config, "RCON is ready at {}", rcon.endpoint);
     } else {
-        log::info!("Minecraft backend TCP port is ready");
+        server_info!(config, "Minecraft backend TCP port is ready");
     }
     let cycle = control.publish_running(backend_use);
     monitor_running_server(
@@ -1240,7 +1286,7 @@ async fn wait_for_readiness(
             if let Some(rcon) = &config.rcon {
                 timeout(
                     connect_timeout,
-                    RconClient::connect(&rcon.endpoint, &rcon.password),
+                    RconClient::connect(&rcon.endpoint, rcon.password.expose()),
                 )
                 .await
                 .context("RCON connection attempt timed out")??;
@@ -1263,7 +1309,7 @@ async fn wait_for_readiness(
                 if request.is_none() {
                     return ReadinessOutcome::Shutdown;
                 }
-                log::debug!("Ignoring duplicate start request during startup");
+                server_debug!(config, "Ignoring duplicate start request during startup");
                 continue;
             }
             status = child.wait() => {
@@ -1278,9 +1324,9 @@ async fn wait_for_readiness(
                     Err(error) => {
                         failed_attempts += 1;
                         if failed_attempts == 1 || failed_attempts.is_multiple_of(30) {
-                            log::warn!("Backend is not ready yet: {error:#}");
+                            server_warn!(config, "Backend is not ready yet: {error:#}");
                         } else {
-                            log::debug!("Backend is not ready yet: {error:#}");
+                            server_debug!(config, "Backend is not ready yet: {error:#}");
                         }
                     }
                 }
@@ -1296,7 +1342,7 @@ async fn wait_for_readiness(
                 if request.is_none() {
                     return ReadinessOutcome::Shutdown;
                 }
-                log::debug!("Ignoring duplicate start request during startup");
+                server_debug!(config, "Ignoring duplicate start request during startup");
             }
             status = child.wait() => {
                 return match status {
@@ -1397,12 +1443,14 @@ enum RunningMonitorOutcome {
 fn complete_stability_window(
     child: &mut OwnedProcess,
     control: &SupervisorControl,
+    config: &SupervisorConfig,
     stability_pending: &mut bool,
 ) -> std::io::Result<Option<ExitStatus>> {
     let Some(status) = child.try_wait()? else {
         control.reset_failure_streak();
         *stability_pending = false;
-        log::info!(
+        server_info!(
+            config,
             "Server has run continuously for {STABILITY_WINDOW:?}; reset the failure streak"
         );
         return Ok(None);
@@ -1439,11 +1487,11 @@ async fn acquire_idle_exclusive(
                 if request.is_none() {
                     return IdleExclusiveOutcome::Shutdown;
                 }
-                log::debug!("Ignoring start request because the server is already running");
+                server_debug!(config, "Ignoring start request because the server is already running");
             }
             status = child.wait() => return IdleExclusiveOutcome::ChildWait(status),
             () = sleep_until(state.stable_at), if state.stability_pending => {
-                match complete_stability_window(child, control, &mut state.stability_pending) {
+                match complete_stability_window(child, control, config, &mut state.stability_pending) {
                     Ok(Some(status)) => return IdleExclusiveOutcome::ChildWait(Ok(status)),
                     Ok(None) => {}
                     Err(error) => return IdleExclusiveOutcome::ChildWait(Err(error)),
@@ -1490,11 +1538,11 @@ async fn final_rcon_player_check(
                     if request.is_none() {
                         break WaitOutcome::Shutdown;
                     }
-                    log::debug!("Ignoring start request because the server is already running");
+                    server_debug!(config, "Ignoring start request because the server is already running");
                 }
                 status = child.wait() => break WaitOutcome::ChildWait(status),
                 () = sleep_until(state.stable_at), if state.stability_pending => {
-                    match complete_stability_window(child, control, &mut state.stability_pending) {
+                    match complete_stability_window(child, control, config, &mut state.stability_pending) {
                         Ok(Some(status)) => break WaitOutcome::ChildWait(Ok(status)),
                         Ok(None) => {}
                         Err(error) => break WaitOutcome::ChildWait(Err(error)),
@@ -1506,20 +1554,29 @@ async fn final_rcon_player_check(
     };
 
     match outcome {
-        WaitOutcome::Command(Ok(Ok(response))) => match observed_player_count(&response) {
+        WaitOutcome::Command(Ok(Ok(response))) => match observed_player_count(config, &response) {
             Some(0) => FinalRconCheck::Zero,
             Some(player_count) => {
-                log::debug!("Final idle check found {player_count} online player(s)");
+                server_debug!(
+                    config,
+                    "Final idle check found {player_count} online player(s)"
+                );
                 FinalRconCheck::Veto(Some(client))
             }
             None => FinalRconCheck::Veto(Some(client)),
         },
         WaitOutcome::Command(Ok(Err(error))) => {
-            log::warn!("Final RCON player check failed; idle shutdown was canceled: {error:#}");
+            server_warn!(
+                config,
+                "Final RCON player check failed; idle shutdown was canceled: {error:#}"
+            );
             FinalRconCheck::Veto(None)
         }
         WaitOutcome::Command(Err(_)) => {
-            log::warn!("Final RCON player check timed out; idle shutdown was canceled");
+            server_warn!(
+                config,
+                "Final RCON player check timed out; idle shutdown was canceled"
+            );
             FinalRconCheck::Veto(None)
         }
         WaitOutcome::Shutdown => FinalRconCheck::Shutdown,
@@ -1645,11 +1702,15 @@ async fn attempt_expired_idle_stop(
     let idle_for = Instant::now().saturating_duration_since(anchor);
     control.begin_idle_stop(state.cycle);
     if config.rcon.is_some() {
-        log::info!(
+        server_info!(
+            config,
             "Server proxy sessions and RCON player count have been idle for {idle_for:?}; stopping it"
         );
     } else {
-        log::info!("Server proxy sessions have been idle for {idle_for:?}; stopping it");
+        server_info!(
+            config,
+            "Server proxy sessions have been idle for {idle_for:?}; stopping it"
+        );
     }
     drop(exclusive);
     RunningMonitorOutcome::Committed
@@ -1685,13 +1746,13 @@ async fn advance_running_monitor(
             if request.is_none() {
                 RunningMonitorOutcome::Shutdown
             } else {
-                log::debug!("Ignoring start request because the server is already running");
+                server_debug!(config, "Ignoring start request because the server is already running");
                 RunningMonitorOutcome::Continue
             }
         }
         status = child.wait() => RunningMonitorOutcome::ChildWait(status),
         () = sleep_until(stable_at), if stability_pending => {
-            match complete_stability_window(child, control, &mut state.stability_pending) {
+            match complete_stability_window(child, control, config, &mut state.stability_pending) {
                 Ok(Some(status)) => RunningMonitorOutcome::ChildWait(Ok(status)),
                 Ok(None) => RunningMonitorOutcome::Continue,
                 Err(error) => RunningMonitorOutcome::ChildWait(Err(error)),
@@ -1771,21 +1832,21 @@ async fn poll_player_presence(player_inspection: &mut PlayerInspection, config: 
         *zero_anchor = None;
         match timeout(
             config.command_timeout,
-            RconClient::connect(&rcon_config.endpoint, &rcon_config.password),
+            RconClient::connect(&rcon_config.endpoint, rcon_config.password.expose()),
         )
         .await
         {
             Ok(Ok(connected)) => {
-                log::info!("Reconnected to RCON");
+                server_info!(config, "Reconnected to RCON");
                 *client = Some(connected);
                 *next_poll = Instant::now();
             }
             Ok(Err(error)) => {
-                log::warn!("RCON reconnection failed: {error:#}");
+                server_warn!(config, "RCON reconnection failed: {error:#}");
                 *next_poll = Instant::now() + config.retry_interval;
             }
             Err(_) => {
-                log::warn!("RCON reconnection timed out");
+                server_warn!(config, "RCON reconnection timed out");
                 *next_poll = Instant::now() + config.retry_interval;
             }
         }
@@ -1795,14 +1856,20 @@ async fn poll_player_presence(player_inspection: &mut PlayerInspection, config: 
     let response = match timeout(config.command_timeout, rcon_client.command("list")).await {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
-            log::warn!("RCON player poll failed; idle shutdown is suspended: {error:#}");
+            server_warn!(
+                config,
+                "RCON player poll failed; idle shutdown is suspended: {error:#}"
+            );
             *client = None;
             *zero_anchor = None;
             *next_poll = Instant::now() + config.retry_interval;
             return;
         }
         Err(_) => {
-            log::warn!("RCON player poll timed out; idle shutdown is suspended");
+            server_warn!(
+                config,
+                "RCON player poll timed out; idle shutdown is suspended"
+            );
             *client = None;
             *zero_anchor = None;
             *next_poll = Instant::now() + config.retry_interval;
@@ -1810,15 +1877,18 @@ async fn poll_player_presence(player_inspection: &mut PlayerInspection, config: 
         }
     };
 
-    match observed_player_count(&response) {
+    match observed_player_count(config, &response) {
         Some(0) => {
             let started = *zero_anchor.get_or_insert_with(Instant::now);
             let idle_for = Instant::now().saturating_duration_since(started);
-            log::debug!("RCON has continuously reported zero players for {idle_for:?}");
+            server_debug!(
+                config,
+                "RCON has continuously reported zero players for {idle_for:?}"
+            );
         }
         Some(player_count) => {
             *zero_anchor = None;
-            log::debug!("Server has {player_count} online player(s)");
+            server_debug!(config, "Server has {player_count} online player(s)");
         }
         None => *zero_anchor = None,
     }
@@ -1827,10 +1897,11 @@ async fn poll_player_presence(player_inspection: &mut PlayerInspection, config: 
 
 fn reaped_failure(
     control: &SupervisorControl,
+    config: &SupervisorConfig,
     failure: FailureCategory,
     status: ExitStatus,
 ) -> CycleOutcome {
-    log_process_exit(status);
+    log_process_exit(config, status);
     let retry_at = control.record_reaped_failure(failure);
     CycleOutcome::Failed {
         retry_at,
@@ -1846,7 +1917,7 @@ async fn process_wait_outcome(
     failure: FailureCategory,
 ) -> Result<CycleOutcome> {
     match status {
-        Ok(status) => Ok(reaped_failure(control, failure, status)),
+        Ok(status) => Ok(reaped_failure(control, config, failure, status)),
         Err(error) => reap_after_wait_error(child, control, config, error).await,
     }
 }
@@ -1908,9 +1979,6 @@ where
                 };
                 if request.requests_retry(control.current_lifecycle()) {
                     retry_pending = true;
-                    log::info!("Latched one server retry while settling the failed process");
-                } else {
-                    log::debug!("Ignoring stale server wake-up request during failed-process cleanup");
                 }
             }
             result = &mut cleanup => {
@@ -1960,7 +2028,7 @@ async fn stop_committed_idle_server(
                 if request.requests_restart(control.current_lifecycle()) {
                     restart = true;
                 } else {
-                    log::debug!("Ignoring stale server wake-up request while stopping");
+                    server_debug!(config, "Ignoring stale server wake-up request while stopping");
                 }
             }
             result = &mut cleanup => {
@@ -1982,7 +2050,10 @@ async fn stop_committed_idle_server(
     loop {
         match control.wake_requests.try_recv() {
             Ok(request) if request.requests_restart(control.current_lifecycle()) => restart = true,
-            Ok(_) => log::debug!("Ignoring stale server wake-up request while stopping"),
+            Ok(_) => server_debug!(
+                config,
+                "Ignoring stale server wake-up request while stopping"
+            ),
             Err(mpsc::error::TryRecvError::Empty) => break,
             Err(mpsc::error::TryRecvError::Disconnected) => {
                 return Ok(CycleOutcome::Shutdown);
@@ -2003,46 +2074,48 @@ async fn stop_and_reap(child: &mut OwnedProcess, config: &SupervisorConfig) -> R
     let graceful_stop_sent = if let Some(rcon_config) = &config.rcon {
         let rcon_stop = async {
             let mut client =
-                RconClient::connect(&rcon_config.endpoint, &rcon_config.password).await?;
+                RconClient::connect(&rcon_config.endpoint, rcon_config.password.expose()).await?;
             client.stop().await
         };
         match timeout_at(command_deadline, rcon_stop).await {
             Ok(Ok(())) => true,
             Ok(Err(error)) => {
-                log::warn!(
+                server_warn!(
+                    config,
                     "Failed to send the RCON stop command; trying the owned console: {error:#}"
                 );
-                send_console_stop_before(child, command_deadline).await
+                send_console_stop_before(child, config, command_deadline).await
             }
             Err(_) => {
-                log::warn!("Sending the RCON stop command timed out");
+                server_warn!(config, "Sending the RCON stop command timed out");
                 false
             }
         }
     } else {
-        send_console_stop_before(child, command_deadline).await
+        send_console_stop_before(child, config, command_deadline).await
     };
 
     if graceful_stop_sent {
         match timeout(config.shutdown_timeout, child.wait()).await {
             Ok(Ok(status)) => {
-                log_process_exit(status);
+                log_process_exit(config, status);
                 return Ok(());
             }
             Ok(Err(error)) => {
-                log::warn!("Failed while waiting for server shutdown: {error}");
+                server_warn!(config, "Failed while waiting for server shutdown: {error}");
                 wait_error = Some(error);
             }
-            Err(_) => log::warn!(
+            Err(_) => server_warn!(
+                config,
                 "Server did not exit within {:?}; terminating it",
                 config.shutdown_timeout
             ),
         }
     }
 
-    process::terminate(child).await?;
+    let termination_result = process::terminate(child).await;
     match timeout(Duration::from_secs(5), child.wait()).await {
-        Ok(Ok(status)) => log_process_exit(status),
+        Ok(Ok(status)) => log_process_exit(config, status),
         Ok(Err(error)) => return Err(error).context("failed to reap the server process"),
         Err(_) => {
             return Err(anyhow::anyhow!(
@@ -2050,21 +2123,26 @@ async fn stop_and_reap(child: &mut OwnedProcess, config: &SupervisorConfig) -> R
             ));
         }
     }
+    termination_result?;
     if let Some(error) = wait_error {
         return Err(error).context("failed while waiting for graceful server shutdown");
     }
     Ok(())
 }
 
-async fn send_console_stop_before(child: &mut OwnedProcess, deadline: Instant) -> bool {
+async fn send_console_stop_before(
+    child: &mut OwnedProcess,
+    config: &SupervisorConfig,
+    deadline: Instant,
+) -> bool {
     match timeout_at(deadline, child.send_console_stop()).await {
         Ok(Ok(())) => true,
         Ok(Err(error)) => {
-            log::warn!("Failed to send the console stop command: {error:#}");
+            server_warn!(config, "Failed to send the console stop command: {error:#}");
             false
         }
         Err(_) => {
-            log::warn!("Sending the console stop command timed out");
+            server_warn!(config, "Sending the console stop command timed out");
             false
         }
     }
@@ -2088,24 +2166,27 @@ pub fn parse_player_count(response: &str) -> Result<u32> {
         .context("RCON player count is outside the supported range")
 }
 
-fn observed_player_count(response: &str) -> Option<u32> {
-    log::debug!("RCON list response: {response}");
+fn observed_player_count(config: &SupervisorConfig, response: &str) -> Option<u32> {
+    server_debug!(config, "RCON list response: {response}");
     match parse_player_count(response) {
         Ok(count) => Some(count),
         Err(error) => {
             // Unknown is never treated as zero: false idle shutdowns are worse than leaving a
             // server running until the next valid observation.
-            log::warn!("Could not parse RCON player count; idle shutdown is suspended: {error:#}");
+            server_warn!(
+                config,
+                "Could not parse RCON player count; idle shutdown is suspended: {error:#}"
+            );
             None
         }
     }
 }
 
-fn log_process_exit(status: ExitStatus) {
+fn log_process_exit(config: &SupervisorConfig, status: ExitStatus) {
     if status.success() {
-        log::info!("Minecraft server exited successfully");
+        server_info!(config, "Minecraft server exited successfully");
     } else {
-        log::warn!("Minecraft server exited with status {status}");
+        server_warn!(config, "Minecraft server exited with status {status}");
     }
 }
 
@@ -2444,6 +2525,7 @@ mod tests {
     fn test_config(rcon_endpoint: &Endpoint) -> SupervisorConfig {
         let executable = std::env::current_exe().expect("test executable path should be known");
         SupervisorConfig {
+            context: ServerContext::new("test".to_owned()),
             launch: LaunchCommand::new(
                 executable.into_os_string(),
                 vec![
@@ -2456,7 +2538,7 @@ mod tests {
             ),
             rcon: Some(RconConfig {
                 endpoint: rcon_endpoint.clone(),
-                password: "secret".to_owned(),
+                password: RconSecret::new("secret".to_owned()).unwrap(),
             }),
             poll_interval: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(30),
@@ -2482,6 +2564,7 @@ mod tests {
 
     fn launch_failure_config() -> SupervisorConfig {
         SupervisorConfig {
+            context: ServerContext::new("test".to_owned()),
             launch: LaunchCommand::new(
                 "mcservernap-test-command-that-does-not-exist".into(),
                 Vec::new(),
@@ -2489,7 +2572,7 @@ mod tests {
             ),
             rcon: Some(RconConfig {
                 endpoint: Endpoint::new("127.0.0.1", 9),
-                password: "secret".to_owned(),
+                password: RconSecret::new("secret".to_owned()).unwrap(),
             }),
             poll_interval: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(30),
@@ -3918,7 +4001,7 @@ mod tests {
         assert_eq!(lifecycle.borrow().phase, ServerPhase::Stopping);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn no_rcon_readiness_timeout_cleans_up_and_reaps() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -3944,9 +4027,17 @@ mod tests {
             lifecycle: lifecycle_sender,
         };
 
-        let outcome = run_server_cycle(child, &mut control, &config, &backend, &test_backend_use())
-            .await
-            .unwrap();
+        let cycle = tokio::spawn(async move {
+            run_server_cycle(child, &mut control, &config, &backend, &test_backend_use()).await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(49)).await;
+        assert_eq!(lifecycle.borrow().phase, ServerPhase::Starting);
+        assert!(!cycle.is_finished());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::time::resume();
+
+        let outcome = cycle.await.unwrap().unwrap();
         assert!(matches!(outcome, CycleOutcome::Failed { .. }));
         assert_eq!(
             lifecycle.borrow().failure,
@@ -4028,6 +4119,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(lifecycle.borrow().phase, ServerPhase::Running);
         tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::time::resume();
         assert_eq!(monitor.await.unwrap().unwrap(), CycleOutcome::Stopped);
         assert_eq!(lifecycle.borrow().phase, ServerPhase::Stopping);
         let rcon_listener = rcon_listener.into_std().unwrap();
@@ -4046,7 +4138,7 @@ mod tests {
         drop(refused_listener);
         config.rcon = Some(RconConfig {
             endpoint: refused_address,
-            password: "secret".to_owned(),
+            password: RconSecret::new("secret".to_owned()).unwrap(),
         });
         let child = process::launch(&config.launch).unwrap();
         let (_wake_sender, wake_receiver) = mpsc::channel(1);
@@ -4294,58 +4386,14 @@ mod tests {
 
     #[tokio::test]
     async fn configured_readiness_player_and_stop_use_separate_rcon_sessions() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let rcon_address = endpoint(listener.local_addr().unwrap());
-        let (events, mut event_receiver) = mpsc::unbounded_channel();
-        let rcon_server = tokio::spawn(async move {
-            for session in 1..=3 {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let auth = read_test_rcon_packet(&mut stream).await;
-                assert_eq!(auth.kind, TEST_AUTH);
-                assert_eq!(auth.body, b"secret");
-                write_test_rcon_packet(&mut stream, auth.id, TEST_AUTH_RESPONSE, b"").await;
-                events.send(session).unwrap();
-
-                match session {
-                    1 => {
-                        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
-                    }
-                    2 => {
-                        for _ in 0..2 {
-                            let command = read_test_rcon_packet(&mut stream).await;
-                            assert_eq!(command.body, b"list");
-                            let marker = read_test_rcon_packet(&mut stream).await;
-                            assert!(marker.body.is_empty());
-                            write_test_rcon_packet(
-                                &mut stream,
-                                command.id,
-                                TEST_RESPONSE_VALUE,
-                                b"There are 0 of a max of 20 players online:",
-                            )
-                            .await;
-                            write_test_rcon_packet(
-                                &mut stream,
-                                marker.id,
-                                TEST_RESPONSE_VALUE,
-                                b"",
-                            )
-                            .await;
-                        }
-                        assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
-                    }
-                    3 => {
-                        let stop = read_test_rcon_packet(&mut stream).await;
-                        assert_eq!(stop.body, b"stop");
-                    }
-                    _ => unreachable!(),
-                }
-            }
-        });
+        let (rcon_address, mut events, rcon_server) =
+            spawn_scripted_list_rcon_server(vec![player_count_reply(0), player_count_reply(0)])
+                .await;
 
         let mut config = test_config(&rcon_address);
         config.idle_timeout = Duration::from_millis(30);
         config.poll_interval = Duration::from_secs(1);
-        let child = process::launch(&config.launch).unwrap();
+        let mut child = process::launch(&config.launch).unwrap();
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let starting = LifecycleState {
@@ -4359,21 +4407,51 @@ mod tests {
             shutdown: shutdown_receiver,
             lifecycle: lifecycle_sender,
         };
+        let backend_use = test_backend_use();
+        assert!(matches!(
+            wait_for_readiness(&mut child, &mut control, &config, &test_backend_endpoint()).await,
+            ReadinessOutcome::Ready
+        ));
+        assert_eq!(events.recv().await, Some(TestRconEvent::Closed));
 
-        let outcome = run_server_cycle(
-            child,
+        let cycle = control.publish_running(&backend_use);
+        let running = *lifecycle.borrow();
+        let mut state =
+            RunningMonitorState::new(cycle, PlayerInspection::from_config(&config), running);
+        poll_player_presence(&mut state.player_inspection, &config).await;
+        poll_player_presence(&mut state.player_inspection, &config).await;
+        assert_eq!(events.recv().await, Some(TestRconEvent::List(1)));
+        let idle_anchor = state
+            .effective_idle_anchor(backend_use.activity_snapshot())
+            .expect("confirmed zero players should establish an idle anchor");
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_millis(29)).await;
+        assert_eq!(lifecycle.borrow().phase, ServerPhase::Running);
+        assert!(Instant::now() < idle_anchor + config.idle_timeout);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::time::resume();
+
+        let outcome = attempt_expired_idle_stop(
+            &mut child,
             &mut control,
             &config,
-            &test_backend_endpoint(),
-            &test_backend_use(),
+            &backend_use,
+            &mut state,
+            idle_anchor,
         )
-        .await
-        .unwrap();
+        .await;
+        assert!(matches!(outcome, RunningMonitorOutcome::Committed));
+        assert_eq!(events.recv().await, Some(TestRconEvent::List(2)));
+        assert_eq!(events.recv().await, Some(TestRconEvent::Closed));
+        drop(state);
+
+        let outcome = stop_committed_idle_server(child, &mut control, &config)
+            .await
+            .unwrap();
         assert_eq!(outcome, CycleOutcome::Stopped);
         assert_eq!(lifecycle.borrow().phase, ServerPhase::Stopping);
-        assert_eq!(event_receiver.recv().await, Some(1));
-        assert_eq!(event_receiver.recv().await, Some(2));
-        assert_eq!(event_receiver.recv().await, Some(3));
+        assert_eq!(events.recv().await, Some(TestRconEvent::Stop));
         drop(wake_sender);
         rcon_server.await.unwrap();
     }
