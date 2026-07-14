@@ -546,6 +546,7 @@ fn validate_listener(listener: &ListenerSchema) -> Result<IpAddr> {
     listener
         .address
         .parse()
+        .map(canonicalize_ip)
         .context("listener address must be an unbracketed numeric IPv4 or IPv6 literal")
 }
 
@@ -560,6 +561,7 @@ fn validate_target(target: &TargetSchema) -> Result<CanonicalHost> {
         "target host must be an unbracketed IP literal or portable ASCII hostname"
     );
     if let Ok(address) = target.host.parse::<IpAddr>() {
+        let address = canonicalize_ip(address);
         ensure!(
             !address.is_unspecified() && !address.is_multicast(),
             "target IP address must not be unspecified or multicast"
@@ -568,6 +570,15 @@ fn validate_target(target: &TargetSchema) -> Result<CanonicalHost> {
     }
     validate_hostname(&target.host)?;
     Ok(CanonicalHost::Dns(target.host.to_ascii_lowercase()))
+}
+
+fn canonicalize_ip(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map_or(IpAddr::V6(address), IpAddr::V4),
+        address @ IpAddr::V4(_) => address,
+    }
 }
 
 fn validate_hostname(host: &str) -> Result<()> {
@@ -969,6 +980,38 @@ bold = true
         only.backend.host = "LOCALHOST".to_owned();
         only.listener.port = 25_567;
         assert!(validate_endpoints(&servers).is_err());
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_addresses_use_ipv4_validation_and_conflict_identity() {
+        for (listener, backend) in [
+            ("127.0.0.1", "::ffff:127.0.0.1"),
+            ("::ffff:127.0.0.1", "127.0.0.1"),
+        ] {
+            let mut document: ConfigDocument = toml::from_str(&complete_config(1, false)).unwrap();
+            let server = document.servers.get_mut("survival").unwrap();
+            server.listener.address = listener.to_owned();
+            server.listener.port = 25_566;
+            server.backend.host = backend.to_owned();
+            assert!(validate_endpoints(&document.servers).is_err());
+        }
+
+        let mut document: ConfigDocument = toml::from_str(&two_server_config()).unwrap();
+        let creative = document.servers.get_mut("creative").unwrap();
+        creative.backend.host = "::ffff:127.0.0.1".to_owned();
+        creative.backend.port = 25_566;
+        assert!(validate_endpoints(&document.servers).is_err());
+
+        for host in ["::ffff:0.0.0.0", "::ffff:224.0.0.1"] {
+            assert!(
+                validate_target(&TargetSchema {
+                    host: host.to_owned(),
+                    port: 1,
+                })
+                .is_err(),
+                "{host}"
+            );
+        }
     }
 
     #[test]

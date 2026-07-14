@@ -95,11 +95,15 @@ enum RunExit {
 
 impl ServerRuntime {
     #[cfg(test)]
-    pub(crate) fn replace_supervisor_with_panic(&mut self) {
+    pub(crate) fn replace_supervisor<F, Fut>(&mut self, run: F)
+    where
+        F: FnOnce(oneshot::Receiver<()>) -> Fut,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
         self.supervisor.abort();
-        self.supervisor = tokio::spawn(async {
-            panic!("intentional coordinator supervisor panic");
-        });
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        self.supervisor_shutdown = shutdown_sender;
+        self.supervisor = tokio::spawn(run(shutdown_receiver));
     }
 
     pub fn prepare(
