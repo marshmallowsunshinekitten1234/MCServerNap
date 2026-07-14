@@ -9,8 +9,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout, timeout_at};
 
-use crate::config::Config;
-
 mod version;
 
 use version::InitialProtocol;
@@ -144,6 +142,18 @@ pub enum ClientRequest {
 }
 
 #[derive(Debug)]
+pub struct MinecraftResponderSettings {
+    pub minecraft_version: MinecraftVersion,
+    pub sleeping_motd_text: String,
+    pub sleeping_motd_color: String,
+    pub sleeping_motd_bold: bool,
+    pub startup_message_text: String,
+    pub startup_message_color: String,
+    pub startup_message_bold: bool,
+    pub server_icon: Option<String>,
+}
+
+#[derive(Debug)]
 pub struct MinecraftResponder {
     minecraft_version: MinecraftVersion,
     status_response: Vec<u8>,
@@ -188,8 +198,17 @@ struct StatusDescription<'a> {
 }
 
 impl MinecraftResponder {
-    pub fn new(config: &Config, favicon: Option<&str>) -> Result<Self> {
-        let minecraft_version = config.minecraft_version;
+    pub fn new(settings: MinecraftResponderSettings) -> Result<Self> {
+        let MinecraftResponderSettings {
+            minecraft_version,
+            sleeping_motd_text,
+            sleeping_motd_color,
+            sleeping_motd_bold,
+            startup_message_text,
+            startup_message_color,
+            startup_message_bold,
+            server_icon,
+        } = settings;
         let status = StatusResponse {
             version: StatusVersion {
                 name: minecraft_version.name(),
@@ -201,20 +220,20 @@ impl MinecraftResponder {
                 sample: Vec::new(),
             },
             description: StatusDescription {
-                text: &config.motd_text,
-                color: &config.motd_color,
-                bold: config.motd_bold,
+                text: &sleeping_motd_text,
+                color: &sleeping_motd_color,
+                bold: sleeping_motd_bold,
             },
-            favicon,
+            favicon: server_icon.as_deref(),
         };
         let status_json =
             serde_json::to_string(&status).context("failed to serialize status response")?;
         let status_response = encode_string_packet(0, &status_json)?;
 
         let disconnect_component = json!({
-            "text": config.connection_msg_text,
-            "color": config.connection_msg_color,
-            "bold": config.connection_msg_bold,
+            "text": startup_message_text,
+            "color": startup_message_color,
+            "bold": startup_message_bold,
         });
         let disconnect_json = serde_json::to_string(&disconnect_component)
             .context("failed to serialize the login disconnect message")?;
@@ -687,6 +706,19 @@ mod tests {
     use super::*;
     use serde_json::Value;
 
+    fn responder_settings(minecraft_version: MinecraftVersion) -> MinecraftResponderSettings {
+        MinecraftResponderSettings {
+            minecraft_version,
+            sleeping_motd_text: "Napping... Join to start server".to_owned(),
+            sleeping_motd_color: "aqua".to_owned(),
+            sleeping_motd_bold: true,
+            startup_message_text: "Server is starting. Please reconnect.".to_owned(),
+            startup_message_color: "light_purple".to_owned(),
+            startup_message_bold: true,
+            server_icon: None,
+        }
+    }
+
     fn version_named(name: &str) -> MinecraftVersion {
         MinecraftVersion::supported()
             .find(|version| version.name() == name)
@@ -732,14 +764,8 @@ mod tests {
     }
 
     fn responder_for_version(minecraft_version: MinecraftVersion) -> MinecraftResponder {
-        MinecraftResponder::new(
-            &Config {
-                minecraft_version,
-                ..Config::default()
-            },
-            None,
-        )
-        .expect("test responder should be constructed")
+        MinecraftResponder::new(responder_settings(minecraft_version))
+            .expect("test responder should be constructed")
     }
 
     async fn read_connection(framed_handshake: &[u8]) -> Result<ConnectionEnvelope> {
@@ -1024,12 +1050,7 @@ mod tests {
     #[test]
     fn status_response_advertises_the_configured_version() {
         for minecraft_version in MinecraftVersion::supported() {
-            let config = Config {
-                minecraft_version,
-                ..Config::default()
-            };
-            let responder =
-                MinecraftResponder::new(&config, None).expect("responder should be constructed");
+            let responder = responder_for_version(minecraft_version);
             let framed = &responder.status_response;
             let (frame_length, length_bytes) = decode_varint(framed).expect("frame length");
             assert_eq!(
@@ -1047,9 +1068,40 @@ mod tests {
     }
 
     #[test]
+    fn responder_settings_preserve_status_disconnect_and_icon_packets() {
+        let minecraft_version = MinecraftVersion::latest();
+        let icon = "data:image/png;base64,AA==";
+        let responder = MinecraftResponder::new(MinecraftResponderSettings {
+            minecraft_version,
+            sleeping_motd_text: "Taking a nap".to_owned(),
+            sleeping_motd_color: "dark_aqua".to_owned(),
+            sleeping_motd_bold: false,
+            startup_message_text: "Booting now".to_owned(),
+            startup_message_color: "gold".to_owned(),
+            startup_message_bold: true,
+            server_icon: Some(icon.to_owned()),
+        })
+        .expect("responder settings should construct exact packets");
+        let expected_status = format!(
+            r#"{{"version":{{"name":"{}","protocol":{}}},"players":{{"max":0,"online":0,"sample":[]}},"description":{{"text":"Taking a nap","color":"dark_aqua","bold":false}},"favicon":"{icon}"}}"#,
+            minecraft_version.name(),
+            minecraft_version.protocol()
+        );
+
+        assert_eq!(
+            responder.status_response,
+            encode_string_packet(0, &expected_status).unwrap()
+        );
+        assert_eq!(
+            responder.login_disconnect,
+            encode_string_packet(0, r#"{"bold":true,"color":"gold","text":"Booting now"}"#)
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn conflict_disconnect_is_fixed_and_red() {
-        let responder = MinecraftResponder::new(&Config::default(), None)
-            .expect("responder should be constructed");
+        let responder = responder_for_version(MinecraftVersion::latest());
         let (frame_length, frame_prefix) =
             decode_varint(&responder.conflict_disconnect).expect("frame length");
         assert_eq!(
@@ -1207,8 +1259,7 @@ mod tests {
     #[tokio::test]
     async fn status_service_echoes_ping_timestamp() {
         let (mut client, mut server) = socket_pair().await;
-        let responder = MinecraftResponder::new(&Config::default(), None)
-            .expect("responder should be constructed");
+        let responder = responder_for_version(MinecraftVersion::latest());
         let server_task = tokio::spawn(async move {
             responder
                 .serve_status(&mut server, Duration::from_secs(2))
@@ -1252,8 +1303,7 @@ mod tests {
     #[tokio::test]
     async fn status_service_rejects_malformed_ping() {
         let (mut client, mut server) = socket_pair().await;
-        let responder = MinecraftResponder::new(&Config::default(), None)
-            .expect("responder should be constructed");
+        let responder = responder_for_version(MinecraftVersion::latest());
         let server_task = tokio::spawn(async move {
             responder
                 .serve_status(&mut server, Duration::from_secs(2))

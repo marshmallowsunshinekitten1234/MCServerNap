@@ -6,6 +6,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout_at};
 
+use crate::endpoint::Endpoint;
+
 const AUTH: i32 = 3;
 const AUTH_RESPONSE: i32 = 2;
 const EXEC_COMMAND: i32 = 2;
@@ -35,11 +37,11 @@ pub(crate) struct RconProbeResult {
 }
 
 impl RconClient {
-    pub async fn connect(address: &str, password: &str) -> Result<Self> {
+    pub async fn connect(endpoint: &Endpoint, password: &str) -> Result<Self> {
         validate_body(password, "RCON password")?;
-        let stream = TcpStream::connect(address)
+        let stream = TcpStream::connect((endpoint.host(), endpoint.port()))
             .await
-            .with_context(|| format!("failed to connect to RCON at {address}"))?;
+            .with_context(|| format!("failed to connect to RCON at {endpoint}"))?;
         Self::authenticate(stream, password).await
     }
 
@@ -143,7 +145,7 @@ impl RconClient {
 }
 
 pub(crate) async fn probe(
-    address: &str,
+    endpoint: &Endpoint,
     password: &str,
     command_timeout: Duration,
 ) -> RconProbeResult {
@@ -155,7 +157,12 @@ pub(crate) async fn probe(
     }
 
     let deadline = Instant::now() + command_timeout;
-    let stream = match timeout_at(deadline, TcpStream::connect(address)).await {
+    let stream = match timeout_at(
+        deadline,
+        TcpStream::connect((endpoint.host(), endpoint.port())),
+    )
+    .await
+    {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) if error.kind() == ErrorKind::ConnectionRefused => {
             return RconProbeResult {
@@ -247,6 +254,10 @@ fn decode_payload(payload: &[u8]) -> Result<Packet> {
 mod tests {
     use super::*;
 
+    fn endpoint(address: std::net::SocketAddr) -> Endpoint {
+        Endpoint::new(address.ip().to_string(), address.port())
+    }
+
     async fn receive_test_packet(stream: &mut TcpStream) -> Packet {
         let length = stream
             .read_i32_le()
@@ -330,7 +341,7 @@ mod tests {
             assert_eq!(stop.body, b"stop");
         });
 
-        let mut client = RconClient::connect(&address.to_string(), "secret")
+        let mut client = RconClient::connect(&endpoint(address), "secret")
             .await
             .expect("RCON authentication should succeed");
         let response = client
@@ -358,9 +369,9 @@ mod tests {
                 .expect("test should await TCP acceptance");
             std::future::pending::<()>().await;
         });
-        let probing = tokio::spawn(async move {
-            probe(&address.to_string(), "secret", Duration::from_secs(5)).await
-        });
+        let endpoint = endpoint(address);
+        let probing =
+            tokio::spawn(async move { probe(&endpoint, "secret", Duration::from_secs(5)).await });
 
         accepted_receiver
             .await
@@ -393,7 +404,7 @@ mod tests {
             send_test_packet(&mut stream, -1, AUTH_RESPONSE, b"").await;
         });
 
-        let result = probe(&address.to_string(), "secret", Duration::from_secs(1)).await;
+        let result = probe(&endpoint(address), "secret", Duration::from_secs(1)).await;
         assert_eq!(
             result.classification,
             RconProbeClassification::AcceptedFailure
@@ -426,7 +437,7 @@ mod tests {
                 }
             });
 
-            let result = probe(&address.to_string(), "secret", Duration::from_secs(1)).await;
+            let result = probe(&endpoint(address), "secret", Duration::from_secs(1)).await;
             assert_eq!(
                 result.classification,
                 RconProbeClassification::AcceptedFailure
