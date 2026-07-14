@@ -1,7 +1,10 @@
+#[cfg(test)]
+use std::collections::VecDeque;
 use std::collections::{BTreeMap, HashMap};
 use std::future::{Future as _, poll_fn};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Poll;
 
@@ -16,12 +19,48 @@ use crate::runtime::{BoundServerRuntime, PreparedServerRuntime, ServerRuntime};
 #[derive(Clone)]
 struct Shutdown {
     state: watch::Sender<bool>,
+    failures: Arc<Mutex<FatalErrors>>,
+}
+
+#[derive(Default)]
+struct FatalErrors {
+    primary: Option<anyhow::Error>,
+    additional: Vec<anyhow::Error>,
+}
+
+impl FatalErrors {
+    fn record(&mut self, error: anyhow::Error) {
+        if self.primary.is_none() {
+            self.primary = Some(error);
+        } else {
+            self.additional.push(error);
+        }
+    }
+
+    fn finish(self) -> Result<()> {
+        let Some(primary) = self.primary else {
+            return Ok(());
+        };
+        if self.additional.is_empty() {
+            return Err(primary);
+        }
+        let additional = self
+            .additional
+            .into_iter()
+            .map(|error| format!("{error:#}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        bail!("{primary:#}; additional daemon failures: {additional}")
+    }
 }
 
 impl Shutdown {
     fn new() -> Self {
         let (state, _) = watch::channel(false);
-        Self { state }
+        Self {
+            state,
+            failures: Arc::new(Mutex::new(FatalErrors::default())),
+        }
     }
 
     fn request(&self) -> bool {
@@ -37,6 +76,26 @@ impl Shutdown {
 
     fn is_pending(&self) -> bool {
         *self.state.borrow()
+    }
+
+    fn fail(&self, error: anyhow::Error) {
+        let mut failures = self
+            .failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        failures.record(error);
+        self.request();
+    }
+
+    fn finish(&self) -> Result<()> {
+        let failures = {
+            let mut failures = self
+                .failures
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *failures)
+        };
+        failures.finish()
     }
 
     async fn wait(&self) {
@@ -62,7 +121,7 @@ enum SignalWatcherExit {
 }
 
 impl SignalWatcher {
-    async fn arm(shutdown: Shutdown, fatal: mpsc::UnboundedSender<anyhow::Error>) -> Result<Self> {
+    async fn arm(shutdown: Shutdown, fatal: mpsc::UnboundedSender<()>) -> Result<Self> {
         let (armed_sender, armed_receiver) = oneshot::channel::<std::result::Result<(), String>>();
         let task = tokio::spawn(async move {
             #[cfg(unix)]
@@ -113,8 +172,8 @@ impl SignalWatcher {
                         shutdown.request();
                         SignalWatcherExit::ShutdownRequested
                     } else {
-                        let _ = fatal.send(anyhow::anyhow!("Unix SIGTERM listener closed unexpectedly"));
-                        shutdown.request();
+                        shutdown.fail(anyhow::anyhow!("Unix SIGTERM listener closed unexpectedly"));
+                        let _ = fatal.send(());
                         SignalWatcherExit::FailureReported
                     }
                 }
@@ -152,7 +211,7 @@ fn signal_result(
     result: std::io::Result<()>,
     name: &str,
     shutdown: &Shutdown,
-    fatal: &mpsc::UnboundedSender<anyhow::Error>,
+    fatal: &mpsc::UnboundedSender<()>,
 ) -> SignalWatcherExit {
     match result {
         Ok(()) => {
@@ -161,8 +220,8 @@ fn signal_result(
             SignalWatcherExit::ShutdownRequested
         }
         Err(error) => {
-            let _ = fatal.send(anyhow::anyhow!("{name} listener failed: {error}"));
-            shutdown.request();
+            shutdown.fail(anyhow::anyhow!("{name} listener failed: {error}"));
+            let _ = fatal.send(());
             SignalWatcherExit::FailureReported
         }
     }
@@ -177,8 +236,11 @@ struct PreparedDaemon {
 struct BoundDaemon {
     servers: Vec<(ServerContext, BoundServerRuntime)>,
     #[cfg(test)]
-    fail_first_runtime: bool,
+    runtime_overrides: VecDeque<RuntimeOverride>,
 }
+
+#[cfg(test)]
+type RuntimeOverride = Box<dyn FnOnce(&mut ServerRuntime) + Send>;
 
 impl DaemonCoordinator {
     pub async fn run(config_path: &Path) -> Result<()> {
@@ -222,56 +284,27 @@ impl PreparedDaemon {
         Ok(BoundDaemon {
             servers: bound,
             #[cfg(test)]
-            fail_first_runtime: false,
+            runtime_overrides: VecDeque::new(),
         })
     }
 }
 
-enum RuntimeTaskExit {
-    Returned {
-        result: Result<()>,
-        shutdown_was_delivered: bool,
-    },
-    Panicked(tokio::task::JoinError),
-}
-
-struct RuntimeTaskOutput {
-    context: ServerContext,
-    exit: RuntimeTaskExit,
-}
-
 #[derive(Default)]
 struct CoordinatorState {
-    primary_error: Option<anyhow::Error>,
-    additional_errors: Vec<anyhow::Error>,
     infrastructure_closed: bool,
     watcher_failure_received: bool,
     watcher_observed: bool,
 }
 
 impl CoordinatorState {
-    fn record_fatal(&mut self, error: anyhow::Error, shutdown: &Shutdown) {
-        if self.primary_error.is_none() {
-            self.primary_error = Some(error);
-            shutdown.request();
-        } else {
-            self.additional_errors.push(error);
-        }
-    }
-
-    fn record_infrastructure_failure(&mut self, error: anyhow::Error, shutdown: &Shutdown) {
+    fn record_infrastructure_failure(&mut self) {
         self.watcher_failure_received = true;
-        self.record_fatal(error, shutdown);
     }
 
-    fn drain_infrastructure(
-        &mut self,
-        failures: &mut mpsc::UnboundedReceiver<anyhow::Error>,
-        shutdown: &Shutdown,
-    ) {
+    fn drain_infrastructure(&mut self, failures: &mut mpsc::UnboundedReceiver<()>) {
         loop {
             match failures.try_recv() {
-                Ok(error) => self.record_infrastructure_failure(error, shutdown),
+                Ok(()) => self.record_infrastructure_failure(),
                 Err(mpsc::error::TryRecvError::Empty) => return,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     self.infrastructure_closed = true;
@@ -284,131 +317,73 @@ impl CoordinatorState {
     fn observe_watcher(
         &mut self,
         result: std::result::Result<SignalWatcherExit, tokio::task::JoinError>,
-        failures: &mut mpsc::UnboundedReceiver<anyhow::Error>,
+        failures: &mut mpsc::UnboundedReceiver<()>,
         shutdown: &Shutdown,
     ) {
         self.watcher_observed = true;
-        self.drain_infrastructure(failures, shutdown);
+        self.drain_infrastructure(failures);
         match result {
             Ok(SignalWatcherExit::ShutdownRequested) => {
                 if !shutdown.is_pending() {
-                    self.record_fatal(
-                        anyhow::anyhow!(
-                            "signal watcher returned after a signal without requesting shutdown"
-                        ),
-                        shutdown,
-                    );
+                    shutdown.fail(anyhow::anyhow!(
+                        "signal watcher returned after a signal without requesting shutdown"
+                    ));
                 }
             }
             Ok(SignalWatcherExit::FailureReported) => {
                 if !self.watcher_failure_received {
-                    self.record_fatal(
-                        anyhow::anyhow!(
-                            "signal watcher stopped after a failure without reporting its cause"
-                        ),
-                        shutdown,
-                    );
+                    shutdown.fail(anyhow::anyhow!(
+                        "signal watcher stopped after a failure without reporting its cause"
+                    ));
                 }
             }
-            Err(error) => self.record_fatal(
-                anyhow::anyhow!("signal watcher task panicked or was cancelled: {error}"),
-                shutdown,
-            ),
+            Err(error) => shutdown.fail(anyhow::anyhow!(
+                "signal watcher task panicked or was cancelled: {error}"
+            )),
         }
     }
 
     fn observe_runtime(
-        &mut self,
-        completed: std::result::Result<
-            (tokio::task::Id, RuntimeTaskOutput),
-            tokio::task::JoinError,
-        >,
+        completed: std::result::Result<(tokio::task::Id, ()), tokio::task::JoinError>,
         contexts: &mut HashMap<tokio::task::Id, ServerContext>,
         shutdown: &Shutdown,
     ) {
         match completed {
-            Ok((task_id, output)) => {
+            Ok((task_id, ())) => {
                 contexts.remove(&task_id);
-                match output.exit {
-                    RuntimeTaskExit::Returned {
-                        result: Err(error),
-                        ..
-                    } => self.record_fatal(
-                        anyhow::anyhow!("[server={}] {error:#}", output.context),
-                        shutdown,
-                    ),
-                    RuntimeTaskExit::Returned {
-                        result: Ok(()),
-                        shutdown_was_delivered: false,
-                    } => self.record_fatal(
-                        anyhow::anyhow!(
-                            "[server={}] complete runtime stopped unexpectedly before shutdown",
-                            output.context
-                        ),
-                        shutdown,
-                    ),
-                    RuntimeTaskExit::Returned {
-                        result: Ok(()),
-                        shutdown_was_delivered: true,
-                    } => {}
-                    RuntimeTaskExit::Panicked(error) => self.record_fatal(
-                        anyhow::anyhow!(
-                            "[server={}] complete runtime panicked; cleanup of this runtime is uncertain: {error}",
-                            output.context
-                        ),
-                        shutdown,
-                    ),
-                }
             }
             Err(error) => {
                 let context = contexts
                     .remove(&error.id())
                     .map_or_else(|| "unknown".to_owned(), |context| context.to_string());
-                self.record_fatal(
-                    anyhow::anyhow!("[server={context}] runtime monitor task panicked: {error}"),
-                    shutdown,
-                );
+                shutdown.fail(anyhow::anyhow!(
+                    "[server={context}] runtime monitor task panicked: {error}"
+                ));
             }
         }
-    }
-
-    fn finish(self) -> Result<()> {
-        let Some(primary) = self.primary_error else {
-            return Ok(());
-        };
-        if self.additional_errors.is_empty() {
-            return Err(primary);
-        }
-        let additional = self
-            .additional_errors
-            .into_iter()
-            .map(|error| format!("{error:#}"))
-            .collect::<Vec<_>>()
-            .join("; ");
-        bail!("{primary:#}; additional runtime cleanup failures: {additional}")
     }
 }
 
 async fn observe_pending_events(
     state: &mut CoordinatorState,
-    failures: &mut mpsc::UnboundedReceiver<anyhow::Error>,
+    failures: &mut mpsc::UnboundedReceiver<()>,
     watcher: &mut JoinHandle<SignalWatcherExit>,
-    runtimes: &mut JoinSet<RuntimeTaskOutput>,
+    runtimes: &mut JoinSet<()>,
     contexts: &mut HashMap<tokio::task::Id, ServerContext>,
     shutdown: &Shutdown,
 ) {
     tokio::task::yield_now().await;
-    state.drain_infrastructure(failures, shutdown);
+    state.drain_infrastructure(failures);
     if !state.watcher_observed && watcher.is_finished() {
         state.observe_watcher(watcher.await, failures, shutdown);
     }
     while let Some(completed) = runtimes.try_join_next_with_id() {
-        state.observe_runtime(completed, contexts, shutdown);
+        CoordinatorState::observe_runtime(completed, contexts, shutdown);
     }
 }
 
 fn spawn_runtime(
-    runtimes: &mut JoinSet<RuntimeTaskOutput>,
+    runtimes: &mut JoinSet<()>,
     contexts: &mut HashMap<tokio::task::Id, ServerContext>,
     context: ServerContext,
     runtime: ServerRuntime,
@@ -425,25 +400,28 @@ fn spawn_runtime(
             delivered_by_shutdown.store(true, Ordering::Release);
             Ok(())
         }));
-        let exit = match runtime_task.await {
+        match runtime_task.await {
             Ok(result) => {
                 let shutdown_was_delivered = shutdown_delivered.load(Ordering::Acquire);
-                if result.is_err() || !shutdown_was_delivered {
-                    runtime_shutdown.request();
-                }
-                RuntimeTaskExit::Returned {
-                    result,
-                    shutdown_was_delivered,
+                match (result, shutdown_was_delivered) {
+                    (Ok(()), true) => {}
+                    (Ok(()), false) => {
+                        runtime_shutdown.fail(anyhow::anyhow!(
+                            "[server={returned_context}] complete runtime stopped unexpectedly before shutdown"
+                        ));
+                    }
+                    (Err(error), _) => {
+                        runtime_shutdown.fail(anyhow::anyhow!(
+                            "[server={returned_context}] {error:#}"
+                        ));
+                    }
                 }
             }
             Err(error) => {
-                runtime_shutdown.request();
-                RuntimeTaskExit::Panicked(error)
+                runtime_shutdown.fail(anyhow::anyhow!(
+                    "[server={returned_context}] complete runtime panicked; cleanup of this runtime is uncertain: {error}"
+                ));
             }
-        };
-        RuntimeTaskOutput {
-            context: returned_context,
-            exit,
         }
     });
     contexts.insert(task.id(), context);
@@ -453,7 +431,7 @@ impl BoundDaemon {
     async fn activate_and_run(
         self,
         shutdown: Shutdown,
-        mut infrastructure_failures: mpsc::UnboundedReceiver<anyhow::Error>,
+        mut infrastructure_failures: mpsc::UnboundedReceiver<()>,
         signals: &mut SignalWatcher,
     ) -> Result<()> {
         let mut watcher = signals
@@ -464,7 +442,7 @@ impl BoundDaemon {
         let mut contexts = HashMap::new();
         let mut state = CoordinatorState::default();
         #[cfg(test)]
-        let mut fail_next_runtime = self.fail_first_runtime;
+        let mut runtime_overrides = self.runtime_overrides;
         for (context, bound) in self.servers {
             observe_pending_events(
                 &mut state,
@@ -482,9 +460,8 @@ impl BoundDaemon {
             #[cfg(test)]
             let mut runtime = runtime;
             #[cfg(test)]
-            if fail_next_runtime {
-                runtime.replace_supervisor_with_panic();
-                fail_next_runtime = false;
+            if let Some(apply) = runtime_overrides.pop_front() {
+                apply(&mut runtime);
             }
             spawn_runtime(&mut runtimes, &mut contexts, context, runtime, &shutdown);
         }
@@ -505,7 +482,7 @@ impl BoundDaemon {
 
                 failure = infrastructure_failures.recv(), if !state.infrastructure_closed => {
                     match failure {
-                        Some(error) => state.record_infrastructure_failure(error, &shutdown),
+                        Some(()) => state.record_infrastructure_failure(),
                         None => state.infrastructure_closed = true,
                     }
                 }
@@ -514,7 +491,7 @@ impl BoundDaemon {
                 }
                 completed = runtimes.join_next_with_id() => {
                     if let Some(completed) = completed {
-                        state.observe_runtime(completed, &mut contexts, &shutdown);
+                        CoordinatorState::observe_runtime(completed, &mut contexts, &shutdown);
                     } else {
                         break;
                     }
@@ -522,8 +499,8 @@ impl BoundDaemon {
             }
         }
 
-        state.drain_infrastructure(&mut infrastructure_failures, &shutdown);
-        if !state.watcher_observed && watcher.is_finished() {
+        state.drain_infrastructure(&mut infrastructure_failures);
+        if !state.watcher_observed && (watcher.is_finished() || state.infrastructure_closed) {
             state.observe_watcher(
                 (&mut watcher).await,
                 &mut infrastructure_failures,
@@ -539,8 +516,8 @@ impl BoundDaemon {
                 }
             }
         }
-        state.drain_infrastructure(&mut infrastructure_failures, &shutdown);
-        state.finish()
+        state.drain_infrastructure(&mut infrastructure_failures);
+        shutdown.finish()
     }
 }
 
@@ -624,6 +601,26 @@ bold = true
         (directory, path)
     }
 
+    fn write_three_server_config(
+        listener_ports: [u16; 3],
+        backend_ports: [u16; 3],
+    ) -> (PathBuf, PathBuf) {
+        let directory = temporary_directory();
+        let servers = ["alpha", "beta", "gamma"];
+        for server in servers {
+            fs::create_dir_all(directory.join(server)).unwrap();
+        }
+        let contents = format!(
+            "schema_version = 3\nmax_connections = 3\n{}{}{}",
+            server_table("alpha", listener_ports[0], backend_ports[0], "alpha"),
+            server_table("beta", listener_ports[1], backend_ports[1], "beta"),
+            server_table("gamma", listener_ports[2], backend_ports[2], "gamma")
+        );
+        let path = directory.join("cfg.toml");
+        fs::write(&path, contents).unwrap();
+        (directory, path)
+    }
+
     fn pending_signal_watcher() -> SignalWatcher {
         SignalWatcher {
             task: Some(tokio::spawn(async {
@@ -644,18 +641,17 @@ bold = true
     fn buffered_infrastructure_failure_is_drained_after_sender_drop() {
         let shutdown = Shutdown::new();
         let (sender, mut receiver) = mpsc::unbounded_channel();
-        sender
-            .send(anyhow::anyhow!("buffered signal-listener failure"))
-            .unwrap();
+        shutdown.fail(anyhow::anyhow!("buffered signal-listener failure"));
+        sender.send(()).unwrap();
         drop(sender);
         let mut state = CoordinatorState::default();
 
-        state.drain_infrastructure(&mut receiver, &shutdown);
+        state.drain_infrastructure(&mut receiver);
 
         assert!(state.infrastructure_closed);
         assert!(shutdown.is_pending());
         assert!(
-            state
+            shutdown
                 .finish()
                 .unwrap_err()
                 .to_string()
@@ -682,7 +678,7 @@ bold = true
             }
             let bound = BoundDaemon {
                 servers: Vec::new(),
-                fail_first_runtime: false,
+                runtime_overrides: VecDeque::new(),
             };
 
             let error = bound
@@ -700,15 +696,49 @@ bold = true
     }
 
     #[tokio::test]
+    async fn closed_watcher_channel_is_joined_before_shutdown_finishes() {
+        let shutdown = Shutdown::new();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (closed_sender, closed_receiver) = oneshot::channel();
+        let (release_sender, release_receiver) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            drop(sender);
+            closed_sender.send(()).unwrap();
+            release_receiver.await.unwrap();
+            SignalWatcherExit::FailureReported
+        });
+        closed_receiver.await.unwrap();
+        assert_eq!(receiver.recv().await, None);
+        let mut signals = SignalWatcher { task: Some(task) };
+        let bound = BoundDaemon {
+            servers: Vec::new(),
+            runtime_overrides: VecDeque::new(),
+        };
+        let mut run = Box::pin(bound.activate_and_run(shutdown, receiver, &mut signals));
+
+        poll_fn(|context| match run.as_mut().poll(context) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(_) => panic!("closed watcher channel must be joined before returning"),
+        })
+        .await;
+        release_sender.send(()).unwrap();
+
+        assert!(
+            run.await
+                .unwrap_err()
+                .to_string()
+                .contains("without reporting its cause")
+        );
+    }
+
+    #[tokio::test]
     async fn zero_activation_still_reports_buffered_watcher_failure() {
         let shutdown = Shutdown::new();
         let watcher_shutdown = shutdown.clone();
         let (sender, receiver) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
-            sender
-                .send(anyhow::anyhow!("fatal failure before activation"))
-                .unwrap();
-            watcher_shutdown.request();
+            watcher_shutdown.fail(anyhow::anyhow!("fatal failure before activation"));
+            sender.send(()).unwrap();
             SignalWatcherExit::FailureReported
         });
         let mut signals = SignalWatcher { task: Some(task) };
@@ -717,7 +747,7 @@ bold = true
         }
         let bound = BoundDaemon {
             servers: Vec::new(),
-            fail_first_runtime: false,
+            runtime_overrides: VecDeque::new(),
         };
 
         let error = bound
@@ -770,6 +800,100 @@ bold = true
         assert_eq!(waiters.len(), 2);
         release_sender.send(true).unwrap();
         while waiters.join_next().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn originating_fatal_remains_primary_while_runtime_cleanups_overlap() {
+        let public = [
+            StdTcpListener::bind("127.0.0.1:0").unwrap(),
+            StdTcpListener::bind("127.0.0.1:0").unwrap(),
+            StdTcpListener::bind("127.0.0.1:0").unwrap(),
+        ];
+        let backend = [
+            StdTcpListener::bind("127.0.0.1:0").unwrap(),
+            StdTcpListener::bind("127.0.0.1:0").unwrap(),
+            StdTcpListener::bind("127.0.0.1:0").unwrap(),
+        ];
+        let listener_ports = public
+            .each_ref()
+            .map(|listener| listener.local_addr().unwrap().port());
+        let backend_ports = backend
+            .each_ref()
+            .map(|listener| listener.local_addr().unwrap().port());
+        let (directory, path) = write_three_server_config(listener_ports, backend_ports);
+        drop(public);
+
+        let mut bound = DaemonCoordinator::prepare(&path)
+            .unwrap()
+            .bind_all()
+            .await
+            .unwrap();
+        let (fail_sender, fail_receiver) = oneshot::channel();
+        bound.runtime_overrides.push_back(Box::new(move |runtime| {
+            runtime.replace_supervisor(move |_| async move {
+                fail_receiver.await.unwrap();
+                Err(anyhow::anyhow!("originating supervisor failure"))
+            });
+        }));
+
+        let (ready_sender, mut ready_receiver) = mpsc::unbounded_channel();
+        let (cleanup_sender, mut cleanup_receiver) = mpsc::unbounded_channel();
+        let (release_sender, release_receiver) = watch::channel(false);
+        for server in ["beta", "gamma"] {
+            let ready_sender = ready_sender.clone();
+            let cleanup_sender = cleanup_sender.clone();
+            let mut release_receiver = release_receiver.clone();
+            bound.runtime_overrides.push_back(Box::new(move |runtime| {
+                runtime.replace_supervisor(move |shutdown| async move {
+                    ready_sender.send(server).unwrap();
+                    shutdown.await.unwrap();
+                    cleanup_sender.send(server).unwrap();
+                    release_receiver
+                        .wait_for(|released| *released)
+                        .await
+                        .unwrap();
+                    Err(anyhow::anyhow!("{server} cleanup failed"))
+                });
+            }));
+        }
+        drop((ready_sender, cleanup_sender));
+
+        let shutdown = Shutdown::new();
+        let (_fatal_sender, fatal_receiver) = mpsc::unbounded_channel();
+        let daemon = tokio::spawn(async move {
+            let mut signals = pending_signal_watcher();
+            bound
+                .activate_and_run(shutdown, fatal_receiver, &mut signals)
+                .await
+        });
+
+        let mut ready = [
+            ready_receiver.recv().await.unwrap(),
+            ready_receiver.recv().await.unwrap(),
+        ];
+        ready.sort_unstable();
+        assert_eq!(ready, ["beta", "gamma"]);
+        fail_sender.send(()).unwrap();
+
+        let mut cleaning = [
+            cleanup_receiver.recv().await.unwrap(),
+            cleanup_receiver.recv().await.unwrap(),
+        ];
+        cleaning.sort_unstable();
+        assert_eq!(cleaning, ["beta", "gamma"]);
+        assert!(!daemon.is_finished());
+        release_sender.send(true).unwrap();
+
+        let error = daemon.await.unwrap().unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.starts_with(
+            "[server=alpha] server supervisor failed: originating supervisor failure"
+        ));
+        assert!(message.contains("[server=beta]"));
+        assert!(message.contains("beta cleanup failed"));
+        assert!(message.contains("[server=gamma]"));
+        assert!(message.contains("gamma cleanup failed"));
+        fs::remove_dir_all(directory).ok();
     }
 
     #[tokio::test]
@@ -915,7 +1039,11 @@ bold = true
             .bind_all()
             .await
             .unwrap();
-        bound.fail_first_runtime = true;
+        bound.runtime_overrides.push_back(Box::new(|runtime| {
+            runtime.replace_supervisor(|_| async {
+                panic!("intentional coordinator supervisor panic");
+            });
+        }));
         let shutdown = Shutdown::new();
         let (_fatal_sender, fatal_receiver) = mpsc::unbounded_channel();
         let mut signals = pending_signal_watcher();
