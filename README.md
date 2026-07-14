@@ -1,27 +1,17 @@
 # MCServerNap
 
-MCServerNap lets a local Minecraft Java server stop when it is empty and start again when somebody joins. While the server is asleep, it remains visible in the server list. The first join attempt starts it and asks the player to reconnect once it is ready.
+MCServerNap is a native daemon that keeps one or more local Minecraft Java servers reachable while stopped, wakes each server when a player connects to its public port, proxies traffic while it runs, and stops owned servers after a confirmed idle period. It supports stable Java releases from 1.20.1 through 26.2.
 
-MCServerNap supports every stable Minecraft Java release from **1.20.1 through 26.2**: 1.20.1–1.20.6, 1.21–1.21.11, and 26.1–26.2.
-
-Vanilla, Forge, NeoForge, and Fabric servers all use the same wake-up flow. While the Minecraft server is stopped, MCServerNap shows the configured sleeping message and Minecraft version, plus the server icon if one is configured. MCServerNap does not inspect the server installation, so this temporary entry does not identify the mod loader or installed mods. Once the real server is running, MCServerNap forwards connections unchanged and the server supplies its normal server-list entry.
+Each configured server has its own public listener port, backend process, lifecycle, cooldown, and idle policy. This release does not route several servers through one port.
 
 ## Requirements
 
-- A supported Minecraft Java server with RCON enabled.
 - Rust 1.88 or newer to build MCServerNap.
-- Separate ports for MCServerNap and the Minecraft server.
+- A separate public listener and backend port for each server.
+- A launch command that remains attached for the backend's complete lifetime.
+- Optional RCON access when RCON-backed readiness, player counts, and commands are desired.
 
-Only expose the MCServerNap port publicly. Keep the backend and RCON ports on a trusted interface.
-
-Example `server.properties`:
-
-```properties
-server-port=25566
-enable-rcon=true
-rcon.port=25575
-rcon.password=replace-with-a-long-random-password
-```
+Keep backend and RCON endpoints on trusted, non-public interfaces. Prefer IP literals for local backend and RCON targets so configuration conflicts can be proven statically.
 
 ## Build
 
@@ -33,91 +23,80 @@ cargo build --locked --release
 
 The compiled binary is placed in `target/release`.
 
-## Run
+## Configure
 
-Pass the RCON password through the environment so it does not end up in shell history.
+Copy [config.example.toml](config.example.toml), then adjust its paths, ports, messages, and RCON environment-variable name. MCServerNap does not create a configuration automatically. The configuration is strict: schema version 3 is the only accepted version, all documented tables and fields are required except `icon_path` and the complete `rcon` table, and unknown fields are rejected.
+
+Repeat the complete `[servers.<id>]` hierarchy for every additional server. IDs use lowercase ASCII kebab case. `max_connections` is a daemon-wide limit shared by all listeners.
+
+Relative `icon_path`, `working_directory`, and path-like `command.program` values resolve from the directory containing the configuration. A bare program such as `java` uses normal `PATH` lookup. Arguments are passed exactly as configured without a shell, interpolation, splitting, or rewriting; relative arguments such as `server.jar` are interpreted by the launched process from `working_directory`.
+
+Configured icons must be readable PNG files no larger than 8 MiB or 4096×4096. MCServerNap resizes them to 64×64 in memory without modifying the source file. Canonical working directories must be unique across servers.
+
+When RCON is configured, set every referenced secret before starting the daemon. Values are read once during preparation, before any listener binds, and environment changes take effect only after a daemon restart.
 
 PowerShell:
 
 ```powershell
-$env:MCSERVERNAP_RCON_PASSWORD = "replace-with-a-long-random-password"
-target\release\mcservernap.exe listen 0.0.0.0 25565 `
-  --server-port 25566 `
-  --rcon-port 25575 `
-  java -- -Xms2G -Xmx5G -jar server.jar nogui
+$env:MCSERVERNAP_SURVIVAL_RCON_PASSWORD = "replace-with-a-long-random-password"
+target\release\mcservernap.exe --config config\cfg.toml listen
 ```
 
 Bash:
 
 ```bash
-export MCSERVERNAP_RCON_PASSWORD='replace-with-a-long-random-password'
-target/release/mcservernap listen 0.0.0.0 25565 \
-  --server-port 25566 \
-  --rcon-port 25575 \
-  java -- -Xms2G -Xmx5G -jar server.jar nogui
+export MCSERVERNAP_SURVIVAL_RCON_PASSWORD='replace-with-a-long-random-password'
+target/release/mcservernap --config config/cfg.toml listen
 ```
 
-Everything after `--` is passed to the server command. The backend and RCON hosts default to `127.0.0.1`; use `--server-host` or `--rcon-host` if needed.
+Only after every server prepares successfully and every public listener binds does MCServerNap activate the runtimes. Ctrl+C and, on Unix, SIGTERM stop all runtimes concurrently. A lifecycle failure such as a launch failure, readiness timeout, cooldown, or inconclusive reconciliation remains isolated to that server; infrastructure, task panic, process ownership, or cleanup failures shut down the daemon.
 
-When the backend is confirmed stopped, the first login attempt starts it and receives the configured startup message. The player reconnects once the server is ready.
+## Migrating schema v2
 
-Automatic idle stopping requires both Login/Transfer proxy-session idleness and continuous RCON evidence of zero players, followed by a fresh final RCON check. Login/Transfer tracking represents open proxy connections, not authenticated players: a client that holds one of these connections open conservatively prevents automatic stopping.
+Schema v2 is rejected and is not upgraded automatically:
 
-Status connections do not reset the activity timer. They are best-effort at the final stop boundary and may be interrupted if an idle stop commits after their handshake has been forwarded.
+1. Set `schema_version = 3`.
+2. Choose a stable lower-kebab server ID.
+3. Move behavioral settings into `[servers.<id>]` and its nested tables.
+4. Keep `max_connections` at the root.
+5. Move the old listener CLI host and port into `listener`.
+6. Move the old backend CLI values into `backend`.
+7. Move the launch command and arguments into `command`.
+8. Set `working_directory` explicitly.
+9. Add `icon_path` explicitly if an icon is desired.
+10. Add the complete RCON table with `password_env`, or omit it deliberately.
+11. Repeat the hierarchy for every additional server.
 
-If the server fails to start or later exits unexpectedly, MCServerNap does not keep restarting it on its own. A new login attempt schedules one more start after a cooldown; consecutive failures increase the cooldown through 5, 10, 20, 40, and at most 60 seconds.
+## Lifecycle and idle behavior
 
-Launch commands inherit MCServerNap's working directory. MCServerNap owns the launch command's stdin and may send `stop\n` through it when RCON shutdown fails, so launch wrappers must preserve stdin through to Java. A launch script should change to the server directory and remain attached to Java until it exits. On Unix, finish with `exec java ...`; on Windows, do not use `start` or `Start-Process`.
+When a backend is confirmed stopped, the first Login or Transfer attempt starts it and receives the configured startup message. The player reconnects after the server is ready. Status traffic does not wake the server or reset its activity timer.
 
-Start `mcservernap listen` only when the backend is fully stopped or ready, and do not start the same server another way while the listener is running. MCServerNap can proxy an already-running server, but it will not stop it. If the backend state is uncertain, it will not launch. Restarting the listener clears what it remembers, so do that only after confirming the backend is fully stopped or ready.
+With RCON, automatic idle stopping requires both proxy-session idleness and continuous RCON evidence of zero players, followed by a fresh final RCON check. An unknown player count is never treated as zero. If startup or runtime failure occurs, MCServerNap waits through the server's cooldown and only retries after new player demand.
 
-## Configuration
+Without RCON:
 
-The first run creates `config/cfg.toml`. Use `--config <path>` or `MCSERVERNAP_CONFIG` to put it elsewhere. A complete example is available in [config.example.toml](config.example.toml).
+- TCP readiness proves only that the backend accepted a connection; it does not prove world initialization is complete.
+- MCServerNap cannot observe players who bypass its public listener, so direct backend access can invalidate proxy-only idle decisions. All player traffic must use the public listener and the backend should remain on a trusted, non-public interface.
+- Graceful stopping uses the owned process console by sending `stop\n`.
+- An externally started backend remains unowned and is never stopped automatically.
 
-Existing configurations must set `schema_version = 2` and add the matching `minecraft_version`.
+The configured launch command must remain attached for the backend's complete lifetime and preserve stdin through to Java. On Unix, a wrapper should finish with `exec java ...`; on Windows, do not detach with `start` or `Start-Process`. Java stdout and stderr remain inherited, so output from several servers may interleave.
 
-| Setting                         |  Default | Purpose                                                                                                                       |
-| ------------------------------- | -------: | ----------------------------------------------------------------------------------------------------------------------------- |
-| `schema_version`                |      `2` | Configuration format required by this release.                                                                                |
-| `minecraft_version`             | `"26.2"` | Exact backend release, from `"1.20.1"` through `"26.2"`.                                                                      |
-| `rcon_poll_interval_seconds`    |     `60` | Time between successful player-count checks.                                                                                  |
-| `rcon_idle_timeout_seconds`     |    `600` | Required proxy/RCON idle time before shutdown.                                                                                |
-| `rcon_startup_timeout_seconds`  |    `600` | Maximum time to wait for RCON during startup.                                                                                 |
-| `rcon_retry_interval_seconds`   |      `2` | Delay between failed RCON connections.                                                                                        |
-| `rcon_command_timeout_seconds`  |     `10` | Maximum total time to send `stop`. RCON is tried first; if it fails early, the remaining time is used for the server console. |
-| `shutdown_timeout_seconds`      |     `30` | Graceful shutdown time before forced termination.                                                                             |
-| `handshake_timeout_seconds`     |      `5` | Total deadline for handshake and required sleeping packet.                                                                    |
-| `proxy_connect_timeout_seconds` |     `10` | Time allowed to connect to the backend.                                                                                       |
-| `max_connections`               |    `512` | Maximum concurrent client tasks.                                                                                              |
-| `motd_*`                        |        — | Sleeping server-list message and style.                                                                                       |
-| `connection_msg_*`              |        — | Message shown while starting the server.                                                                                      |
+## Standalone stop command
 
-Every duration must be greater than zero. Configuration is strict: missing fields, unknown fields, and unsupported schema versions are rejected instead of being guessed or migrated.
-
-To use a server icon, place `server-icon.png` beside the configuration file. PNG files up to 8 MiB and 4096×4096 are accepted. The icon is resized to 64×64 in memory; the source file is not modified.
-
-## Stop command
-
-To stop an already-running server through RCON:
+The standalone command is an out-of-band direct RCON client:
 
 ```console
-target/release/mcservernap stop --rcon-port 25575
+target/release/mcservernap stop --rcon-host 127.0.0.1 --rcon-port 25575
 ```
 
-`MCSERVERNAP_RCON_PASSWORD` is used here as well.
+Set `MCSERVERNAP_RCON_PASSWORD` or pass `--rcon-pass`. This command does not select a configured server, contact the listener daemon, or load the listener configuration; it still works if `--config` points to a missing or invalid file.
 
-The `stop` command only sends the RCON stop request. It does not wait for the server to exit or reset a running listener.
+## Logging and troubleshooting
 
-## Logging
+Logging defaults to `info`; set `RUST_LOG=debug` for connection and reconciliation details. MCServerNap-owned server messages include `[server=<id>]`. Java output is inherited unchanged.
 
-Logging defaults to `info`. Set `RUST_LOG=debug` when troubleshooting:
-
-```console
-RUST_LOG=debug target/release/mcservernap listen ...
-```
-
-MCServerNap will not stop the server when RCON is unavailable or its `list` response cannot be understood. This is deliberate: an unknown player count is never treated as an empty server.
+If configuration validation reports a listener/target ownership conflict, use distinct ports or more specific IP literals. Actual socket binding remains authoritative for local-address availability, IPv4/IPv6 dual-stack interaction, and OS-specific exclusive-bind behavior.
 
 ## License
 
