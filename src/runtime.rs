@@ -12,6 +12,7 @@ use tokio::time::{Instant, sleep, sleep_until, timeout};
 use crate::backend_use::{
     BackendCycle, BackendUseCoordinator, BackendUseLease, LoginTransferProxySession,
 };
+use crate::endpoint::Endpoint;
 use crate::minecraft::{ClientRequest, ConnectionEnvelope, HandshakeIntent, MinecraftResponder};
 use crate::supervisor::{
     self, BackendEndpoint, LifecycleState, ServerPhase, SupervisorConfig, WakeRequest,
@@ -33,14 +34,32 @@ fn supervisor_shutdown_wait_limit(
 }
 
 pub struct ServerRuntimeConfig {
-    pub bind_host: String,
-    pub bind_port: u16,
-    pub server_host: String,
-    pub server_port: u16,
+    pub bind_endpoint: Endpoint,
+    pub backend_endpoint: Endpoint,
     pub handshake_timeout: Duration,
     pub proxy_connect_timeout: Duration,
-    pub max_connections: usize,
     pub supervisor: SupervisorConfig,
+}
+
+struct PreparedRuntimeInputs {
+    backend_endpoint: Endpoint,
+    handshake_timeout: Duration,
+    proxy_connect_timeout: Duration,
+    supervisor: SupervisorConfig,
+    supervisor_wait_limit: Duration,
+    responder: MinecraftResponder,
+    connection_limit: Arc<Semaphore>,
+}
+
+pub struct PreparedServerRuntime {
+    bind_endpoint: Endpoint,
+    inputs: PreparedRuntimeInputs,
+}
+
+pub struct BoundServerRuntime {
+    bind_endpoint: Endpoint,
+    listener: TcpListener,
+    inputs: PreparedRuntimeInputs,
 }
 
 pub struct ServerRuntime {
@@ -59,8 +78,7 @@ struct ClientContext {
     wake_requests: mpsc::Sender<WakeRequest>,
     backend_use: Arc<BackendUseCoordinator>,
     responder: Arc<MinecraftResponder>,
-    server_host: Arc<str>,
-    server_port: u16,
+    backend_endpoint: Endpoint,
     handshake_timeout: Duration,
     proxy_connect_timeout: Duration,
 }
@@ -71,58 +89,34 @@ enum RunExit {
 }
 
 impl ServerRuntime {
-    pub async fn bind(config: ServerRuntimeConfig, responder: MinecraftResponder) -> Result<Self> {
+    pub fn prepare(
+        config: ServerRuntimeConfig,
+        responder: MinecraftResponder,
+        connection_limit: Arc<Semaphore>,
+    ) -> Result<PreparedServerRuntime> {
         let ServerRuntimeConfig {
-            bind_host,
-            bind_port,
-            server_host,
-            server_port,
+            bind_endpoint,
+            backend_endpoint,
             handshake_timeout,
             proxy_connect_timeout,
-            max_connections,
             supervisor: supervisor_config,
         } = config;
         let supervisor_wait_limit = supervisor_shutdown_wait_limit(
             supervisor_config.command_timeout,
             supervisor_config.shutdown_timeout,
         )?;
-        let listener = TcpListener::bind((bind_host.as_str(), bind_port))
-            .await
-            .with_context(|| format!("failed to listen on {bind_host}:{bind_port}"))?;
-        log::info!("Listening for Minecraft clients on {bind_host}:{bind_port}");
 
-        let (wake_requests, wake_receiver) = mpsc::channel(PENDING_WAKE_CAPACITY);
-        let (supervisor_shutdown, shutdown_receiver) = oneshot::channel();
-        let (lifecycle_sender, lifecycle) = watch::channel(LifecycleState::reconciling());
-        let backend_use = Arc::new(BackendUseCoordinator::new());
-        let server_host: Arc<str> = Arc::from(server_host);
-        let supervisor = tokio::spawn(supervisor::run(
-            wake_receiver,
-            shutdown_receiver,
-            lifecycle_sender,
-            supervisor_config,
-            BackendEndpoint::network(Arc::clone(&server_host), server_port, proxy_connect_timeout),
-            Arc::clone(&backend_use),
-        ));
-        let client_context = ClientContext {
-            lifecycle,
-            wake_requests,
-            backend_use,
-            responder: Arc::new(responder),
-            server_host,
-            server_port,
-            handshake_timeout,
-            proxy_connect_timeout,
-        };
-
-        Ok(Self {
-            listener,
-            client_context,
-            connection_limit: Arc::new(Semaphore::new(max_connections)),
-            connections: JoinSet::new(),
-            supervisor,
-            supervisor_shutdown,
-            supervisor_wait_limit,
+        Ok(PreparedServerRuntime {
+            bind_endpoint,
+            inputs: PreparedRuntimeInputs {
+                backend_endpoint,
+                handshake_timeout,
+                proxy_connect_timeout,
+                supervisor: supervisor_config,
+                supervisor_wait_limit,
+                responder,
+                connection_limit,
+            },
         })
     }
 
@@ -203,6 +197,74 @@ impl ServerRuntime {
                         .context(format!("runtime cleanup also failed: {cleanup_error:#}"))),
                 }
             }
+        }
+    }
+}
+
+impl PreparedServerRuntime {
+    pub async fn bind(self) -> Result<BoundServerRuntime> {
+        let listener = TcpListener::bind((self.bind_endpoint.host(), self.bind_endpoint.port()))
+            .await
+            .with_context(|| format!("failed to listen on {}", self.bind_endpoint))?;
+
+        Ok(BoundServerRuntime {
+            bind_endpoint: self.bind_endpoint,
+            listener,
+            inputs: self.inputs,
+        })
+    }
+}
+
+impl BoundServerRuntime {
+    #[must_use]
+    pub fn activate(self) -> ServerRuntime {
+        let BoundServerRuntime {
+            bind_endpoint,
+            listener,
+            inputs,
+        } = self;
+        let PreparedRuntimeInputs {
+            backend_endpoint,
+            handshake_timeout,
+            proxy_connect_timeout,
+            supervisor: supervisor_config,
+            supervisor_wait_limit,
+            responder,
+            connection_limit,
+        } = inputs;
+
+        let (wake_requests, wake_receiver) = mpsc::channel(PENDING_WAKE_CAPACITY);
+        let (supervisor_shutdown, shutdown_receiver) = oneshot::channel();
+        let (lifecycle_sender, lifecycle) = watch::channel(LifecycleState::reconciling());
+        let backend_use = Arc::new(BackendUseCoordinator::new());
+        let supervisor = tokio::spawn(supervisor::run(
+            wake_receiver,
+            shutdown_receiver,
+            lifecycle_sender,
+            supervisor_config,
+            BackendEndpoint::network(backend_endpoint.clone(), proxy_connect_timeout),
+            Arc::clone(&backend_use),
+        ));
+        let client_context = ClientContext {
+            lifecycle,
+            wake_requests,
+            backend_use,
+            responder: Arc::new(responder),
+            backend_endpoint,
+            handshake_timeout,
+            proxy_connect_timeout,
+        };
+
+        log::info!("Listening for Minecraft clients on {bind_endpoint}");
+
+        ServerRuntime {
+            listener,
+            client_context,
+            connection_limit,
+            connections: JoinSet::new(),
+            supervisor,
+            supervisor_shutdown,
+            supervisor_wait_limit,
         }
     }
 }
@@ -334,12 +396,7 @@ async fn proxy_owned_connection(
 ) -> Result<()> {
     let lease = context.backend_use.acquire_shared(cycle).await;
     ensure_current_owned_cycle(&context.lifecycle, cycle)?;
-    let backend = connect_backend(
-        &context.server_host,
-        context.server_port,
-        context.proxy_connect_timeout,
-    )
-    .await?;
+    let backend = connect_backend(&context.backend_endpoint, context.proxy_connect_timeout).await?;
     backend
         .set_nodelay(true)
         .context("failed to enable TCP_NODELAY for backend")?;
@@ -357,11 +414,7 @@ async fn proxy_connected_owned(
     ensure_current_owned_cycle(&context.lifecycle, cycle)?;
     let intent = connection.intent();
     let (mut client, framed_handshake) = connection.into_proxy_parts();
-    log::debug!(
-        "Proxying {peer} to {}:{}",
-        context.server_host,
-        context.server_port
-    );
+    log::debug!("Proxying {peer} to {}", context.backend_endpoint);
 
     backend
         .write_all(&framed_handshake)
@@ -401,20 +454,12 @@ async fn proxy_external_connection(
     context: &ClientContext,
 ) -> Result<()> {
     let (mut client, framed_handshake) = connection.into_proxy_parts();
-    let mut backend = connect_backend(
-        &context.server_host,
-        context.server_port,
-        context.proxy_connect_timeout,
-    )
-    .await?;
+    let mut backend =
+        connect_backend(&context.backend_endpoint, context.proxy_connect_timeout).await?;
     backend
         .set_nodelay(true)
         .context("failed to enable TCP_NODELAY for backend")?;
-    log::debug!(
-        "Proxying {peer} to {}:{}",
-        context.server_host,
-        context.server_port
-    );
+    log::debug!("Proxying {peer} to {}", context.backend_endpoint);
     backend
         .write_all(&framed_handshake)
         .await
@@ -454,7 +499,7 @@ async fn proxy_streams(
     Ok(())
 }
 
-async fn connect_backend(host: &str, port: u16, connect_timeout: Duration) -> Result<TcpStream> {
+async fn connect_backend(endpoint: &Endpoint, connect_timeout: Duration) -> Result<TcpStream> {
     let deadline = Instant::now() + connect_timeout;
     let mut last_error = None;
 
@@ -464,7 +509,12 @@ async fn connect_backend(host: &str, port: u16, connect_timeout: Duration) -> Re
             break;
         }
         let attempt_timeout = remaining.min(Duration::from_secs(1));
-        match timeout(attempt_timeout, TcpStream::connect((host, port))).await {
+        match timeout(
+            attempt_timeout,
+            TcpStream::connect((endpoint.host(), endpoint.port())),
+        )
+        .await
+        {
             Ok(Ok(stream)) => return Ok(stream),
             Ok(Err(error)) => last_error = Some(error.to_string()),
             Err(_) => last_error = Some("connection attempt timed out".to_owned()),
@@ -474,37 +524,40 @@ async fn connect_backend(host: &str, port: u16, connect_timeout: Duration) -> Re
     }
 
     let detail = last_error.unwrap_or_else(|| "timeout elapsed".to_owned());
-    bail!("could not connect to Minecraft backend {host}:{port}: {detail}")
+    bail!("could not connect to Minecraft backend {endpoint}: {detail}")
 }
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+
     use anyhow::anyhow;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::sync::oneshot;
 
     use super::*;
-    use crate::config::Config;
+    use crate::minecraft::{MinecraftResponderSettings, MinecraftVersion};
+    use crate::process::LaunchCommand;
     use crate::supervisor::RconConfig;
 
     fn runtime_config(
         command: String,
         arguments: Vec<String>,
-        rcon_address: String,
+        rcon_endpoint: Endpoint,
     ) -> ServerRuntimeConfig {
         ServerRuntimeConfig {
-            bind_host: "127.0.0.1".to_owned(),
-            bind_port: 0,
-            server_host: "127.0.0.1".to_owned(),
-            server_port: 25566,
+            bind_endpoint: Endpoint::new("127.0.0.1", 0),
+            backend_endpoint: Endpoint::new("127.0.0.1", 25_566),
             handshake_timeout: Duration::from_secs(30),
             proxy_connect_timeout: Duration::from_secs(1),
-            max_connections: 1,
             supervisor: SupervisorConfig {
-                command,
-                arguments,
+                launch: LaunchCommand::new(
+                    OsString::from(command),
+                    arguments.into_iter().map(OsString::from).collect(),
+                    std::env::current_dir().expect("test working directory should be known"),
+                ),
                 rcon: Some(RconConfig {
-                    endpoint: rcon_address,
+                    endpoint: rcon_endpoint,
                     password: "secret".to_owned(),
                 }),
                 poll_interval: Duration::from_secs(30),
@@ -517,12 +570,63 @@ mod tests {
         }
     }
 
+    fn test_responder() -> MinecraftResponder {
+        MinecraftResponder::new(MinecraftResponderSettings {
+            minecraft_version: MinecraftVersion::latest(),
+            sleeping_motd_text: "Sleeping".to_owned(),
+            sleeping_motd_color: "aqua".to_owned(),
+            sleeping_motd_bold: true,
+            startup_message_text: "Starting".to_owned(),
+            startup_message_color: "light_purple".to_owned(),
+            startup_message_bold: true,
+            server_icon: None,
+        })
+        .expect("test responder should be constructed")
+    }
+
+    fn endpoint(address: std::net::SocketAddr) -> Endpoint {
+        Endpoint::new(address.ip().to_string(), address.port())
+    }
+
+    fn construction_config(
+        rcon_address: std::net::SocketAddr,
+        backend_address: std::net::SocketAddr,
+        launch_signal_address: std::net::SocketAddr,
+    ) -> ServerRuntimeConfig {
+        let executable = std::env::current_exe().expect("test executable path should be known");
+        let mut config = runtime_config(
+            executable.to_string_lossy().into_owned(),
+            vec![
+                "--ignored".to_owned(),
+                "--exact".to_owned(),
+                "runtime::tests::launch_signal_fixture".to_owned(),
+                format!("launch-signal={launch_signal_address}"),
+                "--quiet".to_owned(),
+            ],
+            endpoint(rcon_address),
+        );
+        config.backend_endpoint = endpoint(backend_address);
+        config
+    }
+
+    #[test]
+    #[ignore = "launched only to detect an unexpected runtime process start"]
+    fn launch_signal_fixture() {
+        let address = std::env::args()
+            .find_map(|argument| argument.strip_prefix("launch-signal=").map(str::to_owned))
+            .expect("fixture should receive a launch signal address");
+        let mut signal = std::net::TcpStream::connect(address)
+            .expect("fixture should connect to its launch observer");
+        std::io::Write::write_all(&mut signal, &[1]).expect("fixture should report its launch");
+    }
+
     async fn bind_test_runtime(config: ServerRuntimeConfig) -> ServerRuntime {
-        let responder = MinecraftResponder::new(&Config::default(), None)
-            .expect("test responder should be constructed");
-        ServerRuntime::bind(config, responder)
+        ServerRuntime::prepare(config, test_responder(), Arc::new(Semaphore::new(1)))
+            .expect("test runtime should be prepared")
+            .bind()
             .await
             .expect("test runtime should bind")
+            .activate()
     }
 
     fn write_varint(value: i32, output: &mut Vec<u8>) {
@@ -657,12 +761,8 @@ mod tests {
             lifecycle,
             wake_requests,
             backend_use,
-            responder: Arc::new(
-                MinecraftResponder::new(&Config::default(), None)
-                    .expect("test responder should be constructed"),
-            ),
-            server_host: Arc::from("127.0.0.1"),
-            server_port: backend_port,
+            responder: Arc::new(test_responder()),
+            backend_endpoint: Endpoint::new("127.0.0.1", backend_port),
             handshake_timeout: Duration::from_secs(1),
             proxy_connect_timeout: Duration::from_secs(1),
         };
@@ -1368,6 +1468,227 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn binding_is_inert_and_activation_starts_one_reconciliation_supervisor() {
+        let rcon_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let launch_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = construction_config(
+            rcon_listener.local_addr().unwrap(),
+            backend_listener.local_addr().unwrap(),
+            launch_listener.local_addr().unwrap(),
+        );
+        let bound = ServerRuntime::prepare(config, test_responder(), Arc::new(Semaphore::new(1)))
+            .expect("runtime should prepare")
+            .bind()
+            .await
+            .expect("runtime should bind without activating");
+
+        let no_rcon = timeout(Duration::from_millis(50), rcon_listener.accept());
+        let no_backend = timeout(Duration::from_millis(50), backend_listener.accept());
+        let no_launch = timeout(Duration::from_millis(50), launch_listener.accept());
+        let (no_rcon, no_backend, no_launch) = tokio::join!(no_rcon, no_backend, no_launch);
+        assert!(no_rcon.is_err(), "binding must not probe RCON");
+        assert!(no_backend.is_err(), "binding must not probe the backend");
+        assert!(no_launch.is_err(), "binding must not launch a process");
+
+        let runtime = bound.activate();
+        assert_eq!(
+            runtime.client_context.lifecycle.borrow().phase(),
+            ServerPhase::Reconciling
+        );
+        let rcon_accept = timeout(Duration::from_secs(2), rcon_listener.accept());
+        let backend_accept = timeout(Duration::from_secs(2), backend_listener.accept());
+        let (rcon_accept, backend_accept) = tokio::join!(rcon_accept, backend_accept);
+        let _rcon_connection = rcon_accept
+            .expect("activation should start RCON reconciliation")
+            .expect("RCON reconciliation connection should be accepted");
+        let _backend_connection = backend_accept
+            .expect("activation should start backend reconciliation")
+            .expect("backend reconciliation connection should be accepted");
+        assert!(!runtime.supervisor.is_finished());
+        assert_eq!(
+            runtime.client_context.lifecycle.borrow().phase(),
+            ServerPhase::Reconciling
+        );
+
+        let second_rcon = timeout(Duration::from_millis(50), rcon_listener.accept());
+        let second_backend = timeout(Duration::from_millis(50), backend_listener.accept());
+        let process_start = timeout(Duration::from_millis(50), launch_listener.accept());
+        let (second_rcon, second_backend, process_start) =
+            tokio::join!(second_rcon, second_backend, process_start);
+        assert!(second_rcon.is_err(), "activation must start one supervisor");
+        assert!(
+            second_backend.is_err(),
+            "activation must run one startup probe"
+        );
+        assert!(
+            process_start.is_err(),
+            "reconciliation must not launch without demand"
+        );
+
+        runtime
+            .run_until(async { Ok(()) })
+            .await
+            .expect("activated runtime should shut down cleanly");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_bound_runtime_releases_its_listener() {
+        let executable = std::env::current_exe().expect("test executable path should be known");
+        let bound = ServerRuntime::prepare(
+            runtime_config(
+                executable.to_string_lossy().into_owned(),
+                Vec::new(),
+                Endpoint::new("127.0.0.1", 9),
+            ),
+            test_responder(),
+            Arc::new(Semaphore::new(1)),
+        )
+        .expect("runtime should prepare")
+        .bind()
+        .await
+        .expect("runtime should bind");
+        let address = bound.listener.local_addr().unwrap();
+
+        drop(bound);
+        TcpListener::bind(address)
+            .await
+            .expect("dropping the bound runtime should release its listener");
+    }
+
+    #[tokio::test]
+    async fn bind_failure_has_no_runtime_work_to_clean_up() {
+        let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rcon_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let launch_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = construction_config(
+            rcon_listener.local_addr().unwrap(),
+            backend_listener.local_addr().unwrap(),
+            launch_listener.local_addr().unwrap(),
+        );
+        config.bind_endpoint = endpoint(public_listener.local_addr().unwrap());
+        let prepared =
+            ServerRuntime::prepare(config, test_responder(), Arc::new(Semaphore::new(1)))
+                .expect("runtime should prepare before binding");
+
+        assert!(prepared.bind().await.is_err());
+        let no_rcon = timeout(Duration::from_millis(50), rcon_listener.accept());
+        let no_backend = timeout(Duration::from_millis(50), backend_listener.accept());
+        let no_launch = timeout(Duration::from_millis(50), launch_listener.accept());
+        let (no_rcon, no_backend, no_launch) = tokio::join!(no_rcon, no_backend, no_launch);
+        assert!(no_rcon.is_err());
+        assert!(no_backend.is_err());
+        assert!(no_launch.is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_watchdog_is_validated_before_listener_binding() {
+        let reserved_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reserved_address = reserved_listener.local_addr().unwrap();
+        let executable = std::env::current_exe().expect("test executable path should be known");
+        let mut config = runtime_config(
+            executable.to_string_lossy().into_owned(),
+            Vec::new(),
+            Endpoint::new("127.0.0.1", 9),
+        );
+        config.bind_endpoint = endpoint(reserved_address);
+        config.supervisor.command_timeout = Duration::MAX;
+
+        let Err(error) =
+            ServerRuntime::prepare(config, test_responder(), Arc::new(Semaphore::new(1)))
+        else {
+            panic!("overflowing watchdog should fail preparation");
+        };
+        assert!(error.to_string().contains("rcon_command_timeout_seconds"));
+
+        drop(reserved_listener);
+        TcpListener::bind(reserved_address)
+            .await
+            .expect("preparation must not have bound the public listener");
+    }
+
+    #[tokio::test]
+    async fn separately_activated_runtimes_share_the_injected_semaphore() {
+        let executable = std::env::current_exe().expect("test executable path should be known");
+        let connection_limit = Arc::new(Semaphore::new(1));
+        let first = ServerRuntime::prepare(
+            runtime_config(
+                executable.to_string_lossy().into_owned(),
+                Vec::new(),
+                Endpoint::new("127.0.0.1", 9),
+            ),
+            test_responder(),
+            Arc::clone(&connection_limit),
+        )
+        .unwrap()
+        .bind()
+        .await
+        .unwrap()
+        .activate();
+        let second = ServerRuntime::prepare(
+            runtime_config(
+                executable.to_string_lossy().into_owned(),
+                Vec::new(),
+                Endpoint::new("127.0.0.1", 9),
+            ),
+            test_responder(),
+            Arc::clone(&connection_limit),
+        )
+        .unwrap()
+        .bind()
+        .await
+        .unwrap()
+        .activate();
+
+        assert!(Arc::ptr_eq(
+            &first.connection_limit,
+            &second.connection_limit
+        ));
+        let permit = Arc::clone(&first.connection_limit)
+            .try_acquire_owned()
+            .expect("shared limiter should have one permit");
+        assert_eq!(second.connection_limit.available_permits(), 0);
+        drop(permit);
+        assert_eq!(first.connection_limit.available_permits(), 1);
+
+        let (first_result, second_result) = tokio::join!(
+            first.run_until(async { Ok(()) }),
+            second.run_until(async { Ok(()) })
+        );
+        first_result.expect("first runtime should shut down");
+        second_result.expect("second runtime should shut down");
+    }
+
+    async fn assert_structured_endpoint_connects(listener: TcpListener, endpoint: Endpoint) {
+        let (connection, accepted) = timeout(Duration::from_secs(3), async {
+            tokio::join!(
+                connect_backend(&endpoint, Duration::from_secs(2)),
+                listener.accept()
+            )
+        })
+        .await
+        .expect("structured endpoint test should finish");
+        connection.expect("structured endpoint should connect");
+        accepted.expect("listener should accept the structured endpoint connection");
+    }
+
+    #[tokio::test]
+    async fn structured_endpoints_connect_over_ipv4_hostname_and_ipv6() {
+        let ipv4 = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let ipv4_endpoint = Endpoint::new("127.0.0.1", ipv4.local_addr().unwrap().port());
+        assert_structured_endpoint_connects(ipv4, ipv4_endpoint).await;
+
+        let hostname = TcpListener::bind(("localhost", 0)).await.unwrap();
+        let hostname_endpoint = Endpoint::new("localhost", hostname.local_addr().unwrap().port());
+        assert_structured_endpoint_connects(hostname, hostname_endpoint).await;
+
+        let ipv6 = TcpListener::bind(("::1", 0)).await.unwrap();
+        let ipv6_endpoint = Endpoint::new("[::1]", ipv6.local_addr().unwrap().port());
+        assert_structured_endpoint_connects(ipv6, ipv6_endpoint).await;
+    }
+
+    #[tokio::test]
     async fn lifecycle_is_reconciling_before_the_supervisor_can_publish() {
         let rcon_listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1379,15 +1700,21 @@ mod tests {
         let mut config = runtime_config(
             executable.to_string_lossy().into_owned(),
             Vec::new(),
-            rcon_listener
-                .local_addr()
-                .expect("RCON listener has an address")
-                .to_string(),
+            Endpoint::new(
+                "127.0.0.1",
+                rcon_listener
+                    .local_addr()
+                    .expect("RCON listener has an address")
+                    .port(),
+            ),
         );
-        config.server_port = backend_listener
-            .local_addr()
-            .expect("backend listener has an address")
-            .port();
+        config.backend_endpoint = Endpoint::new(
+            "127.0.0.1",
+            backend_listener
+                .local_addr()
+                .expect("backend listener has an address")
+                .port(),
+        );
         let runtime = bind_test_runtime(config).await;
 
         assert_eq!(
@@ -1407,7 +1734,7 @@ mod tests {
         let mut runtime = bind_test_runtime(runtime_config(
             executable.to_string_lossy().into_owned(),
             Vec::new(),
-            "127.0.0.1:9".to_owned(),
+            Endpoint::new("127.0.0.1", 9),
         ))
         .await;
         let address = runtime
@@ -1453,7 +1780,7 @@ mod tests {
         let runtime = bind_test_runtime(runtime_config(
             executable.to_string_lossy().into_owned(),
             Vec::new(),
-            "127.0.0.1:9".to_owned(),
+            Endpoint::new("127.0.0.1", 9),
         ))
         .await;
         let address = runtime
@@ -1556,7 +1883,7 @@ mod tests {
         let mut runtime = bind_test_runtime(runtime_config(
             executable.to_string_lossy().into_owned(),
             Vec::new(),
-            "127.0.0.1:9".to_owned(),
+            Endpoint::new("127.0.0.1", 9),
         ))
         .await;
         runtime.supervisor.abort();

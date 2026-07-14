@@ -11,7 +11,8 @@ use tokio::sync::{OwnedRwLockWriteGuard, mpsc, oneshot, watch};
 use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 
 use crate::backend_use::{BackendCycle, BackendUseCoordinator, CurrentCycleActivity};
-use crate::process::{self, OwnedProcess};
+use crate::endpoint::Endpoint;
+use crate::process::{self, LaunchCommand, OwnedProcess};
 use crate::rcon::{self, RconClient, RconProbeClassification};
 
 const STABILITY_WINDOW: Duration = Duration::from_secs(60);
@@ -169,8 +170,7 @@ impl WakeRequest {
 }
 
 pub struct SupervisorConfig {
-    pub command: String,
-    pub arguments: Vec<String>,
+    pub launch: LaunchCommand,
     pub rcon: Option<RconConfig>,
     pub poll_interval: Duration,
     pub idle_timeout: Duration,
@@ -181,23 +181,21 @@ pub struct SupervisorConfig {
 }
 
 pub struct RconConfig {
-    pub endpoint: String,
+    pub endpoint: Endpoint,
     pub password: String,
 }
 
 pub(crate) struct BackendEndpoint {
-    host: Arc<str>,
-    port: u16,
+    endpoint: Endpoint,
     connect_timeout: Duration,
     #[cfg(test)]
     scripted_probes: Option<tokio::sync::Mutex<mpsc::UnboundedReceiver<ReconciliationResult>>>,
 }
 
 impl BackendEndpoint {
-    pub(crate) fn network(host: Arc<str>, port: u16, connect_timeout: Duration) -> Self {
+    pub(crate) fn network(endpoint: Endpoint, connect_timeout: Duration) -> Self {
         Self {
-            host,
-            port,
+            endpoint,
             connect_timeout,
             #[cfg(test)]
             scripted_probes: None,
@@ -727,10 +725,10 @@ enum ExternalMonitorOutcome {
     Shutdown,
 }
 
-async fn probe_backend(endpoint: &BackendEndpoint) -> BackendProbeResult {
+async fn probe_backend(backend: &BackendEndpoint) -> BackendProbeResult {
     match timeout(
-        endpoint.connect_timeout,
-        TcpStream::connect((endpoint.host.as_ref(), endpoint.port)),
+        backend.connect_timeout,
+        TcpStream::connect((backend.endpoint.host(), backend.endpoint.port())),
     )
     .await
     {
@@ -1112,7 +1110,7 @@ pub(crate) async fn run(
             FinalGateOutcome::Shutdown => return Ok(()),
         }
 
-        let child = match process::launch(&config.command, &config.arguments) {
+        let child = match process::launch(&config.launch) {
             Ok(child) => {
                 control.record_launch_success();
                 child
@@ -1249,7 +1247,7 @@ async fn wait_for_readiness(
             } else {
                 timeout(
                     connect_timeout,
-                    TcpStream::connect((backend.host.as_ref(), backend.port)),
+                    TcpStream::connect((backend.endpoint.host(), backend.endpoint.port())),
                 )
                 .await
                 .context("Minecraft backend TCP connection attempt timed out")??;
@@ -2200,14 +2198,14 @@ mod tests {
     async fn spawn_scripted_list_rcon_server(
         replies: Vec<TestListReply>,
     ) -> (
-        String,
+        Endpoint,
         mpsc::UnboundedReceiver<TestRconEvent>,
         JoinHandle<()>,
     ) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test RCON listener should bind");
-        let address = listener.local_addr().unwrap().to_string();
+        let address = endpoint(listener.local_addr().unwrap());
         let (events, event_receiver) = mpsc::unbounded_channel();
         let server = tokio::spawn(async move {
             let mut replies = std::collections::VecDeque::from(replies);
@@ -2303,14 +2301,15 @@ mod tests {
         (address, event_receiver, server)
     }
 
-    async fn spawn_test_rcon_server() -> (String, oneshot::Receiver<()>, JoinHandle<()>) {
+    async fn spawn_test_rcon_server() -> (Endpoint, oneshot::Receiver<()>, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test RCON listener should bind");
-        let address = listener
-            .local_addr()
-            .expect("test RCON listener should have an address")
-            .to_string();
+        let address = endpoint(
+            listener
+                .local_addr()
+                .expect("test RCON listener should have an address"),
+        );
         let (ready_sender, ready_receiver) = oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener
@@ -2334,14 +2333,15 @@ mod tests {
 
     async fn spawn_player_count_rcon_server(
         player_count: u32,
-    ) -> (String, oneshot::Receiver<()>, JoinHandle<()>) {
+    ) -> (Endpoint, oneshot::Receiver<()>, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test RCON listener should bind");
-        let address = listener
-            .local_addr()
-            .expect("test RCON listener should have an address")
-            .to_string();
+        let address = endpoint(
+            listener
+                .local_addr()
+                .expect("test RCON listener should have an address"),
+        );
         let (first_poll_sender, first_poll_receiver) = oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener
@@ -2396,7 +2396,7 @@ mod tests {
     }
 
     async fn spawn_blocked_player_count_rcon_server() -> (
-        String,
+        Endpoint,
         oneshot::Receiver<()>,
         oneshot::Sender<()>,
         JoinHandle<()>,
@@ -2404,10 +2404,11 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test RCON listener should bind");
-        let address = listener
-            .local_addr()
-            .expect("test RCON listener should have an address")
-            .to_string();
+        let address = endpoint(
+            listener
+                .local_addr()
+                .expect("test RCON listener should have an address"),
+        );
         let (poll_started_sender, poll_started_receiver) = oneshot::channel();
         let (release_sender, release_receiver) = oneshot::channel();
         let server = tokio::spawn(async move {
@@ -2436,18 +2437,25 @@ mod tests {
         (address, poll_started_receiver, release_sender, server)
     }
 
-    fn test_config(rcon_address: String) -> SupervisorConfig {
+    fn endpoint(address: std::net::SocketAddr) -> Endpoint {
+        Endpoint::new(address.ip().to_string(), address.port())
+    }
+
+    fn test_config(rcon_endpoint: &Endpoint) -> SupervisorConfig {
         let executable = std::env::current_exe().expect("test executable path should be known");
         SupervisorConfig {
-            command: executable.to_string_lossy().into_owned(),
-            arguments: vec![
-                "--ignored".to_owned(),
-                "--exact".to_owned(),
-                "supervisor::tests::server_process_fixture".to_owned(),
-                "--quiet".to_owned(),
-            ],
+            launch: LaunchCommand::new(
+                executable.into_os_string(),
+                vec![
+                    "--ignored".into(),
+                    "--exact".into(),
+                    "supervisor::tests::server_process_fixture".into(),
+                    "--quiet".into(),
+                ],
+                std::env::current_dir().expect("test working directory should be known"),
+            ),
             rcon: Some(RconConfig {
-                endpoint: rcon_address,
+                endpoint: rcon_endpoint.clone(),
                 password: "secret".to_owned(),
             }),
             poll_interval: Duration::from_secs(30),
@@ -2460,9 +2468,9 @@ mod tests {
     }
 
     fn no_rcon_config() -> SupervisorConfig {
-        let mut config = test_config(String::new());
+        let mut config = test_config(&Endpoint::new("127.0.0.1", 9));
         config.rcon = None;
-        config.arguments[2] = "supervisor::tests::console_stop_fixture".to_owned();
+        config.launch.arguments[2] = "supervisor::tests::console_stop_fixture".into();
         config
     }
 
@@ -2474,10 +2482,13 @@ mod tests {
 
     fn launch_failure_config() -> SupervisorConfig {
         SupervisorConfig {
-            command: "mcservernap-test-command-that-does-not-exist".to_owned(),
-            arguments: Vec::new(),
+            launch: LaunchCommand::new(
+                "mcservernap-test-command-that-does-not-exist".into(),
+                Vec::new(),
+                std::env::current_dir().expect("test working directory should be known"),
+            ),
             rcon: Some(RconConfig {
-                endpoint: "127.0.0.1:9".to_owned(),
+                endpoint: Endpoint::new("127.0.0.1", 9),
                 password: "secret".to_owned(),
             }),
             poll_interval: Duration::from_secs(30),
@@ -2510,15 +2521,14 @@ mod tests {
         (
             probe_sender,
             BackendEndpoint {
-                host: Arc::from("127.0.0.1"),
-                port: 9,
+                endpoint: Endpoint::new("127.0.0.1", 9),
                 connect_timeout: Duration::from_secs(1),
                 scripted_probes: Some(tokio::sync::Mutex::new(probe_receiver)),
             },
         )
     }
 
-    fn refused_endpoints() -> (String, BackendEndpoint) {
+    fn refused_endpoints() -> (Endpoint, BackendEndpoint) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")
             .expect("test should reserve an unused local port");
         let address = listener
@@ -2535,38 +2545,39 @@ mod tests {
                 .expect("test probe script should accept a clean result");
         }
         drop(probe_sender);
+        let endpoint = endpoint(address);
         (
-            address.to_string(),
+            endpoint.clone(),
             BackendEndpoint {
-                host: Arc::from("127.0.0.1"),
-                port: address.port(),
+                endpoint,
                 connect_timeout: Duration::from_secs(1),
                 scripted_probes: Some(tokio::sync::Mutex::new(probe_receiver)),
             },
         )
     }
 
-    fn rapid_exit_config(rcon_address: String) -> SupervisorConfig {
-        let mut config = test_config(rcon_address);
-        config.arguments[2] = "supervisor::tests::rapid_exit_fixture".to_owned();
+    fn rapid_exit_config(rcon_endpoint: &Endpoint) -> SupervisorConfig {
+        let mut config = test_config(rcon_endpoint);
+        config.launch.arguments[2] = "supervisor::tests::rapid_exit_fixture".into();
         config
     }
 
-    fn stable_exit_config(rcon_address: String) -> SupervisorConfig {
-        let mut config = test_config(rcon_address);
-        config.arguments[2] = "supervisor::tests::stable_exit_fixture".to_owned();
+    fn stable_exit_config(rcon_endpoint: &Endpoint) -> SupervisorConfig {
+        let mut config = test_config(rcon_endpoint);
+        config.launch.arguments[2] = "supervisor::tests::stable_exit_fixture".into();
         config
     }
 
     fn signaled_exit_config(
-        rcon_address: String,
+        rcon_endpoint: &Endpoint,
         exit_signal_address: std::net::SocketAddr,
     ) -> SupervisorConfig {
-        let mut config = test_config(rcon_address);
-        config.arguments[2] = "supervisor::tests::signaled_exit_fixture".to_owned();
+        let mut config = test_config(rcon_endpoint);
+        config.launch.arguments[2] = "supervisor::tests::signaled_exit_fixture".into();
         config
+            .launch
             .arguments
-            .insert(3, format!("exit-signal={exit_signal_address}"));
+            .insert(3, format!("exit-signal={exit_signal_address}").into());
         config
     }
 
@@ -2595,7 +2606,7 @@ mod tests {
     }
 
     fn test_backend_endpoint() -> BackendEndpoint {
-        BackendEndpoint::network(Arc::from("127.0.0.1"), 9, Duration::from_secs(1))
+        BackendEndpoint::network(Endpoint::new("127.0.0.1", 9), Duration::from_secs(1))
     }
 
     fn running_backend_use(lifecycle: LifecycleState) -> Arc<BackendUseCoordinator> {
@@ -2607,9 +2618,9 @@ mod tests {
         backend_use
     }
 
-    async fn connected_player_inspection(rcon_address: &str) -> PlayerInspection {
+    async fn connected_player_inspection(rcon_endpoint: &Endpoint) -> PlayerInspection {
         PlayerInspection::ConfiguredRcon {
-            client: Some(RconClient::connect(rcon_address, "secret").await.unwrap()),
+            client: Some(RconClient::connect(rcon_endpoint, "secret").await.unwrap()),
             next_poll: Instant::now(),
             zero_anchor: None,
         }
@@ -2618,11 +2629,10 @@ mod tests {
     async fn assert_final_rcon_veto(reply: TestListReply) {
         let (rcon_address, mut events, rcon_server) =
             spawn_scripted_list_rcon_server(vec![player_count_reply(0), reply]).await;
-        let mut config = test_config(rcon_address.clone());
+        let mut config = test_config(&rcon_address);
         config.idle_timeout = Duration::from_secs(1);
         config.poll_interval = Duration::from_secs(100);
-        let child = process::launch(&config.command, &config.arguments)
-            .expect("test server process should launch");
+        let child = process::launch(&config.launch).expect("test server process should launch");
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = running_lifecycle(0);
@@ -3350,10 +3360,11 @@ mod tests {
         let rcon_listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test RCON listener should bind");
-        let rcon_address = rcon_listener
-            .local_addr()
-            .expect("RCON listener should have an address")
-            .to_string();
+        let rcon_address = endpoint(
+            rcon_listener
+                .local_addr()
+                .expect("RCON listener should have an address"),
+        );
         let rcon_server = tokio::spawn(async move {
             let (mut stream, _) = rcon_listener
                 .accept()
@@ -3397,8 +3408,7 @@ mod tests {
             lifecycle_sender,
             config,
             BackendEndpoint::network(
-                Arc::from("127.0.0.1"),
-                backend_address.port(),
+                Endpoint::new("127.0.0.1", backend_address.port()),
                 Duration::from_secs(1),
             ),
             test_backend_use(),
@@ -3794,7 +3804,7 @@ mod tests {
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let (lifecycle_sender, mut lifecycle) = watch::channel(LifecycleState::reconciling());
         let (rcon_address, backend) = refused_endpoints();
-        let mut config = test_config(rcon_address);
+        let mut config = test_config(&rcon_address);
         config.startup_timeout = Duration::from_millis(50);
         config.command_timeout = Duration::from_millis(10);
         config.retry_interval = Duration::from_millis(10);
@@ -3836,9 +3846,8 @@ mod tests {
 
     #[tokio::test]
     async fn successful_exit_before_readiness_is_retryable() {
-        let config = rapid_exit_config("127.0.0.1:9".to_owned());
-        let child = process::launch(&config.command, &config.arguments)
-            .expect("short-lived test server should launch");
+        let config = rapid_exit_config(&Endpoint::new("127.0.0.1", 9));
+        let child = process::launch(&config.launch).expect("short-lived test server should launch");
         let (_wake_sender, wake_receiver) = mpsc::channel(1);
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let (lifecycle_sender, lifecycle) = watch::channel(LifecycleState::reconciling());
@@ -3877,13 +3886,12 @@ mod tests {
         let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_address = backend_listener.local_addr().unwrap();
         let backend = BackendEndpoint::network(
-            Arc::from("127.0.0.1"),
-            backend_address.port(),
+            Endpoint::new("127.0.0.1", backend_address.port()),
             Duration::from_secs(1),
         );
         let backend_accept = tokio::spawn(async move { backend_listener.accept().await.unwrap() });
         let config = no_rcon_config();
-        let child = process::launch(&config.command, &config.arguments).unwrap();
+        let child = process::launch(&config.launch).unwrap();
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let starting = LifecycleState {
@@ -3916,12 +3924,12 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
         let backend =
-            BackendEndpoint::network(Arc::from("127.0.0.1"), port, Duration::from_millis(10));
+            BackendEndpoint::network(Endpoint::new("127.0.0.1", port), Duration::from_millis(10));
         let mut config = no_rcon_config();
         config.startup_timeout = Duration::from_millis(50);
         config.retry_interval = Duration::from_millis(10);
         config.command_timeout = Duration::from_millis(10);
-        let child = process::launch(&config.command, &config.arguments).unwrap();
+        let child = process::launch(&config.launch).unwrap();
         let (_wake_sender, wake_receiver) = mpsc::channel(1);
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let starting = LifecycleState {
@@ -3950,8 +3958,8 @@ mod tests {
     #[tokio::test]
     async fn no_rcon_running_child_exit_is_reaped_as_failure() {
         let mut config = no_rcon_config();
-        config.arguments[2] = "supervisor::tests::rapid_exit_fixture".to_owned();
-        let child = process::launch(&config.command, &config.arguments).unwrap();
+        config.launch.arguments[2] = "supervisor::tests::rapid_exit_fixture".into();
+        let child = process::launch(&config.launch).unwrap();
         let (_wake_sender, wake_receiver) = mpsc::channel(1);
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = running_lifecycle(0);
@@ -3985,7 +3993,7 @@ mod tests {
         let rcon_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut config = no_rcon_config();
         config.idle_timeout = Duration::from_secs(1);
-        let child = process::launch(&config.command, &config.arguments).unwrap();
+        let child = process::launch(&config.launch).unwrap();
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = running_lifecycle(0);
@@ -4034,13 +4042,13 @@ mod tests {
     async fn rcon_stop_failure_falls_back_to_exact_console_stop() {
         let mut config = no_rcon_config();
         let refused_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let refused_address = refused_listener.local_addr().unwrap().to_string();
+        let refused_address = endpoint(refused_listener.local_addr().unwrap());
         drop(refused_listener);
         config.rcon = Some(RconConfig {
             endpoint: refused_address,
             password: "secret".to_owned(),
         });
-        let child = process::launch(&config.command, &config.arguments).unwrap();
+        let child = process::launch(&config.launch).unwrap();
         let (_wake_sender, wake_receiver) = mpsc::channel(1);
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = running_lifecycle(0);
@@ -4062,9 +4070,8 @@ mod tests {
     #[tokio::test]
     async fn console_failure_is_reaped_and_timeout_forces_termination() {
         let mut failed_config = no_rcon_config();
-        failed_config.arguments[2] = "supervisor::tests::rapid_exit_fixture".to_owned();
-        let mut failed_child =
-            process::launch(&failed_config.command, &failed_config.arguments).unwrap();
+        failed_config.launch.arguments[2] = "supervisor::tests::rapid_exit_fixture".into();
+        let mut failed_child = process::launch(&failed_config.launch).unwrap();
         let failed_pid = failed_child.id().unwrap();
         wait_for_test_process_exit(failed_pid);
         assert!(failed_child.send_console_stop().await.is_err());
@@ -4074,10 +4081,9 @@ mod tests {
         assert!(test_process_has_exited(failed_pid));
 
         let mut timeout_config = no_rcon_config();
-        timeout_config.arguments[2] = "supervisor::tests::server_process_fixture".to_owned();
+        timeout_config.launch.arguments[2] = "supervisor::tests::server_process_fixture".into();
         timeout_config.command_timeout = Duration::ZERO;
-        let mut timeout_child =
-            process::launch(&timeout_config.command, &timeout_config.arguments).unwrap();
+        let mut timeout_child = process::launch(&timeout_config.launch).unwrap();
         let timeout_pid = timeout_child.id().unwrap();
         stop_and_reap(&mut timeout_child, &timeout_config)
             .await
@@ -4099,9 +4105,9 @@ mod tests {
 
         for (expected_streak, expected_delay) in [(2, 10), (3, 20)] {
             let (rcon_address, _first_poll, rcon_server) = spawn_player_count_rcon_server(1).await;
-            let config = rapid_exit_config(rcon_address);
-            let child = process::launch(&config.command, &config.arguments)
-                .expect("short-lived test server should launch");
+            let config = rapid_exit_config(&rcon_address);
+            let child =
+                process::launch(&config.launch).expect("short-lived test server should launch");
             control.begin_reconciliation();
             control.record_launch_success();
 
@@ -4143,10 +4149,9 @@ mod tests {
             .expect("test exit-signal listener should have an address");
         let (rcon_address, poll_started, release_poll, rcon_server) =
             spawn_blocked_player_count_rcon_server().await;
-        let mut config = signaled_exit_config(rcon_address.clone(), exit_signal_address);
+        let mut config = signaled_exit_config(&rcon_address, exit_signal_address);
         config.command_timeout = Duration::from_secs(120);
-        let child = process::launch(&config.command, &config.arguments)
-            .expect("signaled test server should launch");
+        let child = process::launch(&config.launch).expect("signaled test server should launch");
         let process_id = child
             .id()
             .expect("signaled test server should have a process ID");
@@ -4231,9 +4236,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stable_running_resets_the_streak_before_an_unexpected_exit() {
         let (rcon_address, first_poll, rcon_server) = spawn_player_count_rcon_server(1).await;
-        let config = stable_exit_config(rcon_address.clone());
-        let child = process::launch(&config.command, &config.arguments)
-            .expect("stable-window test server should launch");
+        let config = stable_exit_config(&rcon_address);
+        let child =
+            process::launch(&config.launch).expect("stable-window test server should launch");
         let (_wake_sender, wake_receiver) = mpsc::channel(1);
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = failed_lifecycle(ServerPhase::Running, 3);
@@ -4290,7 +4295,7 @@ mod tests {
     #[tokio::test]
     async fn configured_readiness_player_and_stop_use_separate_rcon_sessions() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let rcon_address = listener.local_addr().unwrap().to_string();
+        let rcon_address = endpoint(listener.local_addr().unwrap());
         let (events, mut event_receiver) = mpsc::unbounded_channel();
         let rcon_server = tokio::spawn(async move {
             for session in 1..=3 {
@@ -4337,10 +4342,10 @@ mod tests {
             }
         });
 
-        let mut config = test_config(rcon_address);
+        let mut config = test_config(&rcon_address);
         config.idle_timeout = Duration::from_millis(30);
         config.poll_interval = Duration::from_secs(1);
-        let child = process::launch(&config.command, &config.arguments).unwrap();
+        let child = process::launch(&config.launch).unwrap();
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let starting = LifecycleState {
@@ -4378,11 +4383,10 @@ mod tests {
         let (rcon_address, mut events, rcon_server) =
             spawn_scripted_list_rcon_server(vec![player_count_reply(0), player_count_reply(0)])
                 .await;
-        let mut config = test_config(rcon_address.clone());
+        let mut config = test_config(&rcon_address);
         config.idle_timeout = Duration::from_secs(10);
         config.poll_interval = Duration::from_secs(100);
-        let child = process::launch(&config.command, &config.arguments)
-            .expect("test server process should launch");
+        let child = process::launch(&config.launch).expect("test server process should launch");
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = running_lifecycle(0);
@@ -4469,11 +4473,11 @@ mod tests {
             },
         ])
         .await;
-        let mut config = test_config(rcon_address.clone());
+        let mut config = test_config(&rcon_address);
         config.idle_timeout = Duration::from_secs(1);
         config.poll_interval = Duration::from_secs(100);
         config.command_timeout = Duration::from_secs(10);
-        let child = process::launch(&config.command, &config.arguments).unwrap();
+        let child = process::launch(&config.launch).unwrap();
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = running_lifecycle(0);
@@ -4525,9 +4529,9 @@ mod tests {
     async fn unavailable_final_rcon_vetoes_idle_stop() {
         let (rcon_address, mut events, rcon_server) =
             spawn_scripted_list_rcon_server(Vec::new()).await;
-        let mut config = test_config(rcon_address.clone());
+        let mut config = test_config(&rcon_address);
         config.idle_timeout = Duration::from_secs(1);
-        let mut child = process::launch(&config.command, &config.arguments).unwrap();
+        let mut child = process::launch(&config.launch).unwrap();
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = running_lifecycle(0);
@@ -4584,11 +4588,11 @@ mod tests {
             },
         ])
         .await;
-        let mut config = test_config(rcon_address.clone());
+        let mut config = test_config(&rcon_address);
         config.idle_timeout = Duration::from_secs(1);
         config.poll_interval = Duration::from_secs(100);
         config.command_timeout = Duration::from_secs(120);
-        let child = process::launch(&config.command, &config.arguments).unwrap();
+        let child = process::launch(&config.launch).unwrap();
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = running_lifecycle(0);
@@ -4639,7 +4643,7 @@ mod tests {
         ] {
             let (rcon_address, _events, rcon_server) =
                 spawn_scripted_list_rcon_server(vec![first_reply, player_count_reply(0)]).await;
-            let config = test_config(rcon_address.clone());
+            let config = test_config(&rcon_address);
             let mut player_inspection = PlayerInspection::ConfiguredRcon {
                 client: Some(RconClient::connect(&rcon_address, "secret").await.unwrap()),
                 next_poll: Instant::now(),
@@ -4670,10 +4674,10 @@ mod tests {
     async fn stability_window_and_shutdown_are_handled_while_exclusivity_is_pending() {
         let (rcon_address, mut events, rcon_server) =
             spawn_scripted_list_rcon_server(vec![player_count_reply(0)]).await;
-        let mut config = test_config(rcon_address.clone());
+        let mut config = test_config(&rcon_address);
         config.idle_timeout = Duration::from_secs(1);
         config.poll_interval = Duration::from_secs(100);
-        let child = process::launch(&config.command, &config.arguments).unwrap();
+        let child = process::launch(&config.launch).unwrap();
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = running_lifecycle(2);
@@ -4730,10 +4734,10 @@ mod tests {
         let exit_signal_address = exit_listener.local_addr().unwrap();
         let (rcon_address, mut events, rcon_server) =
             spawn_scripted_list_rcon_server(vec![player_count_reply(0)]).await;
-        let mut config = signaled_exit_config(rcon_address.clone(), exit_signal_address);
+        let mut config = signaled_exit_config(&rcon_address, exit_signal_address);
         config.idle_timeout = Duration::from_secs(1);
         config.poll_interval = Duration::from_secs(100);
-        let child = process::launch(&config.command, &config.arguments).unwrap();
+        let child = process::launch(&config.launch).unwrap();
         let (mut exit_signal, _) = exit_listener.accept().await.unwrap();
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
@@ -4785,11 +4789,11 @@ mod tests {
             },
         ])
         .await;
-        let mut config = signaled_exit_config(rcon_address.clone(), exit_signal_address);
+        let mut config = signaled_exit_config(&rcon_address, exit_signal_address);
         config.idle_timeout = Duration::from_secs(1);
         config.poll_interval = Duration::from_secs(100);
         config.command_timeout = Duration::from_secs(120);
-        let child = process::launch(&config.command, &config.arguments).unwrap();
+        let child = process::launch(&config.launch).unwrap();
         let (mut exit_signal, _) = exit_listener.accept().await.unwrap();
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
@@ -4833,9 +4837,8 @@ mod tests {
     #[tokio::test]
     async fn controlled_idle_stop_resets_the_failure_streak() {
         let (rcon_address, rcon_ready, rcon_server) = spawn_test_rcon_server().await;
-        let config = test_config(rcon_address.clone());
-        let child = process::launch(&config.command, &config.arguments)
-            .expect("test server process should launch");
+        let config = test_config(&rcon_address);
+        let child = process::launch(&config.launch).expect("test server process should launch");
         let (_wake_sender, wake_receiver) = mpsc::channel(1);
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = failed_lifecycle(ServerPhase::Running, 3);
@@ -4863,9 +4866,8 @@ mod tests {
 
     #[tokio::test]
     async fn process_wait_error_is_fatal_after_successful_cleanup() {
-        let config = test_config("127.0.0.1:9".to_owned());
-        let child = process::launch(&config.command, &config.arguments)
-            .expect("test server process should launch");
+        let config = test_config(&Endpoint::new("127.0.0.1", 9));
+        let child = process::launch(&config.launch).expect("test server process should launch");
         let (_wake_sender, wake_receiver) = mpsc::channel(1);
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = LifecycleState {
@@ -4964,7 +4966,7 @@ mod tests {
             wake_receiver,
             shutdown_receiver,
             lifecycle_sender,
-            test_config(rcon_address),
+            test_config(&rcon_address),
             backend,
             test_backend_use(),
         )
@@ -4985,7 +4987,7 @@ mod tests {
             wake_receiver,
             shutdown_receiver,
             lifecycle_sender,
-            test_config(rcon_address),
+            test_config(&rcon_address),
             backend,
             test_backend_use(),
         ));
@@ -5029,7 +5031,7 @@ mod tests {
             wake_receiver,
             shutdown_receiver,
             lifecycle_sender,
-            test_config(rcon_address),
+            test_config(&rcon_address),
             backend,
             test_backend_use(),
         ));
@@ -5058,9 +5060,8 @@ mod tests {
     #[tokio::test]
     async fn shutdown_precedes_a_running_phase_wake() {
         let (rcon_address, rcon_ready, rcon_server) = spawn_test_rcon_server().await;
-        let config = test_config(rcon_address);
-        let child = process::launch(&config.command, &config.arguments)
-            .expect("test server process should launch");
+        let config = test_config(&rcon_address);
+        let child = process::launch(&config.launch).expect("test server process should launch");
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = LifecycleState {
@@ -5112,9 +5113,8 @@ mod tests {
     #[tokio::test]
     async fn stopping_wake_flood_cannot_starve_cleanup() {
         let (rcon_address, rcon_ready, rcon_server) = spawn_test_rcon_server().await;
-        let config = test_config(rcon_address);
-        let child = process::launch(&config.command, &config.arguments)
-            .expect("test server process should launch");
+        let config = test_config(&rcon_address);
+        let child = process::launch(&config.launch).expect("test server process should launch");
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let active = failed_lifecycle(ServerPhase::Running, 3);
@@ -5179,9 +5179,8 @@ mod tests {
     #[tokio::test]
     async fn shutdown_overrides_a_stopping_phase_restart() {
         let (rcon_address, rcon_ready, rcon_server) = spawn_test_rcon_server().await;
-        let config = test_config(rcon_address);
-        let child = process::launch(&config.command, &config.arguments)
-            .expect("test server process should launch");
+        let config = test_config(&rcon_address);
+        let child = process::launch(&config.launch).expect("test server process should launch");
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let active = LifecycleState {

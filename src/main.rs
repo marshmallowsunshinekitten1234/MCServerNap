@@ -1,13 +1,18 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use mcservernap::config::{self, Config};
-use mcservernap::minecraft::MinecraftResponder;
+use mcservernap::endpoint::Endpoint;
+use mcservernap::minecraft::{MinecraftResponder, MinecraftResponderSettings};
+use mcservernap::process::LaunchCommand;
 use mcservernap::rcon::RconClient;
 use mcservernap::runtime::{ServerRuntime, ServerRuntimeConfig};
 use mcservernap::supervisor::{RconConfig, SupervisorConfig};
+use tokio::sync::Semaphore;
 use tokio::time::timeout;
 
 #[derive(Parser)]
@@ -74,11 +79,9 @@ enum Commands {
 }
 
 struct ListenOptions {
-    bind_host: String,
-    bind_port: u16,
-    server_host: String,
-    server_port: u16,
-    rcon_address: String,
+    bind_endpoint: Endpoint,
+    backend_endpoint: Endpoint,
+    rcon_endpoint: Endpoint,
     rcon_password: String,
     command: String,
     arguments: Vec<String>,
@@ -105,11 +108,9 @@ async fn main() -> Result<()> {
             arguments,
         } => {
             run_listener(ListenOptions {
-                bind_host: host,
-                bind_port: port,
-                server_host,
-                server_port,
-                rcon_address: socket_address(&rcon_host, rcon_port),
+                bind_endpoint: Endpoint::new(host, port),
+                backend_endpoint: Endpoint::new(server_host, server_port),
+                rcon_endpoint: Endpoint::new(rcon_host, rcon_port),
                 rcon_password: rcon_pass,
                 command,
                 arguments,
@@ -121,15 +122,25 @@ async fn main() -> Result<()> {
             rcon_host,
             rcon_port,
             rcon_pass,
-        } => stop_via_rcon(&socket_address(&rcon_host, rcon_port), &rcon_pass).await,
+        } => stop_via_rcon(&Endpoint::new(rcon_host, rcon_port), &rcon_pass).await,
     }
 }
 
 async fn run_listener(options: ListenOptions) -> Result<()> {
     let loaded = config::load_or_create(&options.config_path)?;
     let settings = loaded.settings;
-    let responder = MinecraftResponder::new(&settings, loaded.server_icon.as_deref())?;
-    let runtime = ServerRuntime::bind(runtime_config(options, &settings), responder).await?;
+    let responder = MinecraftResponder::new(responder_settings(&settings, loaded.server_icon))?;
+    let connection_limit = Arc::new(Semaphore::new(settings.max_connections));
+    let working_directory =
+        std::env::current_dir().context("failed to determine MCServerNap's working directory")?;
+    let runtime = ServerRuntime::prepare(
+        runtime_config(options, &settings, working_directory),
+        responder,
+        connection_limit,
+    )?
+    .bind()
+    .await?
+    .activate();
     let shutdown = async {
         tokio::signal::ctrl_c()
             .await
@@ -140,34 +151,38 @@ async fn run_listener(options: ListenOptions) -> Result<()> {
     runtime.run_until(shutdown).await
 }
 
-async fn stop_via_rcon(address: &str, password: &str) -> Result<()> {
+async fn stop_via_rcon(endpoint: &Endpoint, password: &str) -> Result<()> {
     let mut client = timeout(
         Duration::from_secs(10),
-        RconClient::connect(address, password),
+        RconClient::connect(endpoint, password),
     )
     .await
     .context("RCON connection timed out")??;
     timeout(Duration::from_secs(5), client.stop())
         .await
         .context("RCON stop command timed out")??;
-    log::info!("Sent stop command to RCON at {address}");
+    log::info!("Sent stop command to RCON at {endpoint}");
     Ok(())
 }
 
-fn runtime_config(options: ListenOptions, settings: &Config) -> ServerRuntimeConfig {
+fn runtime_config(
+    options: ListenOptions,
+    settings: &Config,
+    working_directory: PathBuf,
+) -> ServerRuntimeConfig {
     ServerRuntimeConfig {
-        bind_host: options.bind_host,
-        bind_port: options.bind_port,
-        server_host: options.server_host,
-        server_port: options.server_port,
+        bind_endpoint: options.bind_endpoint,
+        backend_endpoint: options.backend_endpoint,
         handshake_timeout: Duration::from_secs(settings.handshake_timeout_seconds),
         proxy_connect_timeout: Duration::from_secs(settings.proxy_connect_timeout_seconds),
-        max_connections: settings.max_connections,
         supervisor: SupervisorConfig {
-            command: options.command,
-            arguments: options.arguments,
+            launch: LaunchCommand::new(
+                OsString::from(options.command),
+                options.arguments.into_iter().map(OsString::from).collect(),
+                working_directory,
+            ),
             rcon: Some(RconConfig {
-                endpoint: options.rcon_address,
+                endpoint: options.rcon_endpoint,
                 password: options.rcon_password,
             }),
             poll_interval: Duration::from_secs(settings.rcon_poll_interval_seconds),
@@ -180,25 +195,25 @@ fn runtime_config(options: ListenOptions, settings: &Config) -> ServerRuntimeCon
     }
 }
 
-fn socket_address(host: &str, port: u16) -> String {
-    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
+fn responder_settings(
+    settings: &Config,
+    server_icon: Option<String>,
+) -> MinecraftResponderSettings {
+    MinecraftResponderSettings {
+        minecraft_version: settings.minecraft_version,
+        sleeping_motd_text: settings.motd_text.clone(),
+        sleeping_motd_color: settings.motd_color.clone(),
+        sleeping_motd_bold: settings.motd_bold,
+        startup_message_text: settings.connection_msg_text.clone(),
+        startup_message_color: settings.connection_msg_color.clone(),
+        startup_message_bold: settings.connection_msg_bold,
+        server_icon,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn formats_ipv4_hostnames_and_ipv6_addresses() {
-        assert_eq!(socket_address("127.0.0.1", 25575), "127.0.0.1:25575");
-        assert_eq!(socket_address("localhost", 25575), "localhost:25575");
-        assert_eq!(socket_address("::1", 25575), "[::1]:25575");
-        assert_eq!(socket_address("[::1]", 25575), "[::1]:25575");
-    }
 
     #[test]
     fn parses_documented_listener_invocation() {
@@ -236,5 +251,68 @@ mod tests {
         assert_eq!(port, 25565);
         assert_eq!(command, "java");
         assert_eq!(arguments, ["-Xmx5G", "-jar", "server.jar", "nogui"]);
+    }
+
+    #[test]
+    fn runtime_translation_preserves_endpoints_and_exact_cli_launch_values() {
+        let working_directory = PathBuf::from("minecraft server");
+        let config = runtime_config(
+            ListenOptions {
+                bind_endpoint: Endpoint::new("::", 25_565),
+                backend_endpoint: Endpoint::new("localhost", 25_566),
+                rcon_endpoint: Endpoint::new("::1", 25_575),
+                rcon_password: "secret".to_owned(),
+                command: "java".to_owned(),
+                arguments: vec![
+                    "-Xmx5G".to_owned(),
+                    "argument with spaces".to_owned(),
+                    "$UNCHANGED".to_owned(),
+                ],
+                config_path: PathBuf::from("config/cfg.toml"),
+            },
+            &Config::default(),
+            working_directory.clone(),
+        );
+
+        assert_eq!(config.bind_endpoint, Endpoint::new("::", 25_565));
+        assert_eq!(config.backend_endpoint, Endpoint::new("localhost", 25_566));
+        assert_eq!(config.supervisor.launch.program, OsString::from("java"));
+        assert_eq!(
+            config.supervisor.launch.arguments,
+            ["-Xmx5G", "argument with spaces", "$UNCHANGED"]
+                .map(OsString::from)
+                .to_vec()
+        );
+        assert_eq!(
+            config.supervisor.launch.working_directory,
+            working_directory
+        );
+        assert_eq!(
+            config.supervisor.rcon.as_ref().unwrap().endpoint,
+            Endpoint::new("::1", 25_575)
+        );
+    }
+
+    #[test]
+    fn schema_v2_translation_owns_only_responder_inputs() {
+        let settings = Config {
+            motd_text: "Sleeping".to_owned(),
+            motd_color: "blue".to_owned(),
+            motd_bold: false,
+            connection_msg_text: "Starting".to_owned(),
+            connection_msg_color: "gold".to_owned(),
+            connection_msg_bold: true,
+            ..Config::default()
+        };
+        let responder = responder_settings(&settings, Some("prepared-icon".to_owned()));
+
+        assert_eq!(responder.minecraft_version, settings.minecraft_version);
+        assert_eq!(responder.sleeping_motd_text, "Sleeping");
+        assert_eq!(responder.sleeping_motd_color, "blue");
+        assert!(!responder.sleeping_motd_bold);
+        assert_eq!(responder.startup_message_text, "Starting");
+        assert_eq!(responder.startup_message_color, "gold");
+        assert!(responder.startup_message_bold);
+        assert_eq!(responder.server_icon.as_deref(), Some("prepared-icon"));
     }
 }
