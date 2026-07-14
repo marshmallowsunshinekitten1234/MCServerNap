@@ -863,6 +863,20 @@ fn publish_conflict_observation(
     }
 }
 
+fn publish_external_backend(
+    control: &SupervisorControl,
+    config: &SupervisorConfig,
+    consume_demand: bool,
+    last_conflict: &mut Option<ConflictClassification>,
+) {
+    control.publish_external(consume_demand);
+    server_info!(
+        config,
+        "Detected a ready external backend; proxying without process ownership or automatic shutdown"
+    );
+    *last_conflict = None;
+}
+
 fn conflict_warning_changed(
     last_conflict: &mut Option<ConflictClassification>,
     classification: ConflictClassification,
@@ -903,12 +917,7 @@ async fn reconcile_startup(
             }
         }
         ReconciliationClassification::FullyReady => {
-            control.publish_external(startup_demand);
-            server_info!(
-                config,
-                "Detected a ready external backend; proxying without process ownership or automatic shutdown"
-            );
-            *last_conflict = None;
+            publish_external_backend(control, config, startup_demand, last_conflict);
             StartupReconciliationOutcome::Idle
         }
         ReconciliationClassification::Positive => {
@@ -956,12 +965,7 @@ async fn reconcile_final_gate(
     let classification = result.classification();
     if prior_evidence == ReconciliationEvidence::Positive {
         if classification == ReconciliationClassification::FullyReady {
-            control.publish_external(true);
-            server_info!(
-                config,
-                "Detected a ready external backend; proxying without process ownership or automatic shutdown"
-            );
-            *last_conflict = None;
+            publish_external_backend(control, config, true, last_conflict);
         } else {
             publish_conflict_observation(
                 control,
@@ -981,12 +985,7 @@ async fn reconcile_final_gate(
             FinalGateOutcome::Launch
         }
         ReconciliationClassification::FullyReady => {
-            control.publish_external(true);
-            server_info!(
-                config,
-                "Detected a ready external backend; proxying without process ownership or automatic shutdown"
-            );
-            *last_conflict = None;
+            publish_external_backend(control, config, true, last_conflict);
             FinalGateOutcome::Blocked
         }
         ReconciliationClassification::Positive => {
@@ -2692,6 +2691,69 @@ mod tests {
         BackendEndpoint::network(Endpoint::new("127.0.0.1", 9), Duration::from_secs(1))
     }
 
+    fn test_control(
+        initial: LifecycleState,
+    ) -> (
+        SupervisorControl,
+        mpsc::Sender<WakeRequest>,
+        oneshot::Sender<()>,
+        watch::Receiver<LifecycleState>,
+    ) {
+        let (wake_sender, wake_requests) = mpsc::channel(1);
+        let (shutdown_sender, shutdown) = oneshot::channel();
+        let (lifecycle, lifecycle_receiver) = watch::channel(initial);
+        (
+            SupervisorControl {
+                wake_requests,
+                shutdown,
+                lifecycle,
+            },
+            wake_sender,
+            shutdown_sender,
+            lifecycle_receiver,
+        )
+    }
+
+    struct TestSupervisor {
+        wake_sender: mpsc::Sender<WakeRequest>,
+        shutdown_sender: oneshot::Sender<()>,
+        lifecycle: watch::Receiver<LifecycleState>,
+        task: JoinHandle<Result<()>>,
+    }
+
+    impl TestSupervisor {
+        fn spawn(config: SupervisorConfig, backend: BackendEndpoint) -> Self {
+            let (wake_sender, wake_receiver) = mpsc::channel(1);
+            let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+            let (lifecycle_sender, lifecycle) = watch::channel(LifecycleState::reconciling());
+            let task = tokio::spawn(run(
+                wake_receiver,
+                shutdown_receiver,
+                lifecycle_sender,
+                config,
+                backend,
+                test_backend_use(),
+            ));
+            Self {
+                wake_sender,
+                shutdown_sender,
+                lifecycle,
+                task,
+            }
+        }
+
+        async fn shutdown(self) -> watch::Receiver<LifecycleState> {
+            self.shutdown_sender
+                .send(())
+                .expect("supervisor should still await shutdown");
+            self.task
+                .await
+                .expect("supervisor task should not panic")
+                .expect("supervisor shutdown should succeed");
+            self.lifecycle
+        }
+    }
+
     fn running_backend_use(lifecycle: LifecycleState) -> Arc<BackendUseCoordinator> {
         let backend_use = test_backend_use();
         let cycle = lifecycle
@@ -2765,27 +2827,11 @@ mod tests {
             .expect("test RCON server should not panic");
     }
 
-    fn spawn_launch_failure_supervisor() -> (
-        mpsc::Sender<WakeRequest>,
-        oneshot::Sender<()>,
-        watch::Receiver<LifecycleState>,
-        JoinHandle<Result<()>>,
-    ) {
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
-        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let (lifecycle_sender, lifecycle) = watch::channel(LifecycleState::reconciling());
+    fn spawn_launch_failure_supervisor() -> TestSupervisor {
         let (rcon_address, backend) = refused_endpoints();
         let mut config = launch_failure_config();
         config.rcon.as_mut().unwrap().endpoint = rcon_address;
-        let supervisor = tokio::spawn(run(
-            wake_receiver,
-            shutdown_receiver,
-            lifecycle_sender,
-            config,
-            backend,
-            test_backend_use(),
-        ));
-        (wake_sender, shutdown_sender, lifecycle, supervisor)
+        TestSupervisor::spawn(config, backend)
     }
 
     async fn wait_for_lifecycle(
@@ -2899,7 +2945,7 @@ mod tests {
     }
 
     #[test]
-    fn failure_backoff_progresses_and_caps_at_sixty_seconds() {
+    fn failure_backoff_caps_at_sixty_seconds() {
         let expected = [5, 10, 20, 40, 60, 60, 60];
         for (failure_streak, expected_seconds) in (1..).zip(expected) {
             assert_eq!(
@@ -2910,7 +2956,7 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_classification_requires_double_refusal_for_clean() {
+    fn reconciliation_requires_double_refusal_to_be_clean() {
         use BackendProbeClassification::{Connected, Inconclusive as BackendInconclusive, Refused};
         use RconProbeClassification::{
             AcceptedFailure, Authenticated, Inconclusive as RconInconclusive,
@@ -2960,7 +3006,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_only_reconciliation_classification_is_exact() {
+    fn backend_only_reconciliation_is_exact() {
         let cases = [
             (
                 BackendProbeClassification::Connected,
@@ -2989,16 +3035,9 @@ mod tests {
     }
 
     #[test]
-    fn transition_helpers_establish_complete_evidence_invariants() {
-        let (_wake_sender, wake_receiver) = mpsc::channel(1);
-        let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let (lifecycle_sender, lifecycle) =
-            watch::channel(LifecycleState::test_phase(ServerPhase::Conflict));
-        let control = SupervisorControl {
-            wake_requests: wake_receiver,
-            shutdown: shutdown_receiver,
-            lifecycle: lifecycle_sender,
-        };
+    fn transitions_preserve_evidence_invariants() {
+        let (control, _wake_sender, _shutdown_sender, lifecycle) =
+            test_control(LifecycleState::test_phase(ServerPhase::Conflict));
 
         assert_eq!(
             control.begin_reconciliation(),
@@ -3034,18 +3073,11 @@ mod tests {
     }
 
     #[test]
-    fn cooldown_metadata_survives_reconciliation_without_changing_the_streak() {
-        let (_wake_sender, wake_receiver) = mpsc::channel(1);
-        let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
+    fn reconciliation_preserves_cooldown_metadata() {
         let retry_at = Instant::now() + Duration::from_secs(5);
         let mut cooldown = failed_lifecycle(ServerPhase::Cooldown, 3);
         cooldown.retry_at = Some(retry_at);
-        let (lifecycle_sender, lifecycle) = watch::channel(cooldown);
-        let control = SupervisorControl {
-            wake_requests: wake_receiver,
-            shutdown: shutdown_receiver,
-            lifecycle: lifecycle_sender,
-        };
+        let (control, _wake_sender, _shutdown_sender, lifecycle) = test_control(cooldown);
 
         control.begin_reconciliation();
         let reconciling = *lifecycle.borrow();
@@ -3108,7 +3140,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocked_startup_consumes_demand_without_automatic_retry() {
+    async fn blocked_startup_requires_new_demand() {
         let (probe_sender, backend) = scripted_backend();
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
@@ -3167,12 +3199,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_startup_wake_drains_before_a_valid_conflict_wake() {
+    async fn stale_startup_wake_precedes_valid_conflict_wake() {
         let (probe_sender, backend) = scripted_backend();
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
-        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let initial = LifecycleState::reconciling();
-        let (lifecycle_sender, mut lifecycle) = watch::channel(initial);
         probe_sender
             .send(test_reconciliation(
                 RconProbeClassification::Inconclusive,
@@ -3185,42 +3213,29 @@ mod tests {
                 BackendProbeClassification::Refused,
             ))
             .expect("conflict clean result should queue");
-        let supervisor = tokio::spawn(run(
-            wake_receiver,
-            shutdown_receiver,
-            lifecycle_sender,
-            launch_failure_config(),
-            backend,
-            test_backend_use(),
-        ));
-        wait_for_phase(&mut lifecycle, ServerPhase::Conflict).await;
+        let mut supervisor = TestSupervisor::spawn(launch_failure_config(), backend);
+        let initial = *supervisor.lifecycle.borrow();
+        wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Conflict).await;
 
-        wake_sender
+        supervisor
+            .wake_sender
             .send(WakeRequest::observed(initial))
             .await
             .expect("stale startup wake should queue");
-        let permit = wake_sender
+        let permit = supervisor
+            .wake_sender
             .reserve()
             .await
             .expect("supervisor should drain the stale startup wake");
-        permit.send(WakeRequest::observed(*lifecycle.borrow()));
-        wait_for_phase(&mut lifecycle, ServerPhase::Cooldown).await;
-        assert_eq!(lifecycle.borrow().launch_generation, 1);
-        shutdown_sender
-            .send(())
-            .expect("supervisor should still await shutdown");
-        supervisor
-            .await
-            .expect("supervisor task should not panic")
-            .expect("supervisor shutdown should succeed");
+        permit.send(WakeRequest::observed(*supervisor.lifecycle.borrow()));
+        wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Cooldown).await;
+        assert_eq!(supervisor.lifecycle.borrow().launch_generation, 1);
+        supervisor.shutdown().await;
     }
 
     #[tokio::test]
-    async fn blocked_final_gate_consumes_one_generation_without_launch_failure() {
+    async fn blocked_final_gate_consumes_one_generation() {
         let (probe_sender, backend) = scripted_backend();
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
-        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let (lifecycle_sender, mut lifecycle) = watch::channel(LifecycleState::reconciling());
         for result in [
             test_reconciliation(
                 RconProbeClassification::Refused,
@@ -3235,39 +3250,24 @@ mod tests {
                 .send(result)
                 .expect("probe result should queue");
         }
-        let supervisor = tokio::spawn(run(
-            wake_receiver,
-            shutdown_receiver,
-            lifecycle_sender,
-            launch_failure_config(),
-            backend,
-            test_backend_use(),
-        ));
-        wait_for_phase(&mut lifecycle, ServerPhase::Stopped).await;
-        wake_sender
-            .send(WakeRequest::observed(*lifecycle.borrow()))
+        let mut supervisor = TestSupervisor::spawn(launch_failure_config(), backend);
+        wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Stopped).await;
+        supervisor
+            .wake_sender
+            .send(WakeRequest::observed(*supervisor.lifecycle.borrow()))
             .await
             .expect("stopped wake should queue");
-        wait_for_phase(&mut lifecycle, ServerPhase::Conflict).await;
+        wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Conflict).await;
 
-        assert_eq!(lifecycle.borrow().launch_generation, 1);
-        assert_eq!(lifecycle.borrow().failure, None);
-        assert_eq!(lifecycle.borrow().failure_streak, 0);
-        shutdown_sender
-            .send(())
-            .expect("supervisor should still await shutdown");
-        supervisor
-            .await
-            .expect("supervisor task should not panic")
-            .expect("supervisor shutdown should succeed");
+        assert_eq!(supervisor.lifecycle.borrow().launch_generation, 1);
+        assert_eq!(supervisor.lifecycle.borrow().failure, None);
+        assert_eq!(supervisor.lifecycle.borrow().failure_streak, 0);
+        supervisor.shutdown().await;
     }
 
     #[tokio::test]
-    async fn positive_evidence_remains_sticky_after_double_refusal() {
+    async fn positive_evidence_survives_double_refusal() {
         let (probe_sender, backend) = scripted_backend();
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
-        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let (lifecycle_sender, mut lifecycle) = watch::channel(LifecycleState::reconciling());
         for result in [
             test_reconciliation(
                 RconProbeClassification::AcceptedFailure,
@@ -3286,53 +3286,41 @@ mod tests {
                 .send(result)
                 .expect("probe result should queue");
         }
-        let supervisor = tokio::spawn(run(
-            wake_receiver,
-            shutdown_receiver,
-            lifecycle_sender,
-            launch_failure_config(),
-            backend,
-            test_backend_use(),
-        ));
-        wait_for_phase(&mut lifecycle, ServerPhase::Conflict).await;
+        let mut supervisor = TestSupervisor::spawn(launch_failure_config(), backend);
+        wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Conflict).await;
         assert_eq!(
-            lifecycle.borrow().reconciliation_evidence,
+            supervisor.lifecycle.borrow().reconciliation_evidence,
             ReconciliationEvidence::Positive
         );
-        wake_sender
-            .send(WakeRequest::observed(*lifecycle.borrow()))
+        supervisor
+            .wake_sender
+            .send(WakeRequest::observed(*supervisor.lifecycle.borrow()))
             .await
             .expect("conflict wake should queue");
-        wait_for_lifecycle(&mut lifecycle, |state| state.launch_generation == 1).await;
+        wait_for_lifecycle(&mut supervisor.lifecycle, |state| {
+            state.launch_generation == 1
+        })
+        .await;
 
-        assert_eq!(lifecycle.borrow().phase, ServerPhase::Conflict);
+        assert_eq!(supervisor.lifecycle.borrow().phase, ServerPhase::Conflict);
         assert_eq!(
-            lifecycle.borrow().reconciliation_evidence,
+            supervisor.lifecycle.borrow().reconciliation_evidence,
             ReconciliationEvidence::Positive
         );
-        assert_eq!(lifecycle.borrow().failure, None);
-        wake_sender
-            .send(WakeRequest::observed(*lifecycle.borrow()))
+        assert_eq!(supervisor.lifecycle.borrow().failure, None);
+        supervisor
+            .wake_sender
+            .send(WakeRequest::observed(*supervisor.lifecycle.borrow()))
             .await
             .expect("sticky conflict wake should queue");
-        wait_for_phase(&mut lifecycle, ServerPhase::External).await;
-        assert_eq!(lifecycle.borrow().launch_generation, 2);
-        shutdown_sender
-            .send(())
-            .expect("supervisor should still await shutdown");
-        supervisor
-            .await
-            .expect("supervisor task should not panic")
-            .expect("supervisor shutdown should succeed");
+        wait_for_phase(&mut supervisor.lifecycle, ServerPhase::External).await;
+        assert_eq!(supervisor.lifecycle.borrow().launch_generation, 2);
+        supervisor.shutdown().await;
     }
 
     #[tokio::test(start_paused = true)]
-    async fn stale_external_wake_does_not_probe_before_poll_interval() {
+    async fn stale_external_wake_waits_for_poll_interval() {
         let (probe_sender, backend) = scripted_backend();
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
-        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let initial = LifecycleState::reconciling();
-        let (lifecycle_sender, mut lifecycle) = watch::channel(initial);
         probe_sender
             .send(test_reconciliation(
                 RconProbeClassification::Authenticated,
@@ -3341,21 +3329,17 @@ mod tests {
             .expect("startup ready result should queue");
         let config = launch_failure_config();
         let poll_interval = config.poll_interval;
-        let supervisor = tokio::spawn(run(
-            wake_receiver,
-            shutdown_receiver,
-            lifecycle_sender,
-            config,
-            backend,
-            test_backend_use(),
-        ));
-        wait_for_phase(&mut lifecycle, ServerPhase::External).await;
+        let mut supervisor = TestSupervisor::spawn(config, backend);
+        let initial = *supervisor.lifecycle.borrow();
+        wait_for_phase(&mut supervisor.lifecycle, ServerPhase::External).await;
 
-        wake_sender
+        supervisor
+            .wake_sender
             .send(WakeRequest::observed(initial))
             .await
             .expect("stale startup wake should queue");
-        let permit = wake_sender
+        let permit = supervisor
+            .wake_sender
             .reserve()
             .await
             .expect("external monitor should drain the stale wake");
@@ -3367,7 +3351,7 @@ mod tests {
             ))
             .expect("periodic probe result should queue");
         tokio::task::yield_now().await;
-        assert_eq!(lifecycle.borrow().phase, ServerPhase::External);
+        assert_eq!(supervisor.lifecycle.borrow().phase, ServerPhase::External);
 
         tokio::time::advance(
             poll_interval
@@ -3376,66 +3360,44 @@ mod tests {
         )
         .await;
         tokio::task::yield_now().await;
-        assert_eq!(lifecycle.borrow().phase, ServerPhase::External);
+        assert_eq!(supervisor.lifecycle.borrow().phase, ServerPhase::External);
         tokio::time::advance(Duration::from_secs(1)).await;
-        wait_for_phase(&mut lifecycle, ServerPhase::Conflict).await;
+        wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Conflict).await;
 
-        shutdown_sender
-            .send(())
-            .expect("supervisor should still await shutdown");
-        supervisor
-            .await
-            .expect("supervisor task should not panic")
-            .expect("external shutdown should not touch a process");
+        supervisor.shutdown().await;
     }
 
     #[tokio::test(start_paused = true)]
-    async fn external_poll_loss_enters_sticky_conflict_without_launching() {
+    async fn external_poll_loss_enters_sticky_conflict() {
         let (probe_sender, backend) = scripted_backend();
-        let (_wake_sender, wake_receiver) = mpsc::channel(1);
-        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let (lifecycle_sender, mut lifecycle) = watch::channel(LifecycleState::reconciling());
         probe_sender
             .send(test_reconciliation(
                 RconProbeClassification::Authenticated,
                 BackendProbeClassification::Connected,
             ))
             .expect("startup ready result should queue");
-        let supervisor = tokio::spawn(run(
-            wake_receiver,
-            shutdown_receiver,
-            lifecycle_sender,
-            launch_failure_config(),
-            backend,
-            test_backend_use(),
-        ));
-        wait_for_phase(&mut lifecycle, ServerPhase::External).await;
+        let mut supervisor = TestSupervisor::spawn(launch_failure_config(), backend);
+        wait_for_phase(&mut supervisor.lifecycle, ServerPhase::External).await;
         tokio::time::advance(Duration::from_secs(29)).await;
-        assert_eq!(lifecycle.borrow().phase, ServerPhase::External);
+        assert_eq!(supervisor.lifecycle.borrow().phase, ServerPhase::External);
         tokio::time::advance(Duration::from_secs(1)).await;
         tokio::task::yield_now().await;
-        assert_eq!(lifecycle.borrow().phase, ServerPhase::External);
+        assert_eq!(supervisor.lifecycle.borrow().phase, ServerPhase::External);
         probe_sender
             .send(test_reconciliation(
                 RconProbeClassification::Refused,
                 BackendProbeClassification::Refused,
             ))
             .expect("lost external result should queue");
-        wait_for_phase(&mut lifecycle, ServerPhase::Conflict).await;
+        wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Conflict).await;
 
-        assert_eq!(lifecycle.borrow().launch_generation, 0);
-        assert_eq!(lifecycle.borrow().failure, None);
+        assert_eq!(supervisor.lifecycle.borrow().launch_generation, 0);
+        assert_eq!(supervisor.lifecycle.borrow().failure, None);
         assert_eq!(
-            lifecycle.borrow().reconciliation_evidence,
+            supervisor.lifecycle.borrow().reconciliation_evidence,
             ReconciliationEvidence::Positive
         );
-        shutdown_sender
-            .send(())
-            .expect("supervisor should still await shutdown");
-        supervisor
-            .await
-            .expect("supervisor task should not panic")
-            .expect("external shutdown should not touch a process");
+        supervisor.shutdown().await;
     }
 
     #[tokio::test]
@@ -3517,12 +3479,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_during_startup_or_final_reconciliation_prevents_launch() {
+    async fn shutdown_during_reconciliation_prevents_launch() {
         for during_final in [false, true] {
             let (probe_sender, backend) = scripted_backend();
-            let (wake_sender, wake_receiver) = mpsc::channel(1);
-            let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-            let (lifecycle_sender, mut lifecycle) = watch::channel(LifecycleState::reconciling());
             if during_final {
                 probe_sender
                     .send(test_reconciliation(
@@ -3531,31 +3490,19 @@ mod tests {
                     ))
                     .expect("startup clean result should queue");
             }
-            let supervisor = tokio::spawn(run(
-                wake_receiver,
-                shutdown_receiver,
-                lifecycle_sender,
-                launch_failure_config(),
-                backend,
-                test_backend_use(),
-            ));
+            let mut supervisor = TestSupervisor::spawn(launch_failure_config(), backend);
             if during_final {
-                wait_for_phase(&mut lifecycle, ServerPhase::Stopped).await;
-                wake_sender
-                    .send(WakeRequest::observed(*lifecycle.borrow()))
+                wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Stopped).await;
+                supervisor
+                    .wake_sender
+                    .send(WakeRequest::observed(*supervisor.lifecycle.borrow()))
                     .await
                     .expect("stopped wake should queue");
-                wait_for_phase(&mut lifecycle, ServerPhase::Reconciling).await;
+                wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Reconciling).await;
             } else {
                 tokio::task::yield_now().await;
             }
-            shutdown_sender
-                .send(())
-                .expect("supervisor should still await shutdown");
-            supervisor
-                .await
-                .expect("supervisor task should not panic")
-                .expect("reconciliation shutdown should succeed");
+            let lifecycle = supervisor.shutdown().await;
             assert_eq!(lifecycle.borrow().launch_generation, 0);
             assert_eq!(lifecycle.borrow().failure, None);
         }
@@ -3581,16 +3528,16 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn launch_failure_does_not_retry_without_new_demand() {
-        let (wake_sender, shutdown_sender, mut lifecycle, supervisor) =
-            spawn_launch_failure_supervisor();
-        wake_sender
-            .send(WakeRequest::observed(*lifecycle.borrow()))
+    async fn launch_failure_waits_for_new_demand() {
+        let mut supervisor = spawn_launch_failure_supervisor();
+        supervisor
+            .wake_sender
+            .send(WakeRequest::observed(*supervisor.lifecycle.borrow()))
             .await
             .expect("supervisor should accept the initial wake request");
-        wait_for_lifecycle(&mut lifecycle, |state| state.phase == ServerPhase::Cooldown).await;
+        wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Cooldown).await;
 
-        let failure = *lifecycle.borrow();
+        let failure = *supervisor.lifecycle.borrow();
         assert_eq!(failure.failure, Some(FailureCategory::LaunchFailed));
         assert_eq!(failure.failure_streak, 1);
         assert_eq!(failure.launch_generation, 1);
@@ -3603,88 +3550,81 @@ mod tests {
         );
 
         tokio::time::advance(Duration::from_secs(5)).await;
-        wait_for_lifecycle(&mut lifecycle, |state| state.phase == ServerPhase::Stopped).await;
-        assert_eq!(lifecycle.borrow().launch_generation, 1);
-        assert_eq!(lifecycle.borrow().failure_streak, 1);
+        wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Stopped).await;
+        assert_eq!(supervisor.lifecycle.borrow().launch_generation, 1);
+        assert_eq!(supervisor.lifecycle.borrow().failure_streak, 1);
 
-        shutdown_sender
-            .send(())
-            .expect("supervisor should still await shutdown");
-        supervisor
-            .await
-            .expect("supervisor task should not panic")
-            .expect("supervisor shutdown should succeed");
+        supervisor.shutdown().await;
     }
 
     #[tokio::test(start_paused = true)]
-    async fn one_retry_latches_and_additional_demand_coalesces() {
-        let (wake_sender, shutdown_sender, mut lifecycle, supervisor) =
-            spawn_launch_failure_supervisor();
-        wake_sender
-            .send(WakeRequest::observed(*lifecycle.borrow()))
+    async fn retry_demand_latches_once() {
+        let mut supervisor = spawn_launch_failure_supervisor();
+        supervisor
+            .wake_sender
+            .send(WakeRequest::observed(*supervisor.lifecycle.borrow()))
             .await
             .expect("supervisor should accept the initial wake request");
-        wait_for_lifecycle(&mut lifecycle, |state| state.phase == ServerPhase::Cooldown).await;
-        let first_failure = *lifecycle.borrow();
+        wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Cooldown).await;
+        let first_failure = *supervisor.lifecycle.borrow();
 
-        wake_sender
+        supervisor
+            .wake_sender
             .send(WakeRequest::observed(first_failure))
             .await
             .expect("one post-failure wake should latch");
-        let permit = wake_sender
+        let permit = supervisor
+            .wake_sender
             .reserve()
             .await
             .expect("supervisor should consume the latched retry request");
         permit.send(WakeRequest::observed(first_failure));
         for _ in 0..16 {
             assert!(matches!(
-                wake_sender.try_send(WakeRequest::observed(first_failure)),
+                supervisor
+                    .wake_sender
+                    .try_send(WakeRequest::observed(first_failure)),
                 Err(mpsc::error::TrySendError::Full(_))
             ));
         }
 
         tokio::time::advance(Duration::from_secs(5)).await;
-        wait_for_lifecycle(&mut lifecycle, |state| state.failure_streak == 2).await;
-        assert_eq!(lifecycle.borrow().phase, ServerPhase::Cooldown);
-        assert_eq!(lifecycle.borrow().launch_generation, 2);
+        wait_for_lifecycle(&mut supervisor.lifecycle, |state| state.failure_streak == 2).await;
+        assert_eq!(supervisor.lifecycle.borrow().phase, ServerPhase::Cooldown);
+        assert_eq!(supervisor.lifecycle.borrow().launch_generation, 2);
         assert_eq!(
-            lifecycle.borrow().failure,
+            supervisor.lifecycle.borrow().failure,
             Some(FailureCategory::LaunchFailed)
         );
 
         tokio::time::advance(Duration::from_secs(10)).await;
-        wait_for_lifecycle(&mut lifecycle, |state| state.phase == ServerPhase::Stopped).await;
-        assert_eq!(lifecycle.borrow().launch_generation, 2);
+        wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Stopped).await;
+        assert_eq!(supervisor.lifecycle.borrow().launch_generation, 2);
 
-        shutdown_sender
-            .send(())
-            .expect("supervisor should still await shutdown");
-        supervisor
-            .await
-            .expect("supervisor task should not panic")
-            .expect("supervisor shutdown should succeed");
+        supervisor.shutdown().await;
     }
 
     #[tokio::test(start_paused = true)]
-    async fn wake_after_no_demand_expiry_launches_immediately() {
-        let (wake_sender, shutdown_sender, mut lifecycle, supervisor) =
-            spawn_launch_failure_supervisor();
-        wake_sender
-            .send(WakeRequest::observed(*lifecycle.borrow()))
+    async fn wake_after_cooldown_launches_immediately() {
+        let mut supervisor = spawn_launch_failure_supervisor();
+        supervisor
+            .wake_sender
+            .send(WakeRequest::observed(*supervisor.lifecycle.borrow()))
             .await
             .expect("supervisor should accept the initial wake request");
-        wait_for_lifecycle(&mut lifecycle, |state| state.phase == ServerPhase::Cooldown).await;
+        wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Cooldown).await;
 
         tokio::time::advance(Duration::from_secs(5)).await;
-        wait_for_lifecycle(&mut lifecycle, |state| state.phase == ServerPhase::Stopped).await;
-        let expired = *lifecycle.borrow();
-        wake_sender
+        wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Stopped).await;
+        let expired = *supervisor.lifecycle.borrow();
+        supervisor
+            .wake_sender
             .send(WakeRequest::observed(expired))
             .await
             .expect("supervisor should accept later demand");
-        wait_for_lifecycle(&mut lifecycle, |state| state.failure_streak == 2).await;
+        wait_for_lifecycle(&mut supervisor.lifecycle, |state| state.failure_streak == 2).await;
 
-        let failure = *lifecycle.borrow();
+        let failure = *supervisor.lifecycle.borrow();
         assert_eq!(failure.phase, ServerPhase::Cooldown);
         assert_eq!(failure.launch_generation, 2);
         assert_eq!(
@@ -3695,49 +3635,30 @@ mod tests {
             Duration::from_secs(10)
         );
 
-        shutdown_sender
-            .send(())
-            .expect("supervisor should still await shutdown");
-        supervisor
-            .await
-            .expect("supervisor task should not panic")
-            .expect("supervisor shutdown should succeed");
+        supervisor.shutdown().await;
     }
 
     #[tokio::test(start_paused = true)]
     async fn shutdown_interrupts_failure_cooldown() {
-        let (wake_sender, shutdown_sender, mut lifecycle, supervisor) =
-            spawn_launch_failure_supervisor();
-        wake_sender
-            .send(WakeRequest::observed(*lifecycle.borrow()))
+        let mut supervisor = spawn_launch_failure_supervisor();
+        supervisor
+            .wake_sender
+            .send(WakeRequest::observed(*supervisor.lifecycle.borrow()))
             .await
             .expect("supervisor should accept the initial wake request");
-        wait_for_lifecycle(&mut lifecycle, |state| state.phase == ServerPhase::Cooldown).await;
+        wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Cooldown).await;
 
-        shutdown_sender
-            .send(())
-            .expect("supervisor should still await shutdown");
-        supervisor
-            .await
-            .expect("supervisor task should not panic")
-            .expect("supervisor shutdown should succeed");
+        let lifecycle = supervisor.shutdown().await;
         assert_eq!(lifecycle.borrow().phase, ServerPhase::Stopped);
         assert_eq!(lifecycle.borrow().launch_generation, 1);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn wake_channel_closure_interrupts_a_latched_cooldown() {
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
-        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+    async fn wake_channel_closure_interrupts_latched_cooldown() {
         let retry_at = Instant::now() + Duration::from_secs(60);
         let mut cooldown = failed_lifecycle(ServerPhase::Cooldown, 5);
         cooldown.retry_at = Some(retry_at);
-        let (lifecycle_sender, lifecycle) = watch::channel(cooldown);
-        let mut control = SupervisorControl {
-            wake_requests: wake_receiver,
-            shutdown: shutdown_receiver,
-            lifecycle: lifecycle_sender,
-        };
+        let (mut control, wake_sender, shutdown_sender, lifecycle) = test_control(cooldown);
         let (started_sender, started_receiver) = oneshot::channel();
         let waiting = tokio::spawn(async move {
             started_sender
@@ -3763,20 +3684,13 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn startup_timeout_cooldown_starts_after_cleanup_and_latched_wake_waits() {
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
-        let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
+    async fn wake_during_failed_cleanup_latches_for_cooldown() {
         let starting = LifecycleState {
             phase: ServerPhase::Starting,
             launch_generation: 1,
             ..LifecycleState::stopped()
         };
-        let (lifecycle_sender, mut lifecycle) = watch::channel(starting);
-        let mut control = SupervisorControl {
-            wake_requests: wake_receiver,
-            shutdown: shutdown_receiver,
-            lifecycle: lifecycle_sender,
-        };
+        let (mut control, wake_sender, _shutdown_sender, mut lifecycle) = test_control(starting);
         let retry_delay = control.begin_failure_cleanup(FailureCategory::StartupTimedOut);
         let failed_cleanup = *lifecycle.borrow();
         assert_eq!(failed_cleanup.phase, ServerPhase::Stopping);
@@ -3846,17 +3760,17 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn demand_racing_cooldown_expiry_launches_at_most_once() {
-        let (wake_sender, shutdown_sender, mut lifecycle, supervisor) =
-            spawn_launch_failure_supervisor();
-        wake_sender
-            .send(WakeRequest::observed(*lifecycle.borrow()))
+    async fn demand_at_cooldown_expiry_launches_once() {
+        let mut supervisor = spawn_launch_failure_supervisor();
+        supervisor
+            .wake_sender
+            .send(WakeRequest::observed(*supervisor.lifecycle.borrow()))
             .await
             .expect("supervisor should accept the initial wake request");
-        wait_for_lifecycle(&mut lifecycle, |state| state.phase == ServerPhase::Cooldown).await;
-        let failure = *lifecycle.borrow();
+        wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Cooldown).await;
+        let failure = *supervisor.lifecycle.borrow();
         let retry_at = failure.retry_at.expect("failure should have a deadline");
-        let racing_sender = wake_sender.clone();
+        let racing_sender = supervisor.wake_sender.clone();
         let demand = tokio::spawn(async move {
             sleep_until(retry_at).await;
             racing_sender
@@ -3867,47 +3781,32 @@ mod tests {
 
         tokio::time::advance(Duration::from_secs(5)).await;
         demand.await.expect("racing demand task should not panic");
-        wait_for_lifecycle(&mut lifecycle, |state| state.failure_streak == 2).await;
-        assert_eq!(lifecycle.borrow().launch_generation, 2);
+        wait_for_lifecycle(&mut supervisor.lifecycle, |state| state.failure_streak == 2).await;
+        assert_eq!(supervisor.lifecycle.borrow().launch_generation, 2);
 
         tokio::task::yield_now().await;
-        assert_eq!(lifecycle.borrow().launch_generation, 2);
-        shutdown_sender
-            .send(())
-            .expect("supervisor should still await shutdown");
-        supervisor
-            .await
-            .expect("supervisor task should not panic")
-            .expect("supervisor shutdown should succeed");
+        assert_eq!(supervisor.lifecycle.borrow().launch_generation, 2);
+        supervisor.shutdown().await;
     }
 
     #[tokio::test]
     async fn startup_timeout_enters_retryable_failure_cleanup() {
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
-        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let (lifecycle_sender, mut lifecycle) = watch::channel(LifecycleState::reconciling());
         let (rcon_address, backend) = refused_endpoints();
         let mut config = test_config(&rcon_address);
         config.startup_timeout = Duration::from_millis(50);
         config.command_timeout = Duration::from_millis(10);
         config.retry_interval = Duration::from_millis(10);
-        let supervisor = tokio::spawn(run(
-            wake_receiver,
-            shutdown_receiver,
-            lifecycle_sender,
-            config,
-            backend,
-            test_backend_use(),
-        ));
+        let mut supervisor = TestSupervisor::spawn(config, backend);
 
-        wake_sender
-            .send(WakeRequest::observed(*lifecycle.borrow()))
+        supervisor
+            .wake_sender
+            .send(WakeRequest::observed(*supervisor.lifecycle.borrow()))
             .await
             .expect("supervisor should accept the initial wake request");
-        wait_for_phase(&mut lifecycle, ServerPhase::Starting).await;
-        wait_for_phase(&mut lifecycle, ServerPhase::Cooldown).await;
+        wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Starting).await;
+        wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Cooldown).await;
 
-        let failure = *lifecycle.borrow();
+        let failure = *supervisor.lifecycle.borrow();
         assert_eq!(failure.failure, Some(FailureCategory::StartupTimedOut));
         assert_eq!(failure.failure_streak, 1);
         assert_eq!(
@@ -3918,13 +3817,7 @@ mod tests {
             Duration::from_secs(5)
         );
 
-        shutdown_sender
-            .send(())
-            .expect("supervisor should still await shutdown");
-        supervisor
-            .await
-            .expect("supervisor task should not panic")
-            .expect("supervisor shutdown should succeed");
+        supervisor.shutdown().await;
     }
 
     #[tokio::test]
@@ -3965,7 +3858,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_rcon_backend_readiness_and_shutdown_use_owned_console() {
+    async fn no_rcon_uses_tcp_readiness_and_console_stop() {
         let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_address = backend_listener.local_addr().unwrap();
         let backend = BackendEndpoint::network(
@@ -4080,7 +3973,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn no_rcon_idle_stop_waits_for_exclusive_and_sends_no_rcon_traffic() {
+    async fn no_rcon_idle_stop_uses_only_proxy_activity() {
         let rcon_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut config = no_rcon_config();
         config.idle_timeout = Duration::from_secs(1);
@@ -4131,7 +4024,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rcon_stop_failure_falls_back_to_exact_console_stop() {
+    async fn rcon_stop_failure_falls_back_to_console() {
         let mut config = no_rcon_config();
         let refused_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let refused_address = endpoint(refused_listener.local_addr().unwrap());
@@ -4184,7 +4077,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rapid_post_readiness_exits_escalate_the_retained_streak() {
+    async fn rapid_exits_increase_failure_streak() {
         let (_wake_sender, wake_receiver) = mpsc::channel(1);
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let initial = failed_lifecycle(ServerPhase::Stopped, 1);
@@ -4232,7 +4125,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn delayed_stability_check_retains_streak_for_an_already_exited_child() {
+    async fn exited_child_does_not_pass_stability_window() {
         let exit_listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test exit-signal listener should bind");
@@ -4326,7 +4219,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn stable_running_resets_the_streak_before_an_unexpected_exit() {
+    async fn stability_window_resets_failure_streak() {
         let (rcon_address, first_poll, rcon_server) = spawn_player_count_rcon_server(1).await;
         let config = stable_exit_config(&rcon_address);
         let child =
@@ -4385,7 +4278,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_readiness_player_and_stop_use_separate_rcon_sessions() {
+    async fn rcon_readiness_poll_and_stop_use_separate_sessions() {
         let (rcon_address, mut events, rcon_server) =
             spawn_scripted_list_rcon_server(vec![player_count_reply(0), player_count_reply(0)])
                 .await;
@@ -4457,7 +4350,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn idle_stop_waits_for_exclusive_and_runs_a_distinct_final_rcon_check() {
+    async fn idle_stop_takes_exclusive_lock_and_rechecks_rcon() {
         let (rcon_address, mut events, rcon_server) =
             spawn_scripted_list_rcon_server(vec![player_count_reply(0), player_count_reply(0)])
                 .await;
@@ -4542,7 +4435,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn timed_out_final_rcon_is_discarded_before_shutdown_cleanup() {
+    async fn timed_out_final_rcon_is_discarded() {
         let (final_started, final_started_receiver) = oneshot::channel();
         let (rcon_address, mut events, rcon_server) = spawn_scripted_list_rcon_server(vec![
             player_count_reply(0),
@@ -4657,7 +4550,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn shutdown_cancels_final_rcon_without_reusing_its_client_for_stop() {
+    async fn shutdown_discards_pending_final_rcon_client() {
         let (final_started, final_started_receiver) = oneshot::channel();
         let (rcon_address, mut events, rcon_server) = spawn_scripted_list_rcon_server(vec![
             player_count_reply(0),
@@ -4714,7 +4607,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn positive_and_unknown_evidence_restart_the_continuous_zero_interval() {
+    async fn nonzero_or_unknown_rcon_resets_zero_interval() {
         for first_reply in [
             player_count_reply(3),
             TestListReply::Body("not a player count".to_owned()),
@@ -4749,7 +4642,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn stability_window_and_shutdown_are_handled_while_exclusivity_is_pending() {
+    async fn pending_idle_lock_handles_stability_and_shutdown() {
         let (rcon_address, mut events, rcon_server) =
             spawn_scripted_list_rcon_server(vec![player_count_reply(0)]).await;
         let mut config = test_config(&rcon_address);
@@ -4913,7 +4806,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn controlled_idle_stop_resets_the_failure_streak() {
+    async fn idle_stop_resets_failure_streak() {
         let (rcon_address, rcon_ready, rcon_server) = spawn_test_rcon_server().await;
         let config = test_config(&rcon_address);
         let child = process::launch(&config.launch).expect("test server process should launch");
@@ -4943,7 +4836,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_wait_error_is_fatal_after_successful_cleanup() {
+    async fn wait_error_is_fatal_after_cleanup() {
         let config = test_config(&Endpoint::new("127.0.0.1", 9));
         let child = process::launch(&config.launch).expect("test server process should launch");
         let (_wake_sender, wake_receiver) = mpsc::channel(1);
@@ -4979,7 +4872,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn failed_process_cleanup_error_is_fatal_without_cooldown() {
+    async fn failed_cleanup_error_is_fatal() {
         let (_wake_sender, wake_receiver) = mpsc::channel(1);
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let starting = LifecycleState {
@@ -5012,7 +4905,7 @@ mod tests {
     }
 
     #[test]
-    fn starting_and_running_wakes_cannot_start_a_later_cycle() {
+    fn active_phase_wakes_cannot_start_new_cycle() {
         let stopped = LifecycleState {
             phase: ServerPhase::Stopped,
             launch_generation: 1,
@@ -5087,7 +4980,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stopped_and_starting_wake_bursts_launch_only_one_child() {
+    async fn wake_bursts_launch_one_child() {
         let (wake_sender, wake_receiver) = mpsc::channel(1);
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let (lifecycle_sender, mut lifecycle) = watch::channel(LifecycleState::reconciling());
@@ -5189,7 +5082,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stopping_wake_flood_cannot_starve_cleanup() {
+    async fn stopping_wake_flood_does_not_starve_cleanup() {
         let (rcon_address, rcon_ready, rcon_server) = spawn_test_rcon_server().await;
         let config = test_config(&rcon_address);
         let child = process::launch(&config.launch).expect("test server process should launch");
@@ -5255,7 +5148,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_overrides_a_stopping_phase_restart() {
+    async fn shutdown_overrides_pending_restart() {
         let (rcon_address, rcon_ready, rcon_server) = spawn_test_rcon_server().await;
         let config = test_config(&rcon_address);
         let child = process::launch(&config.launch).expect("test server process should launch");

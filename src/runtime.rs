@@ -1097,7 +1097,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lifecycle_change_at_replay_completion_cannot_establish_a_session() {
+    async fn cycle_change_at_replay_completion_rejects_session() {
         let (wake_sender, _wake_receiver) = mpsc::channel(1);
         let (context, lifecycle_authority) =
             client_context_with_lifecycle(ServerPhase::Running, wake_sender, 9);
@@ -1122,7 +1122,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concrete_replay_failure_creates_no_session_or_disconnect_timestamp() {
+    async fn failed_replay_records_no_session_activity() {
         let (wake_sender, _wake_receiver) = mpsc::channel(1);
         let (context, _lifecycle_authority) =
             client_context_with_lifecycle(ServerPhase::Running, wake_sender, 9);
@@ -1304,7 +1304,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn login_transfer_and_cooldown_requests_preserve_wake_semantics() {
+    async fn sleeping_login_transfer_and_cooldown_queue_wakes() {
         for (phase, intent) in [
             (ServerPhase::Stopped, 2),
             (ServerPhase::Stopped, 3),
@@ -1563,7 +1563,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn binding_is_inert_and_activation_starts_one_reconciliation_supervisor() {
+    async fn binding_is_inert_until_activation() {
         let rcon_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let launch_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1704,7 +1704,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn separately_activated_runtimes_share_the_injected_semaphore() {
+    async fn activated_runtimes_share_connection_limit() {
         let executable = std::env::current_exe().expect("test executable path should be known");
         let connection_limit = Arc::new(Semaphore::new(1));
         let first = ServerRuntime::prepare(
@@ -1784,7 +1784,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lifecycle_is_reconciling_before_the_supervisor_can_publish() {
+    async fn activation_starts_in_reconciling_phase() {
         let rcon_listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test RCON listener should bind");
@@ -2017,7 +2017,7 @@ mod tests {
     }
 
     #[test]
-    fn default_shutdown_cleanup_fits_within_supervisor_watchdog() {
+    fn default_cleanup_fits_watchdog() {
         let command_delivery = Duration::from_secs(10);
         let graceful_exit = Duration::from_secs(30);
         let forced_reaping = Duration::from_secs(5);
