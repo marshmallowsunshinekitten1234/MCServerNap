@@ -2233,6 +2233,7 @@ mod tests {
     const TEST_AUTH_RESPONSE: i32 = 2;
     const TEST_EXEC_COMMAND: i32 = 2;
     const TEST_RESPONSE_VALUE: i32 = 0;
+    const TEST_RCON_END_MARKER_DELAY: Duration = Duration::from_millis(3);
 
     #[derive(Debug)]
     struct TestRconPacket {
@@ -2253,6 +2254,86 @@ mod tests {
         Stop,
         Closed,
     }
+
+    struct PausedTimeAutoAdvanceGuard {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        blocking_task: JoinHandle<()>,
+    }
+
+    impl PausedTimeAutoAdvanceGuard {
+        async fn start() -> Self {
+            let (started_sender, started_receiver) = oneshot::channel();
+            let (release, wait_for_release) = std::sync::mpsc::channel();
+            let blocking_task = tokio::task::spawn_blocking(move || {
+                let _ = started_sender.send(());
+                let _ = wait_for_release.recv();
+            });
+            started_receiver
+                .await
+                .expect("paused-time auto-advance inhibitor should start");
+
+            Self {
+                release: Some(release),
+                blocking_task,
+            }
+        }
+
+        fn release(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+        }
+
+        async fn finish(mut self) {
+            self.release();
+            (&mut self.blocking_task)
+                .await
+                .expect("paused-time auto-advance inhibitor should not panic");
+        }
+    }
+
+    impl Drop for PausedTimeAutoAdvanceGuard {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    struct ScriptedRconServer {
+        task: Option<JoinHandle<()>>,
+    }
+
+    impl ScriptedRconServer {
+        fn abort(&self) {
+            self.task
+                .as_ref()
+                .expect("scripted RCON server task should be present")
+                .abort();
+        }
+
+        async fn join(mut self) -> std::result::Result<(), tokio::task::JoinError> {
+            let result = self
+                .task
+                .as_mut()
+                .expect("scripted RCON server task should be present")
+                .await;
+            self.task.take();
+            result
+        }
+    }
+
+    impl Drop for ScriptedRconServer {
+        fn drop(&mut self) {
+            if let Some(task) = &self.task {
+                task.abort();
+            }
+        }
+    }
+
+    type ScriptedRconFixture = (
+        Endpoint,
+        mpsc::UnboundedReceiver<TestRconEvent>,
+        ScriptedRconServer,
+    );
 
     async fn try_read_test_rcon_packet(stream: &mut TcpStream) -> std::io::Result<TestRconPacket> {
         let length = stream.read_i32_le().await?;
@@ -2307,30 +2388,33 @@ mod tests {
             .expect("test RCON packet terminators should be written");
     }
 
-    async fn spawn_scripted_list_rcon_server(
-        replies: Vec<TestListReply>,
-    ) -> (
-        Endpoint,
-        mpsc::UnboundedReceiver<TestRconEvent>,
-        JoinHandle<()>,
-    ) {
+    async fn accept_authenticated_test_rcon_client(listener: &TcpListener) -> TcpStream {
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .expect("test RCON client should connect");
+        let auth = read_test_rcon_packet(&mut stream).await;
+        assert_eq!(auth.kind, TEST_AUTH);
+        assert_eq!(auth.body, b"secret");
+        write_test_rcon_packet(&mut stream, auth.id, TEST_AUTH_RESPONSE, b"").await;
+        stream
+    }
+
+    async fn spawn_scripted_list_rcon_server(replies: Vec<TestListReply>) -> ScriptedRconFixture {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test RCON listener should bind");
         let address = endpoint(listener.local_addr().unwrap());
         let (events, event_receiver) = mpsc::unbounded_channel();
-        let server = tokio::spawn(async move {
+        // Tokio keeps paused time fixed while a blocking task is active, but explicit time
+        // advances remain available to tests that exercise idle deadlines.
+        let auto_advance_guard = PausedTimeAutoAdvanceGuard::start().await;
+        let task = tokio::spawn(async move {
+            let auto_advance_guard = auto_advance_guard;
             let mut replies = std::collections::VecDeque::from(replies);
             let mut list_index = 0;
             'connections: loop {
-                let (mut stream, _) = listener
-                    .accept()
-                    .await
-                    .expect("test RCON client should connect");
-                let auth = read_test_rcon_packet(&mut stream).await;
-                assert_eq!(auth.kind, TEST_AUTH);
-                assert_eq!(auth.body, b"secret");
-                write_test_rcon_packet(&mut stream, auth.id, TEST_AUTH_RESPONSE, b"").await;
+                let mut stream = accept_authenticated_test_rcon_client(&listener).await;
 
                 loop {
                     let command = match try_read_test_rcon_packet(&mut stream).await {
@@ -2354,6 +2438,9 @@ mod tests {
                         break 'connections;
                     }
                     assert_eq!(command.body, b"list");
+                    // RconClient intentionally paces its end marker; the inhibitor makes that
+                    // otherwise automatic virtual-time advance explicit.
+                    tokio::time::advance(TEST_RCON_END_MARKER_DELAY).await;
                     let end_marker = read_test_rcon_packet(&mut stream).await;
                     assert_eq!(end_marker.kind, TEST_EXEC_COMMAND);
                     assert!(end_marker.body.is_empty());
@@ -2409,8 +2496,13 @@ mod tests {
                     }
                 }
             }
+            auto_advance_guard.finish().await;
         });
-        (address, event_receiver, server)
+        (
+            address,
+            event_receiver,
+            ScriptedRconServer { task: Some(task) },
+        )
     }
 
     async fn spawn_test_rcon_server() -> (Endpoint, oneshot::Receiver<()>, JoinHandle<()>) {
@@ -2803,6 +2895,59 @@ mod tests {
         }
     }
 
+    async fn initially_polled_player_inspection(config: &SupervisorConfig) -> PlayerInspection {
+        let rcon_endpoint = &config
+            .rcon
+            .as_ref()
+            .expect("test configuration should enable RCON")
+            .endpoint;
+        let mut player_inspection = connected_player_inspection(rcon_endpoint).await;
+        poll_player_presence(&mut player_inspection, config).await;
+        player_inspection
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scripted_rcon_io_inhibits_automatic_but_not_manual_time_advance() {
+        let started_at = Instant::now();
+        let (rcon_address, mut events, rcon_server) =
+            spawn_scripted_list_rcon_server(vec![player_count_reply(0)]).await;
+        let config = test_config(&rcon_address);
+        let mut player_inspection = connected_player_inspection(&rcon_address).await;
+
+        poll_player_presence(&mut player_inspection, &config).await;
+        assert_eq!(events.recv().await, Some(TestRconEvent::List(1)));
+        assert_eq!(Instant::now() - started_at, TEST_RCON_END_MARKER_DELAY);
+
+        let idle_deadline = tokio::time::sleep(Duration::from_secs(1));
+        tokio::pin!(idle_deadline);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        idle_deadline.await;
+        assert_eq!(
+            Instant::now() - started_at,
+            Duration::from_secs(1) + TEST_RCON_END_MARKER_DELAY
+        );
+
+        drop(player_inspection);
+        assert_eq!(events.recv().await, Some(TestRconEvent::Closed));
+        rcon_server.abort();
+        assert!(rcon_server.join().await.unwrap_err().is_cancelled());
+
+        let cleanup_finished_at = Instant::now();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(Instant::now() - cleanup_finished_at, Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_scripted_rcon_server_releases_time_inhibitor() {
+        let started_at = Instant::now();
+        let (_rcon_address, events, rcon_server) =
+            spawn_scripted_list_rcon_server(Vec::new()).await;
+
+        drop((events, rcon_server));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(Instant::now() - started_at, Duration::from_secs(1));
+    }
+
     async fn assert_final_rcon_veto(reply: TestListReply) {
         let (rcon_address, mut events, rcon_server) =
             spawn_scripted_list_rcon_server(vec![player_count_reply(0), reply]).await;
@@ -2821,7 +2966,7 @@ mod tests {
         };
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
-        let player_inspection = connected_player_inspection(&rcon_address).await;
+        let player_inspection = initially_polled_player_inspection(&config).await;
         let monitor_backend_use = Arc::clone(&backend_use);
         let monitor = tokio::spawn(async move {
             monitor_running_server(
@@ -2855,6 +3000,7 @@ mod tests {
         assert_eq!(events.recv().await, Some(TestRconEvent::Closed));
         assert_eq!(events.recv().await, Some(TestRconEvent::Stop));
         rcon_server
+            .join()
             .await
             .expect("test RCON server should not panic");
     }
@@ -4309,7 +4455,7 @@ mod tests {
             .expect("test RCON server should not panic");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn rcon_readiness_poll_and_stop_use_separate_sessions() {
         let (rcon_address, mut events, rcon_server) =
             spawn_scripted_list_rcon_server(vec![player_count_reply(0), player_count_reply(0)])
@@ -4350,12 +4496,10 @@ mod tests {
             .effective_idle_anchor(backend_use.activity_snapshot())
             .expect("confirmed zero players should establish an idle anchor");
 
-        tokio::time::pause();
         tokio::time::advance(Duration::from_millis(29)).await;
         assert_eq!(lifecycle.borrow().phase, ServerPhase::Running);
         assert!(Instant::now() < idle_anchor + config.idle_timeout);
         tokio::time::advance(Duration::from_millis(1)).await;
-        tokio::time::resume();
 
         let outcome = attempt_expired_idle_stop(
             &mut child,
@@ -4370,6 +4514,7 @@ mod tests {
         assert_eq!(events.recv().await, Some(TestRconEvent::List(2)));
         assert_eq!(events.recv().await, Some(TestRconEvent::Closed));
         drop(state);
+        tokio::time::resume();
 
         let outcome = stop_committed_idle_server(child, &mut control, &config)
             .await
@@ -4378,7 +4523,7 @@ mod tests {
         assert_eq!(lifecycle.borrow().phase, ServerPhase::Stopping);
         assert_eq!(events.recv().await, Some(TestRconEvent::Stop));
         drop(wake_sender);
-        rcon_server.await.unwrap();
+        rcon_server.join().await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -4402,7 +4547,7 @@ mod tests {
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
         let replay_lease = backend_use.acquire_shared(cycle).await;
-        let player_inspection = connected_player_inspection(&rcon_address).await;
+        let player_inspection = initially_polled_player_inspection(&config).await;
         let monitor_backend_use = Arc::clone(&backend_use);
         let monitor = tokio::spawn(async move {
             monitor_running_server(
@@ -4434,6 +4579,7 @@ mod tests {
         drop(replay_lease);
 
         assert_eq!(events.recv().await, Some(TestRconEvent::List(2)));
+        tokio::time::resume();
         wait_for_phase(&mut lifecycle, ServerPhase::Stopping).await;
         let stopping_started_at = lifecycle.borrow().phase_started_at;
         assert_eq!(events.recv().await, Some(TestRconEvent::Closed));
@@ -4447,6 +4593,7 @@ mod tests {
         assert_eq!(lifecycle.borrow().phase_started_at, stopping_started_at);
         drop(wake_sender);
         rcon_server
+            .join()
             .await
             .expect("test RCON server should not panic");
     }
@@ -4492,7 +4639,7 @@ mod tests {
         };
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
-        let player_inspection = connected_player_inspection(&rcon_address).await;
+        let player_inspection = initially_polled_player_inspection(&config).await;
         let monitor_backend_use = Arc::clone(&backend_use);
         let monitor = tokio::spawn(async move {
             monitor_running_server(
@@ -4516,12 +4663,13 @@ mod tests {
         drop(observation);
         assert_eq!(events.recv().await, Some(TestRconEvent::Closed));
 
+        tokio::time::resume();
         shutdown_sender.send(()).unwrap();
         let outcome = monitor.await.unwrap().unwrap();
         assert_eq!(outcome, CycleOutcome::Shutdown);
         assert_eq!(events.recv().await, Some(TestRconEvent::Stop));
         drop(wake_sender);
-        rcon_server.await.unwrap();
+        rcon_server.join().await.unwrap();
         assert!(matches!(
             events.try_recv(),
             Err(mpsc::error::TryRecvError::Disconnected)
@@ -4578,7 +4726,7 @@ mod tests {
         assert_eq!(outcome, CycleOutcome::Shutdown);
         assert_eq!(events.recv().await, Some(TestRconEvent::Stop));
         drop(wake_sender);
-        rcon_server.await.unwrap();
+        rcon_server.join().await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -4607,7 +4755,7 @@ mod tests {
         };
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
-        let player_inspection = connected_player_inspection(&rcon_address).await;
+        let player_inspection = initially_polled_player_inspection(&config).await;
         let monitor = tokio::spawn(async move {
             monitor_running_server(
                 child,
@@ -4624,6 +4772,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         final_started_receiver.await.unwrap();
         assert_eq!(events.recv().await, Some(TestRconEvent::List(2)));
+        tokio::time::resume();
         shutdown_sender.send(()).unwrap();
         assert_eq!(events.recv().await, Some(TestRconEvent::Closed));
         let outcome = monitor.await.unwrap().unwrap();
@@ -4631,7 +4780,7 @@ mod tests {
         assert_eq!(lifecycle.borrow().phase, ServerPhase::Stopping);
         assert_eq!(events.recv().await, Some(TestRconEvent::Stop));
         drop(wake_sender);
-        rcon_server.await.unwrap();
+        rcon_server.join().await.unwrap();
         assert!(matches!(
             events.try_recv(),
             Err(mpsc::error::TryRecvError::Disconnected)
@@ -4669,7 +4818,7 @@ mod tests {
 
             drop(player_inspection);
             rcon_server.abort();
-            assert!(rcon_server.await.unwrap_err().is_cancelled());
+            assert!(rcon_server.join().await.unwrap_err().is_cancelled());
         }
     }
 
@@ -4693,7 +4842,7 @@ mod tests {
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
         let blocking_reader = backend_use.acquire_shared(cycle).await;
-        let player_inspection = connected_player_inspection(&rcon_address).await;
+        let player_inspection = initially_polled_player_inspection(&config).await;
         let monitor = tokio::spawn(async move {
             monitor_running_server(
                 child,
@@ -4722,13 +4871,14 @@ mod tests {
             Err(mpsc::error::TryRecvError::Empty)
         ));
 
+        tokio::time::resume();
         shutdown_sender.send(()).unwrap();
         assert_eq!(events.recv().await, Some(TestRconEvent::Closed));
         assert_eq!(events.recv().await, Some(TestRconEvent::Stop));
         let outcome = monitor.await.unwrap().unwrap();
         assert_eq!(outcome, CycleOutcome::Shutdown);
         drop((blocking_reader, wake_sender));
-        rcon_server.await.unwrap();
+        rcon_server.join().await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -4754,7 +4904,7 @@ mod tests {
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
         let blocking_reader = backend_use.acquire_shared(cycle).await;
-        let player_inspection = connected_player_inspection(&rcon_address).await;
+        let player_inspection = initially_polled_player_inspection(&config).await;
         let monitor = tokio::spawn(async move {
             monitor_running_server(
                 child,
@@ -4777,7 +4927,7 @@ mod tests {
         assert_eq!(lifecycle.borrow().phase, ServerPhase::Cooldown);
         drop((blocking_reader, wake_sender));
         rcon_server.abort();
-        assert!(rcon_server.await.unwrap_err().is_cancelled());
+        assert!(rcon_server.join().await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test(start_paused = true)]
@@ -4809,7 +4959,7 @@ mod tests {
         };
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
-        let player_inspection = connected_player_inspection(&rcon_address).await;
+        let player_inspection = initially_polled_player_inspection(&config).await;
         let monitor = tokio::spawn(async move {
             monitor_running_server(
                 child,
@@ -4834,7 +4984,7 @@ mod tests {
         assert_eq!(lifecycle.borrow().phase, ServerPhase::Cooldown);
         drop(wake_sender);
         rcon_server.abort();
-        assert!(rcon_server.await.unwrap_err().is_cancelled());
+        assert!(rcon_server.join().await.unwrap_err().is_cancelled());
     }
 
     #[tokio::test]
