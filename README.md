@@ -57,6 +57,30 @@ name and set each named environment variable before starting the daemon.
 
 Stop the daemon with Ctrl+C. On Unix, SIGTERM is also supported.
 
+## Local status commands
+
+The daemon exposes a versioned, read-only local control endpoint. Run these
+commands as the same operating-system account that started the daemon. If a
+system service runs the daemon under a dedicated account, run these commands as
+that account too.
+
+List configured server IDs or inspect one lifecycle status without loading the
+daemon configuration:
+
+```console
+target/release/mcservernap list
+target/release/mcservernap status survival
+```
+
+Only the server ID, lifecycle phase, failure category and streak, and remaining
+retry delay are returned. Control requests cannot start, stop, or otherwise
+change a server.
+
+Control commands are available only on the local machine. On Unix, one daemon
+is supported per user account. On Windows, access is controlled by that
+account's Windows permissions; machine administrators and LocalSystem remain
+privileged.
+
 ## How it behaves
 
 - Server-list status requests show the configured sleeping MOTD and do not wake
