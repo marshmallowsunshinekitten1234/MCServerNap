@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 use std::time::Duration;
+use std::{fmt::Write as _, io::Write as _};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use mcservernap::control;
 use mcservernap::coordinator::DaemonCoordinator;
 use mcservernap::endpoint::Endpoint;
 use mcservernap::rcon::RconClient;
@@ -32,6 +34,13 @@ struct Cli {
 enum Commands {
     /// Listen on every configured public endpoint and manage its backend.
     Listen,
+    /// List the server IDs exposed by the daemon for this OS principal.
+    List,
+    /// Show the daemon's current lifecycle status for one server.
+    Status {
+        /// Configured server ID.
+        server_id: String,
+    },
     /// Send `stop` directly to an already-running Minecraft server via RCON.
     Stop {
         /// Host or IP of the Minecraft RCON endpoint.
@@ -59,12 +68,64 @@ async fn main() -> Result<()> {
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Listen => DaemonCoordinator::run(&cli.config).await,
+        Commands::List => {
+            print_output(&format_list(&control::list().await?))?;
+            Ok(())
+        }
+        Commands::Status { server_id } => {
+            let status = control::status(server_id).await?;
+            print_output(&format_status(
+                status.server_id(),
+                status.phase(),
+                status.failure_category(),
+                status.failure_streak(),
+                status.retry_after_ms(),
+            ))?;
+            Ok(())
+        }
         Commands::Stop {
             rcon_host,
             rcon_port,
             rcon_pass,
         } => stop_via_rcon(&Endpoint::new(rcon_host, rcon_port), &rcon_pass).await,
     }
+}
+
+fn print_output(output: &str) -> Result<()> {
+    std::io::stdout()
+        .write_all(output.as_bytes())
+        .context("failed to write command output")
+}
+
+fn format_list(server_ids: &[String]) -> String {
+    let mut output = String::new();
+    for server_id in server_ids {
+        writeln!(output, "{server_id}").expect("writing to a String cannot fail");
+    }
+    output
+}
+
+fn format_status(
+    server_id: &str,
+    phase: &str,
+    failure_category: Option<&str>,
+    failure_streak: u32,
+    retry_after_ms: Option<u64>,
+) -> String {
+    let mut output = format!("server: {server_id}\nphase: {phase}\n");
+    if let Some(failure) = failure_category {
+        writeln!(output, "failure: {failure}").expect("writing to a String cannot fail");
+    }
+    writeln!(output, "failure streak: {failure_streak}").expect("writing to a String cannot fail");
+    if let Some(retry_after_ms) = retry_after_ms {
+        writeln!(
+            output,
+            "retry after: {:?}",
+            Duration::from_millis(retry_after_ms)
+        )
+        .expect("writing to a String cannot fail");
+    }
+    output
 }
 
 async fn stop_via_rcon(endpoint: &Endpoint, password: &str) -> Result<()> {
@@ -99,6 +160,56 @@ mod tests {
             .expect("configuration-only listen command should parse");
         assert!(matches!(cli.command, Commands::Listen));
         assert_eq!(cli.config, PathBuf::from("config/cfg.toml"));
+    }
+
+    #[test]
+    fn parses_read_only_control_commands_and_retains_clap_usage_exit_two() {
+        let list =
+            Cli::try_parse_from(["mcservernap", "--config", "definitely-invalid.toml", "list"])
+                .unwrap();
+        assert!(matches!(list.command, Commands::List));
+
+        let status = Cli::try_parse_from([
+            "mcservernap",
+            "--config",
+            "definitely-invalid.toml",
+            "status",
+            "survival",
+        ])
+        .unwrap();
+        assert!(matches!(
+            status.command,
+            Commands::Status { ref server_id } if server_id == "survival"
+        ));
+        assert_eq!(
+            Cli::try_parse_from(["mcservernap", "status"])
+                .err()
+                .unwrap()
+                .exit_code(),
+            2
+        );
+    }
+
+    #[test]
+    fn list_and_status_human_output_is_deterministic() {
+        assert_eq!(
+            format_list(&["creative".to_owned(), "survival".to_owned()]),
+            "creative\nsurvival\n"
+        );
+        assert_eq!(
+            format_status(
+                "survival",
+                "cooldown",
+                Some("launch_failed"),
+                2,
+                Some(8_400)
+            ),
+            "server: survival\nphase: cooldown\nfailure: launch_failed\nfailure streak: 2\nretry after: 8.4s\n"
+        );
+        assert_eq!(
+            format_status("creative", "running", None, 0, None),
+            "server: creative\nphase: running\nfailure streak: 0\n"
+        );
     }
 
     #[tokio::test]
