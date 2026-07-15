@@ -80,6 +80,14 @@ pub(crate) struct LifecycleState {
     reconciliation_evidence: ReconciliationEvidence,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct LifecycleStatusSnapshot {
+    pub(crate) phase: ServerPhase,
+    pub(crate) failure: Option<FailureCategory>,
+    pub(crate) failure_streak: u32,
+    pub(crate) retry_at: Option<Instant>,
+}
+
 impl LifecycleState {
     pub(crate) fn reconciling() -> Self {
         Self {
@@ -110,6 +118,15 @@ impl LifecycleState {
         self.phase
     }
 
+    pub(crate) const fn status_snapshot(self) -> LifecycleStatusSnapshot {
+        LifecycleStatusSnapshot {
+            phase: self.phase,
+            failure: self.failure,
+            failure_streak: self.failure_streak,
+            retry_at: self.retry_at,
+        }
+    }
+
     pub(crate) fn owned_running_cycle(self) -> Option<BackendCycle> {
         (self.phase == ServerPhase::Running)
             .then(|| BackendCycle::from_launch_generation(self.launch_generation))
@@ -129,6 +146,21 @@ impl LifecycleState {
         };
         assert!(state.invariant_holds());
         state
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_status(
+        phase: ServerPhase,
+        failure: Option<FailureCategory>,
+        failure_streak: u32,
+        retry_at: Option<Instant>,
+    ) -> Self {
+        Self {
+            failure,
+            failure_streak,
+            retry_at,
+            ..Self::test_phase(phase)
+        }
     }
 
     fn invariant_holds(self) -> bool {

@@ -14,12 +14,43 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use crate::config;
 use crate::context::ServerContext;
-use crate::runtime::{BoundServerRuntime, PreparedServerRuntime, ServerRuntime};
+use crate::control::{BoundEndpoint, ControlServer, InstanceLock, PreparedRegistry};
+use crate::runtime::{
+    ActivatedServerRuntime, BoundServerRuntime, PreparedServerRuntime, ServerRuntime,
+};
 
 #[derive(Clone)]
 struct Shutdown {
     state: watch::Sender<bool>,
     failures: Arc<Mutex<FatalErrors>>,
+}
+
+#[derive(Clone)]
+struct RuntimeStop {
+    state: watch::Sender<bool>,
+}
+
+impl RuntimeStop {
+    fn new() -> Self {
+        let (state, _) = watch::channel(false);
+        Self { state }
+    }
+
+    fn request(&self) {
+        self.state.send_replace(true);
+    }
+
+    async fn wait(&self) {
+        let mut receiver = self.state.subscribe();
+        if *receiver.borrow() {
+            return;
+        }
+        while receiver.changed().await.is_ok() {
+            if *receiver.borrow_and_update() {
+                return;
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -231,10 +262,13 @@ pub struct DaemonCoordinator;
 
 struct PreparedDaemon {
     servers: BTreeMap<String, (ServerContext, PreparedServerRuntime)>,
+    control: PreparedRegistry,
 }
 
 struct BoundDaemon {
     servers: Vec<(ServerContext, BoundServerRuntime)>,
+    control: Option<PreparedRegistry>,
+    control_endpoint: Option<BoundEndpoint>,
     #[cfg(test)]
     runtime_overrides: VecDeque<RuntimeOverride>,
 }
@@ -248,14 +282,19 @@ impl DaemonCoordinator {
         let shutdown = Shutdown::new();
         let (fatal_sender, fatal_receiver) = mpsc::unbounded_channel();
         let mut signals = SignalWatcher::arm(shutdown.clone(), fatal_sender).await?;
-        let bound = prepared.bind_all().await?;
+        let instance_lock = InstanceLock::acquire()?;
+        let mut bound = prepared.bind_all().await?;
+        bound.control_endpoint = Some(instance_lock.bind()?);
         bound
             .activate_and_run(shutdown, fatal_receiver, &mut signals)
-            .await
+            .await?;
+        drop(instance_lock);
+        Ok(())
     }
 
     fn prepare(config_path: &Path) -> Result<PreparedDaemon> {
         let prepared = config::load(config_path)?;
+        let control = PreparedRegistry::new(prepared.servers.keys())?;
         let connection_limit = Arc::new(Semaphore::new(prepared.max_connections));
         let mut servers = BTreeMap::new();
         for (server_id, server) in prepared.servers {
@@ -267,7 +306,7 @@ impl DaemonCoordinator {
             .with_context(|| format!("[server={server_id}] runtime preparation failed"))?;
             servers.insert(server_id, (server.context, runtime));
         }
-        Ok(PreparedDaemon { servers })
+        Ok(PreparedDaemon { servers, control })
     }
 }
 
@@ -283,6 +322,8 @@ impl PreparedDaemon {
         }
         Ok(BoundDaemon {
             servers: bound,
+            control: Some(self.control),
+            control_endpoint: None,
             #[cfg(test)]
             runtime_overrides: VecDeque::new(),
         })
@@ -388,15 +429,16 @@ fn spawn_runtime(
     context: ServerContext,
     runtime: ServerRuntime,
     shutdown: &Shutdown,
+    runtime_stop: &RuntimeStop,
 ) {
     let runtime_shutdown = shutdown.clone();
+    let runtime_stop = runtime_stop.clone();
     let returned_context = context.clone();
     let task = runtimes.spawn(async move {
-        let inner_shutdown = runtime_shutdown.clone();
         let shutdown_delivered = Arc::new(AtomicBool::new(false));
         let delivered_by_shutdown = Arc::clone(&shutdown_delivered);
         let runtime_task = tokio::spawn(runtime.run_until(async move {
-            inner_shutdown.wait().await;
+            runtime_stop.wait().await;
             delivered_by_shutdown.store(true, Ordering::Release);
             Ok(())
         }));
@@ -428,6 +470,10 @@ fn spawn_runtime(
 }
 
 impl BoundDaemon {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "startup, fatal observation, ordered control shutdown, and runtime draining are one coordinator state machine"
+    )]
     async fn activate_and_run(
         self,
         shutdown: Shutdown,
@@ -438,8 +484,17 @@ impl BoundDaemon {
             .task
             .take()
             .expect("armed signal watcher must own one task");
+        let runtime_stop = RuntimeStop::new();
+        let mut runtime_stop_requested = false;
         let mut runtimes = JoinSet::new();
         let mut contexts = HashMap::new();
+        let expected_runtime_count = self.servers.len();
+        let mut status_handles = BTreeMap::new();
+        let mut control_preparation = self.control;
+        let mut control_endpoint = self.control_endpoint;
+        let mut control_shutdown = None;
+        let mut admission_stopped = None;
+        let mut control_task: Option<JoinHandle<Result<()>>> = None;
         let mut state = CoordinatorState::default();
         #[cfg(test)]
         let mut runtime_overrides = self.runtime_overrides;
@@ -456,14 +511,22 @@ impl BoundDaemon {
             if shutdown.is_pending() {
                 break;
             }
-            let runtime = bound.activate();
+            let ActivatedServerRuntime { runtime, status } = bound.activate();
+            status_handles.insert(context.id().to_owned(), status);
             #[cfg(test)]
             let mut runtime = runtime;
             #[cfg(test)]
             if let Some(apply) = runtime_overrides.pop_front() {
                 apply(&mut runtime);
             }
-            spawn_runtime(&mut runtimes, &mut contexts, context, runtime, &shutdown);
+            spawn_runtime(
+                &mut runtimes,
+                &mut contexts,
+                context,
+                runtime,
+                &shutdown,
+                &runtime_stop,
+            );
         }
 
         observe_pending_events(
@@ -476,10 +539,64 @@ impl BoundDaemon {
         )
         .await;
 
-        while !runtimes.is_empty() {
+        if status_handles.len() == expected_runtime_count
+            && !shutdown.is_pending()
+            && let (Some(prepared), Some(mut endpoint)) =
+                (control_preparation.take(), control_endpoint.take())
+        {
+            match prepared.activate(status_handles) {
+                Ok(registry) => {
+                    let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+                    let (stopped_sender, stopped_receiver) = oneshot::channel();
+                    control_shutdown = Some(shutdown_sender);
+                    admission_stopped = Some(stopped_receiver);
+                    control_task = Some(tokio::spawn(
+                        ControlServer::new(endpoint, registry)
+                            .run(shutdown_receiver, stopped_sender),
+                    ));
+                    log::info!("Local control protocol v1 is ready");
+                }
+                Err(error) => {
+                    shutdown.fail(error.context("control registry activation failed"));
+                    if let Err(cleanup_error) = endpoint.stop() {
+                        shutdown
+                            .fail(cleanup_error.context("control endpoint cleanup also failed"));
+                    }
+                }
+            }
+        }
+
+        if control_task.is_none() {
+            if let Some(mut endpoint) = control_endpoint.take()
+                && let Err(error) = endpoint.stop()
+            {
+                shutdown.fail(error.context("control endpoint cleanup failed before activation"));
+            }
+            if shutdown.is_pending() {
+                runtime_stop.request();
+                runtime_stop_requested = true;
+            }
+        }
+
+        while !runtimes.is_empty() || control_task.is_some() {
+            if shutdown.is_pending() && !runtime_stop_requested {
+                if let Some(sender) = control_shutdown.take() {
+                    let _ = sender.send(());
+                }
+                if let Some(stopped) = admission_stopped.take()
+                    && stopped.await.is_err()
+                    && let Some(task) = control_task.take()
+                {
+                    record_control_result(task.await, true, &shutdown);
+                }
+                runtime_stop.request();
+                runtime_stop_requested = true;
+            }
+
             tokio::select! {
                 biased;
 
+                () = shutdown.wait(), if !runtime_stop_requested => {}
                 failure = infrastructure_failures.recv(), if !state.infrastructure_closed => {
                     match failure {
                         Some(()) => state.record_infrastructure_failure(),
@@ -489,14 +606,31 @@ impl BoundDaemon {
                 result = &mut watcher, if !state.watcher_observed => {
                     state.observe_watcher(result, &mut infrastructure_failures, &shutdown);
                 }
-                completed = runtimes.join_next_with_id() => {
+                completed = runtimes.join_next_with_id(), if !runtimes.is_empty() => {
                     if let Some(completed) = completed {
                         CoordinatorState::observe_runtime(completed, &mut contexts, &shutdown);
-                    } else {
-                        break;
                     }
                 }
+                result = async {
+                    control_task
+                        .as_mut()
+                        .expect("guarded control task must be present")
+                        .await
+                }, if control_task.is_some() => {
+                    control_task = None;
+                    record_control_result(result, runtime_stop_requested, &shutdown);
+                }
             }
+        }
+
+        if shutdown.is_pending() && !runtime_stop_requested {
+            if let Some(sender) = control_shutdown.take() {
+                let _ = sender.send(());
+            }
+            if let Some(stopped) = admission_stopped.take() {
+                let _ = stopped.await;
+            }
+            runtime_stop.request();
         }
 
         state.drain_infrastructure(&mut infrastructure_failures);
@@ -518,6 +652,23 @@ impl BoundDaemon {
         }
         state.drain_infrastructure(&mut infrastructure_failures);
         shutdown.finish()
+    }
+}
+
+fn record_control_result(
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+    shutdown_requested: bool,
+    shutdown: &Shutdown,
+) {
+    match result {
+        Ok(Ok(())) if shutdown_requested => {}
+        Ok(Ok(())) => shutdown.fail(anyhow::anyhow!(
+            "control accept loop stopped unexpectedly before daemon shutdown"
+        )),
+        Ok(Err(error)) => shutdown.fail(error.context("control infrastructure failed")),
+        Err(error) => shutdown.fail(anyhow::anyhow!(
+            "control accept loop panicked or was cancelled: {error}"
+        )),
     }
 }
 
@@ -637,6 +788,20 @@ bold = true
         shutdown.wait().await;
     }
 
+    #[tokio::test]
+    async fn control_task_panic_enters_global_fatal_shutdown() {
+        let shutdown = Shutdown::new();
+        let task = tokio::spawn(async {
+            panic!("intentional control task panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+        record_control_result(task.await, false, &shutdown);
+        assert!(shutdown.is_pending());
+        let error = shutdown.finish().unwrap_err().to_string();
+        assert!(error.contains("control accept loop panicked"));
+    }
+
     #[test]
     fn buffered_infrastructure_failure_is_drained_after_sender_drop() {
         let shutdown = Shutdown::new();
@@ -678,6 +843,8 @@ bold = true
             }
             let bound = BoundDaemon {
                 servers: Vec::new(),
+                control: None,
+                control_endpoint: None,
                 runtime_overrides: VecDeque::new(),
             };
 
@@ -712,6 +879,8 @@ bold = true
         let mut signals = SignalWatcher { task: Some(task) };
         let bound = BoundDaemon {
             servers: Vec::new(),
+            control: None,
+            control_endpoint: None,
             runtime_overrides: VecDeque::new(),
         };
         let mut run = Box::pin(bound.activate_and_run(shutdown, receiver, &mut signals));
@@ -747,6 +916,8 @@ bold = true
         }
         let bound = BoundDaemon {
             servers: Vec::new(),
+            control: None,
+            control_endpoint: None,
             runtime_overrides: VecDeque::new(),
         };
 

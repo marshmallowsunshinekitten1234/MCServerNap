@@ -3,6 +3,7 @@
 pub(crate) mod backend_use;
 pub mod config;
 pub mod context;
+pub mod control;
 pub mod coordinator;
 pub mod endpoint;
 pub mod minecraft;

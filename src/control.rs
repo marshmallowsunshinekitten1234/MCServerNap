@@ -1,0 +1,1472 @@
+use std::collections::BTreeMap;
+use std::fmt;
+use std::io;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context as _, Result, ensure};
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::task::JoinSet;
+use tokio::time::{Instant, timeout_at};
+
+use crate::runtime::RuntimeStatusHandle;
+use crate::supervisor::{FailureCategory, LifecycleStatusSnapshot, ServerPhase};
+
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
+
+#[cfg(unix)]
+pub(crate) use unix::{BoundEndpoint, InstanceLock};
+#[cfg(windows)]
+pub(crate) use windows::{BoundEndpoint, InstanceLock};
+
+const PROTOCOL_VERSION: u16 = 1;
+const MAX_PAYLOAD_LENGTH: u32 = 65_536;
+const MAX_CONTROL_EXCHANGES: usize = 32;
+const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Request {
+    List,
+    Status { server_id: String },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequestDocument {
+    #[serde(rename = "type")]
+    operation: RequestOperation,
+    #[serde(default)]
+    server_id: Present<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RequestOperation {
+    List,
+    Status,
+}
+
+#[derive(Default)]
+enum Present<T> {
+    #[default]
+    Missing,
+    Value(T),
+}
+
+impl<'de, T> Deserialize<'de> for Present<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        T::deserialize(deserializer).map(Self::Value)
+    }
+}
+
+impl RequestDocument {
+    fn into_request(self) -> Option<Request> {
+        match (self.operation, self.server_id) {
+            (RequestOperation::List, Present::Missing) => Some(Request::List),
+            (RequestOperation::Status, Present::Value(server_id)) => {
+                Some(Request::Status { server_id })
+            }
+            (RequestOperation::List, Present::Value(_))
+            | (RequestOperation::Status, Present::Missing) => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WirePhase {
+    Reconciling,
+    Stopped,
+    Starting,
+    Running,
+    Stopping,
+    Cooldown,
+    External,
+    Conflict,
+}
+
+impl WirePhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reconciling => "reconciling",
+            Self::Stopped => "stopped",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Stopping => "stopping",
+            Self::Cooldown => "cooldown",
+            Self::External => "external",
+            Self::Conflict => "conflict",
+        }
+    }
+}
+
+impl From<ServerPhase> for WirePhase {
+    fn from(phase: ServerPhase) -> Self {
+        match phase {
+            ServerPhase::Reconciling => Self::Reconciling,
+            ServerPhase::Stopped => Self::Stopped,
+            ServerPhase::Starting => Self::Starting,
+            ServerPhase::Running => Self::Running,
+            ServerPhase::Stopping => Self::Stopping,
+            ServerPhase::Cooldown => Self::Cooldown,
+            ServerPhase::External => Self::External,
+            ServerPhase::Conflict => Self::Conflict,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireFailureCategory {
+    LaunchFailed,
+    StartupTimedOut,
+    ExitedBeforeReady,
+    ExitedUnexpectedly,
+}
+
+impl WireFailureCategory {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::LaunchFailed => "launch_failed",
+            Self::StartupTimedOut => "startup_timed_out",
+            Self::ExitedBeforeReady => "exited_before_ready",
+            Self::ExitedUnexpectedly => "exited_unexpectedly",
+        }
+    }
+}
+
+impl From<FailureCategory> for WireFailureCategory {
+    fn from(category: FailureCategory) -> Self {
+        match category {
+            FailureCategory::LaunchFailed => Self::LaunchFailed,
+            FailureCategory::StartupTimedOut => Self::StartupTimedOut,
+            FailureCategory::ExitedBeforeReady => Self::ExitedBeforeReady,
+            FailureCategory::ExitedUnexpectedly => Self::ExitedUnexpectedly,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WireErrorCode {
+    MalformedRequest,
+    UnsupportedProtocolVersion,
+    UnknownServerId,
+}
+
+#[derive(Serialize)]
+struct SuccessEnvelope<T> {
+    #[serde(rename = "type")]
+    response_type: &'static str,
+    result: T,
+}
+
+#[derive(Serialize)]
+struct ListResult<'a> {
+    #[serde(rename = "type")]
+    result_type: &'static str,
+    servers: &'a [String],
+}
+
+#[derive(Serialize)]
+struct StatusResult<'a> {
+    #[serde(rename = "type")]
+    result_type: &'static str,
+    server: StatusFields<'a>,
+}
+
+#[derive(Serialize)]
+struct StatusFields<'a> {
+    server_id: &'a str,
+    phase: WirePhase,
+    failure_category: Option<WireFailureCategory>,
+    failure_streak: u32,
+    retry_after_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct ErrorEnvelope {
+    #[serde(rename = "type")]
+    response_type: &'static str,
+    error: ErrorFields,
+}
+
+#[derive(Serialize)]
+struct ErrorFields {
+    code: WireErrorCode,
+    message: &'static str,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum Response {
+    Success { result: SuccessResult },
+    Error { error: ReceivedError },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum SuccessResult {
+    List { servers: Vec<String> },
+    Status { server: ReceivedStatus },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceivedStatus {
+    server_id: String,
+    phase: WirePhase,
+    failure_category: RequiredNullable<WireFailureCategory>,
+    failure_streak: u32,
+    retry_after_ms: RequiredNullable<u64>,
+}
+
+struct RequiredNullable<T>(Option<T>);
+
+impl<'de, T> Deserialize<'de> for RequiredNullable<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Option::deserialize(deserializer).map(Self)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceivedError {
+    code: WireErrorCode,
+    #[serde(rename = "message")]
+    _message: String,
+}
+
+pub struct ServerStatus {
+    server_id: String,
+    phase: WirePhase,
+    failure_category: Option<WireFailureCategory>,
+    failure_streak: u32,
+    retry_after_ms: Option<u64>,
+}
+
+impl ServerStatus {
+    #[must_use]
+    pub fn server_id(&self) -> &str {
+        &self.server_id
+    }
+
+    #[must_use]
+    pub const fn phase(&self) -> &'static str {
+        self.phase.as_str()
+    }
+
+    #[must_use]
+    pub const fn failure_category(&self) -> Option<&'static str> {
+        match self.failure_category {
+            Some(category) => Some(category.as_str()),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn failure_streak(&self) -> u32 {
+        self.failure_streak
+    }
+
+    #[must_use]
+    pub const fn retry_after_ms(&self) -> Option<u64> {
+        self.retry_after_ms
+    }
+}
+
+#[derive(Debug)]
+pub enum ClientError {
+    DaemonUnavailable,
+    ProtocolMismatch,
+    UnknownServerId,
+    Operation(String),
+}
+
+impl fmt::Display for ClientError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DaemonUnavailable => formatter
+                .write_str("the MCServerNap daemon is unavailable for the current OS principal"),
+            Self::ProtocolMismatch => {
+                formatter.write_str("the client and daemon use incompatible control protocols")
+            }
+            Self::UnknownServerId => formatter.write_str("unknown server ID"),
+            Self::Operation(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ClientError {}
+
+pub(crate) struct PreparedRegistry {
+    server_ids: Vec<String>,
+    list_response: Arc<[u8]>,
+}
+
+impl PreparedRegistry {
+    pub(crate) fn new<'a>(server_ids: impl Iterator<Item = &'a String>) -> Result<Self> {
+        let mut server_ids = server_ids.cloned().collect::<Vec<_>>();
+        server_ids.sort();
+        let list = SuccessEnvelope {
+            response_type: "success",
+            result: ListResult {
+                result_type: "list",
+                servers: &server_ids,
+            },
+        };
+        let list_response = encode_frame(&list).map_err(|error| {
+            anyhow::anyhow!(
+                "control protocol v1 response limit exceeded by the complete server list: {error}"
+            )
+        })?;
+
+        let longest_id = server_ids
+            .iter()
+            .max_by_key(|server_id| server_id.len())
+            .context("control registry requires at least one configured server")?;
+        let worst_case = SuccessEnvelope {
+            response_type: "success",
+            result: StatusResult {
+                result_type: "status",
+                server: StatusFields {
+                    server_id: longest_id,
+                    phase: WirePhase::Reconciling,
+                    failure_category: Some(WireFailureCategory::ExitedUnexpectedly),
+                    failure_streak: u32::MAX,
+                    retry_after_ms: Some(u64::MAX),
+                },
+            },
+        };
+        encode_frame(&worst_case).map_err(|error| {
+            anyhow::anyhow!(
+                "control protocol v1 response limit exceeded by a worst-case server status: {error}"
+            )
+        })?;
+
+        Ok(Self {
+            server_ids,
+            list_response: list_response.into(),
+        })
+    }
+
+    pub(crate) fn activate(
+        self,
+        handles: BTreeMap<String, RuntimeStatusHandle>,
+    ) -> Result<Registry> {
+        ensure!(
+            handles.len() == self.server_ids.len()
+                && handles
+                    .keys()
+                    .zip(&self.server_ids)
+                    .all(|(actual, expected)| actual == expected),
+            "control registry activation did not receive every prepared server"
+        );
+        ensure!(
+            handles
+                .iter()
+                .all(|(server_id, handle)| server_id == handle.server_id()),
+            "control registry handle identity does not match its server ID"
+        );
+        Ok(Registry(Arc::new(RegistryInner {
+            handles,
+            list_response: self.list_response,
+        })))
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct Registry(Arc<RegistryInner>);
+
+struct RegistryInner {
+    handles: BTreeMap<String, RuntimeStatusHandle>,
+    list_response: Arc<[u8]>,
+}
+
+pub(crate) struct ControlServer {
+    endpoint: BoundEndpoint,
+    registry: Registry,
+    permits: Arc<Semaphore>,
+}
+
+impl ControlServer {
+    pub(crate) fn new(endpoint: BoundEndpoint, registry: Registry) -> Self {
+        Self {
+            endpoint,
+            registry,
+            permits: Arc::new(Semaphore::new(MAX_CONTROL_EXCHANGES)),
+        }
+    }
+
+    pub(crate) async fn run(
+        mut self,
+        mut shutdown: oneshot::Receiver<()>,
+        admission_stopped: oneshot::Sender<()>,
+    ) -> Result<()> {
+        let mut clients = JoinSet::new();
+        let accept_result = loop {
+            tokio::select! {
+                biased;
+
+                _ = &mut shutdown => break Ok(()),
+                completed = clients.join_next(), if !clients.is_empty() => {
+                    if let Some(Err(error)) = completed {
+                        break Err(anyhow::anyhow!("control-client task panicked: {error}"));
+                    }
+                }
+                accepted = self.endpoint.accept(&self.permits) => {
+                    match accepted.context("control endpoint accept failed") {
+                        Err(error) => break Err(error),
+                        Ok(Some((stream, permit))) => {
+                            let registry = self.registry.clone();
+                            let deadline = Instant::now() + EXCHANGE_TIMEOUT;
+                            clients.spawn(async move {
+                                serve_accepted_before(stream, registry, permit, deadline).await;
+                            });
+                        }
+                        Ok(None) => log::debug!("Control connection rejected: exchange limit reached"),
+                    }
+                }
+            }
+        };
+
+        let endpoint_result = self
+            .endpoint
+            .stop()
+            .context("control endpoint cleanup failed");
+        clients.abort_all();
+        let _ = admission_stopped.send(());
+        let mut client_panics = Vec::new();
+        while let Some(completed) = clients.join_next().await {
+            if let Err(error) = completed
+                && error.is_panic()
+            {
+                client_panics.push(anyhow::anyhow!("control-client task panicked: {error}"));
+            }
+        }
+
+        combine_control_results(accept_result, endpoint_result, client_panics, |error| {
+            log::error!("Additional control failure during shutdown: {error:#}");
+        })
+    }
+}
+
+fn combine_control_results(
+    accept_result: Result<()>,
+    endpoint_result: Result<()>,
+    client_panics: impl IntoIterator<Item = anyhow::Error>,
+    mut report_secondary: impl FnMut(&anyhow::Error),
+) -> Result<()> {
+    let mut primary = None;
+    let mut record = |result: Result<()>| {
+        if let Err(error) = result {
+            if primary.is_none() {
+                primary = Some(error);
+            } else {
+                report_secondary(&error);
+            }
+        }
+    };
+
+    record(accept_result);
+    record(endpoint_result);
+    for error in client_panics {
+        record(Err(error));
+    }
+
+    match primary {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+async fn serve_accepted<S>(stream: S, registry: Registry, permit: OwnedSemaphorePermit)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let deadline = Instant::now() + EXCHANGE_TIMEOUT;
+    serve_accepted_before(stream, registry, permit, deadline).await;
+}
+
+async fn serve_accepted_before<S>(
+    mut stream: S,
+    registry: Registry,
+    _permit: OwnedSemaphorePermit,
+    deadline: Instant,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let result = timeout_at(deadline, serve_exchange(&mut stream, &registry)).await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(ExchangeError::Client)) => {
+            log::debug!("Control exchange ended before a complete response");
+        }
+        Err(_) => log::debug!("Control exchange deadline elapsed"),
+    }
+}
+
+enum ExchangeError {
+    Client,
+}
+
+async fn serve_exchange<S>(stream: &mut S, registry: &Registry) -> Result<(), ExchangeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let request = match read_frame(stream).await {
+        Ok(ReadFrame::Version { version, .. }) if version != PROTOCOL_VERSION => {
+            let response = error_frame(
+                WireErrorCode::UnsupportedProtocolVersion,
+                "unsupported control protocol version",
+            );
+            stream
+                .write_all(&response)
+                .await
+                .map_err(|_| ExchangeError::Client)?;
+            return Ok(());
+        }
+        Ok(ReadFrame::Version { body, .. }) => {
+            let Some(request) = serde_json::from_slice::<RequestDocument>(&body)
+                .ok()
+                .and_then(RequestDocument::into_request)
+            else {
+                let response = error_frame(WireErrorCode::MalformedRequest, "malformed request");
+                stream
+                    .write_all(&response)
+                    .await
+                    .map_err(|_| ExchangeError::Client)?;
+                return Ok(());
+            };
+            request
+        }
+        Err(error) => {
+            log::debug!(
+                "Control request framing rejected (declared payload length: {:?})",
+                error.declared_length
+            );
+            let response = error_frame(WireErrorCode::MalformedRequest, "malformed request");
+            stream
+                .write_all(&response)
+                .await
+                .map_err(|_| ExchangeError::Client)?;
+            return Ok(());
+        }
+    };
+
+    match request {
+        Request::List => stream
+            .write_all(&registry.0.list_response)
+            .await
+            .map_err(|_| ExchangeError::Client)?,
+        Request::Status { server_id } => {
+            let Some(handle) = registry.0.handles.get(&server_id) else {
+                let response = error_frame(WireErrorCode::UnknownServerId, "unknown server ID");
+                stream
+                    .write_all(&response)
+                    .await
+                    .map_err(|_| ExchangeError::Client)?;
+                return Ok(());
+            };
+            let Some(snapshot) = handle.snapshot() else {
+                return Err(ExchangeError::Client);
+            };
+            let response = status_frame(handle.server_id(), snapshot, Instant::now());
+            stream
+                .write_all(&response)
+                .await
+                .map_err(|_| ExchangeError::Client)?;
+        }
+    }
+    Ok(())
+}
+
+fn status_frame(
+    server_id: &str,
+    snapshot: LifecycleStatusSnapshot,
+    snapshot_now: Instant,
+) -> Vec<u8> {
+    let response = SuccessEnvelope {
+        response_type: "success",
+        result: StatusResult {
+            result_type: "status",
+            server: StatusFields {
+                server_id,
+                phase: snapshot.phase.into(),
+                failure_category: snapshot.failure.map(Into::into),
+                failure_streak: snapshot.failure_streak,
+                retry_after_ms: snapshot
+                    .retry_at
+                    .map(|retry_at| retry_milliseconds(retry_at, snapshot_now)),
+            },
+        },
+    };
+    encode_frame(&response).expect("prepared status response bound must cover every snapshot")
+}
+
+fn retry_milliseconds(retry_at: Instant, snapshot_now: Instant) -> u64 {
+    let remaining = retry_at.saturating_duration_since(snapshot_now);
+    let milliseconds = remaining.as_millis();
+    let rounded = milliseconds + u128::from(!remaining.subsec_nanos().is_multiple_of(1_000_000));
+    u64::try_from(rounded).expect("supervisor retry delays must fit the v1 millisecond field")
+}
+
+fn error_frame(code: WireErrorCode, message: &'static str) -> Vec<u8> {
+    encode_frame(&ErrorEnvelope {
+        response_type: "error",
+        error: ErrorFields { code, message },
+    })
+    .expect("protocol-v1 error responses are bounded constants")
+}
+
+fn encode_frame(value: &impl Serialize) -> Result<Vec<u8>> {
+    let maximum_body_length = MAX_PAYLOAD_LENGTH as usize - 2;
+    let mut body = BoundedJson::new(maximum_body_length);
+    serde_json::to_writer(&mut body, value).context("failed to encode bounded JSON")?;
+    let body = body.into_inner();
+    let payload_length = body.len() + 2;
+    let payload_length = u32::try_from(payload_length).expect("bounded payload length fits u32");
+    let mut frame = Vec::with_capacity(payload_length as usize + 4);
+    frame.extend_from_slice(&payload_length.to_be_bytes());
+    frame.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+    frame.extend_from_slice(&body);
+    Ok(frame)
+}
+
+struct BoundedJson {
+    bytes: Vec<u8>,
+    maximum: usize,
+}
+
+impl BoundedJson {
+    fn new(maximum: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            maximum,
+        }
+    }
+
+    fn into_inner(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl io::Write for BoundedJson {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if buffer.len() > self.maximum - self.bytes.len() {
+            return Err(io::Error::other(format!(
+                "payload exceeds the {MAX_PAYLOAD_LENGTH}-byte protocol limit"
+            )));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+enum ReadFrame {
+    Version { version: u16, body: Vec<u8> },
+}
+
+#[derive(Debug)]
+struct FrameError {
+    declared_length: Option<u32>,
+}
+
+async fn read_frame<R>(reader: &mut R) -> std::result::Result<ReadFrame, FrameError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut header = [0; 4];
+    reader
+        .read_exact(&mut header)
+        .await
+        .map_err(|_| FrameError {
+            declared_length: None,
+        })?;
+    let payload_length = u32::from_be_bytes(header);
+    if !(2..=MAX_PAYLOAD_LENGTH).contains(&payload_length) {
+        return Err(FrameError {
+            declared_length: Some(payload_length),
+        });
+    }
+    let mut version = [0; 2];
+    reader
+        .read_exact(&mut version)
+        .await
+        .map_err(|_| FrameError {
+            declared_length: Some(payload_length),
+        })?;
+    let version = u16::from_be_bytes(version);
+    if version != PROTOCOL_VERSION {
+        return Ok(ReadFrame::Version {
+            version,
+            body: Vec::new(),
+        });
+    }
+    let body_length = usize::try_from(payload_length - 2).expect("bounded u32 length fits usize");
+    let mut body = vec![0; body_length];
+    reader.read_exact(&mut body).await.map_err(|_| FrameError {
+        declared_length: Some(payload_length),
+    })?;
+    Ok(ReadFrame::Version { version, body })
+}
+
+pub async fn list() -> std::result::Result<Vec<String>, ClientError> {
+    match request(Request::List).await? {
+        SuccessResult::List { servers } => validate_server_list(servers),
+        SuccessResult::Status { .. } => Err(ClientError::DaemonUnavailable),
+    }
+}
+
+fn validate_server_list(servers: Vec<String>) -> std::result::Result<Vec<String>, ClientError> {
+    if servers.is_empty() || !servers.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err(ClientError::DaemonUnavailable);
+    }
+    Ok(servers)
+}
+
+pub async fn status(server_id: String) -> std::result::Result<ServerStatus, ClientError> {
+    let expected_server_id = server_id.clone();
+    match request(Request::Status { server_id }).await? {
+        SuccessResult::Status { server } if server.server_id == expected_server_id => {
+            Ok(ServerStatus {
+                server_id: server.server_id,
+                phase: server.phase,
+                failure_category: server.failure_category.0,
+                failure_streak: server.failure_streak,
+                retry_after_ms: server.retry_after_ms.0,
+            })
+        }
+        SuccessResult::Status { .. } | SuccessResult::List { .. } => {
+            Err(ClientError::DaemonUnavailable)
+        }
+    }
+}
+
+async fn request(request: Request) -> std::result::Result<SuccessResult, ClientError> {
+    let deadline = Instant::now() + EXCHANGE_TIMEOUT;
+    match timeout_at(deadline, request_before(deadline, request)).await {
+        Ok(result) => result,
+        Err(_) => Err(ClientError::DaemonUnavailable),
+    }
+}
+
+async fn request_before(
+    deadline: Instant,
+    request: Request,
+) -> std::result::Result<SuccessResult, ClientError> {
+    let frame =
+        encode_frame(&request).map_err(|error| ClientError::Operation(error.to_string()))?;
+    let mut stream = platform_connect(deadline)
+        .await
+        .map_err(|_| ClientError::DaemonUnavailable)?;
+    client_exchange(&mut stream, &frame).await
+}
+
+async fn client_exchange<S>(
+    stream: &mut S,
+    frame: &[u8],
+) -> std::result::Result<SuccessResult, ClientError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    stream
+        .write_all(frame)
+        .await
+        .map_err(|_| ClientError::DaemonUnavailable)?;
+    let response = match read_frame(stream).await {
+        Ok(ReadFrame::Version { version, .. }) if version != PROTOCOL_VERSION => {
+            return Err(ClientError::ProtocolMismatch);
+        }
+        Ok(ReadFrame::Version { body, .. }) => {
+            serde_json::from_slice::<Response>(&body).map_err(|_| ClientError::DaemonUnavailable)?
+        }
+        Err(_) => return Err(ClientError::DaemonUnavailable),
+    };
+    match response {
+        Response::Success { result } => Ok(result),
+        Response::Error { error } => match error.code {
+            WireErrorCode::UnknownServerId => Err(ClientError::UnknownServerId),
+            WireErrorCode::UnsupportedProtocolVersion => Err(ClientError::ProtocolMismatch),
+            WireErrorCode::MalformedRequest => Err(ClientError::DaemonUnavailable),
+        },
+    }
+}
+
+#[cfg(unix)]
+async fn platform_connect(deadline: Instant) -> std::io::Result<unix::ControlStream> {
+    unix::connect(deadline).await
+}
+
+#[cfg(windows)]
+async fn platform_connect(deadline: Instant) -> std::io::Result<windows::ControlStream> {
+    windows::connect(deadline).await
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use serde_json::Value;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, DuplexStream};
+    use tokio::sync::{Semaphore, watch};
+    use tokio::time::{Duration, Instant, advance};
+
+    use super::*;
+    use crate::runtime::RuntimeStatusHandle;
+    use crate::supervisor::{FailureCategory, LifecycleState};
+
+    fn raw_frame(version: u16, body: &[u8]) -> Vec<u8> {
+        let payload_length = u32::try_from(body.len() + 2).unwrap();
+        let mut frame = Vec::with_capacity(body.len() + 6);
+        frame.extend_from_slice(&payload_length.to_be_bytes());
+        frame.extend_from_slice(&version.to_be_bytes());
+        frame.extend_from_slice(body);
+        frame
+    }
+
+    fn one_server_registry(lifecycle: LifecycleState) -> (Registry, watch::Sender<LifecycleState>) {
+        let prepared = PreparedRegistry::new([&"survival".to_owned()].into_iter()).unwrap();
+        let (handle, sender) = RuntimeStatusHandle::test("survival", lifecycle);
+        let handles = BTreeMap::from([("survival".to_owned(), handle)]);
+        (prepared.activate(handles).unwrap(), sender)
+    }
+
+    async fn exchange(request: &[u8], registry: Registry) -> Vec<u8> {
+        let permits = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&permits).try_acquire_owned().unwrap();
+        let (mut client, server) = tokio::io::duplex(70_000);
+        let task = tokio::spawn(serve_accepted(server, registry, permit));
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        task.await.unwrap();
+        assert_eq!(permits.available_permits(), 1);
+        response
+    }
+
+    async fn client_receives(response: Vec<u8>) -> std::result::Result<SuccessResult, ClientError> {
+        let (mut client, mut daemon) = tokio::io::duplex(70_000);
+        let daemon_task = tokio::spawn(async move {
+            let _ = read_frame(&mut daemon).await;
+            daemon.write_all(&response).await.unwrap();
+        });
+        let request = encode_frame(&Request::List).unwrap();
+        let result = client_exchange(&mut client, &request).await;
+        daemon_task.await.unwrap();
+        result
+    }
+
+    fn frame_body(frame: &[u8]) -> &[u8] {
+        let payload_length = u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize;
+        assert_eq!(frame.len(), payload_length + 4);
+        assert_eq!(u16::from_be_bytes(frame[4..6].try_into().unwrap()), 1);
+        &frame[6..]
+    }
+
+    fn response_code(frame: &[u8]) -> WireErrorCode {
+        let response: Response = serde_json::from_slice(frame_body(frame)).unwrap();
+        let Response::Error { error } = response else {
+            panic!("expected an error response");
+        };
+        error.code
+    }
+
+    fn combine_test_results(
+        accept_failure: Option<&str>,
+        endpoint_failure: Option<&str>,
+        client_panics: &[&str],
+    ) -> (Result<()>, Vec<String>) {
+        let result = |failure: Option<&str>| match failure {
+            Some(message) => Err(anyhow::anyhow!(message.to_owned())),
+            None => Ok(()),
+        };
+        let mut secondary = Vec::new();
+        let combined = combine_control_results(
+            result(accept_failure),
+            result(endpoint_failure),
+            client_panics
+                .iter()
+                .map(|message| anyhow::anyhow!((*message).to_owned())),
+            |error| secondary.push(error.to_string()),
+        );
+        (combined, secondary)
+    }
+
+    #[test]
+    fn control_result_combination_succeeds_when_every_outcome_succeeds() {
+        let (result, secondary) = combine_test_results(None, None, &[]);
+        assert!(result.is_ok());
+        assert!(secondary.is_empty());
+    }
+
+    #[test]
+    fn each_individual_control_failure_is_returned_without_secondary_reporting() {
+        for (accept, endpoint, panics, expected) in [
+            (Some("accept"), None, &[][..], "accept"),
+            (None, Some("endpoint"), &[][..], "endpoint"),
+            (None, None, &["client"][..], "client"),
+        ] {
+            let (result, secondary) = combine_test_results(accept, endpoint, panics);
+            assert_eq!(result.unwrap_err().to_string(), expected);
+            assert!(secondary.is_empty());
+        }
+    }
+
+    #[test]
+    fn control_result_combination_preserves_precedence_and_reports_later_failures() {
+        let (result, secondary) = combine_test_results(
+            Some("accept"),
+            Some("endpoint"),
+            &["client one", "client two"],
+        );
+        assert_eq!(result.unwrap_err().to_string(), "accept");
+        assert_eq!(secondary, ["endpoint", "client one", "client two"]);
+
+        let (result, secondary) = combine_test_results(None, Some("endpoint"), &["client"]);
+        assert_eq!(result.unwrap_err().to_string(), "endpoint");
+        assert_eq!(secondary, ["client"]);
+    }
+
+    #[test]
+    fn client_accepts_nonempty_strictly_sorted_server_lists() {
+        assert_eq!(
+            validate_server_list(vec!["survival".to_owned()]).unwrap(),
+            ["survival"]
+        );
+        assert_eq!(
+            validate_server_list(vec!["creative".to_owned(), "survival".to_owned()]).unwrap(),
+            ["creative", "survival"]
+        );
+    }
+
+    #[test]
+    fn client_rejects_empty_duplicate_and_unsorted_server_lists() {
+        for servers in [
+            Vec::new(),
+            vec!["survival".to_owned(), "survival".to_owned()],
+            vec!["survival".to_owned(), "creative".to_owned()],
+        ] {
+            assert!(matches!(
+                validate_server_list(servers),
+                Err(ClientError::DaemonUnavailable)
+            ));
+        }
+    }
+
+    #[test]
+    fn frame_bytes_are_exact_big_endian_protocol_v1() {
+        let frame = encode_frame(&Request::List).unwrap();
+        let mut expected = vec![0, 0, 0, 17, 0, 1];
+        expected.extend_from_slice(br#"{"type":"list"}"#);
+        assert_eq!(frame, expected);
+    }
+
+    #[test]
+    fn bounded_json_rejects_before_copying_an_oversized_chunk() {
+        let mut writer = BoundedJson::new(8);
+        assert!(std::io::Write::write_all(&mut writer, &[0; 9]).is_err());
+        assert!(writer.bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fragmented_header_version_and_body_decode_successfully() {
+        let (registry, _authority) =
+            one_server_registry(LifecycleState::test_phase(ServerPhase::Stopped));
+        let request = encode_frame(&Request::List).unwrap();
+        let permits = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&permits).try_acquire_owned().unwrap();
+        let (mut client, server) = tokio::io::duplex(128);
+        let task = tokio::spawn(serve_accepted(server, registry, permit));
+        for byte in request {
+            client.write_all(&[byte]).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        task.await.unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<Response>(frame_body(&response)).unwrap(),
+            Response::Success {
+                result: SuccessResult::List { .. }
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn coalesced_second_request_is_ignored_after_one_response() {
+        let (registry, _authority) =
+            one_server_registry(LifecycleState::test_phase(ServerPhase::Stopped));
+        let first = encode_frame(&Request::List).unwrap();
+        let second = encode_frame(&Request::Status {
+            server_id: "survival".to_owned(),
+        })
+        .unwrap();
+        let response = exchange(&[first, second].concat(), registry).await;
+        assert!(matches!(
+            serde_json::from_slice::<Response>(frame_body(&response)).unwrap(),
+            Response::Success {
+                result: SuccessResult::List { .. }
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn payload_length_boundaries_are_enforced_before_body_read() {
+        for length in [0_u32, 1, 65_537] {
+            let (registry, _authority) =
+                one_server_registry(LifecycleState::test_phase(ServerPhase::Stopped));
+            let response = exchange(&length.to_be_bytes(), registry).await;
+            assert!(matches!(
+                response_code(&response),
+                WireErrorCode::MalformedRequest
+            ));
+        }
+
+        let (registry, _authority) =
+            one_server_registry(LifecycleState::test_phase(ServerPhase::Stopped));
+        let mut maximum = Vec::with_capacity(65_540);
+        maximum.extend_from_slice(&65_536_u32.to_be_bytes());
+        maximum.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+        maximum.resize(65_540, b'x');
+        let response = exchange(&maximum, registry).await;
+        assert!(matches!(
+            response_code(&response),
+            WireErrorCode::MalformedRequest
+        ));
+    }
+
+    #[tokio::test]
+    async fn strict_request_schema_rejects_every_malformed_form() {
+        let bodies: &[&[u8]] = &[
+            &[0xff],
+            br#"{"type":}"#,
+            br#"{"type":"list","type":"list"}"#,
+            br#"{"type":"list","extra":1}"#,
+            br"{}",
+            br#"{"type":"unknown"}"#,
+            br#"{"type":"status"}"#,
+            br#"{"type":"list"}{"type":"list"}"#,
+        ];
+        for body in bodies {
+            let (registry, _authority) =
+                one_server_registry(LifecycleState::test_phase(ServerPhase::Stopped));
+            let response = exchange(&raw_frame(PROTOCOL_VERSION, body), registry).await;
+            assert!(
+                matches!(
+                    serde_json::from_slice::<Response>(frame_body(&response)).unwrap(),
+                    Response::Error {
+                        error: ReceivedError {
+                            code: WireErrorCode::MalformedRequest,
+                            ..
+                        }
+                    }
+                ),
+                "accepted malformed body: {:?}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_headers_and_bodies_are_malformed() {
+        for request in [
+            vec![0, 0, 0],
+            [10_u32.to_be_bytes().as_slice(), &[0, 1], b"{}"].concat(),
+        ] {
+            let (registry, _authority) =
+                one_server_registry(LifecycleState::test_phase(ServerPhase::Stopped));
+            let response = exchange(&request, registry).await;
+            assert!(matches!(
+                response_code(&response),
+                WireErrorCode::MalformedRequest
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn version_one_succeeds_and_other_versions_skip_json() {
+        let (registry, _authority) =
+            one_server_registry(LifecycleState::test_phase(ServerPhase::Stopped));
+        let response = exchange(&raw_frame(1, br#"{"type":"list"}"#), registry).await;
+        assert!(matches!(
+            serde_json::from_slice::<Response>(frame_body(&response)).unwrap(),
+            Response::Success { .. }
+        ));
+
+        for version in [0, 2] {
+            let (registry, _authority) =
+                one_server_registry(LifecycleState::test_phase(ServerPhase::Stopped));
+            let response = exchange(&raw_frame(version, &[0xff, 0xff]), registry).await;
+            assert!(matches!(
+                response_code(&response),
+                WireErrorCode::UnsupportedProtocolVersion
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn incompatible_response_version_is_observed_without_reading_json() {
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        writer.write_all(&65_536_u32.to_be_bytes()).await.unwrap();
+        writer.write_all(&2_u16.to_be_bytes()).await.unwrap();
+        let ReadFrame::Version { version, body } = read_frame(&mut reader).await.unwrap();
+        assert_eq!(version, 2);
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn client_classifies_protocol_unknown_and_malformed_daemon_responses() {
+        assert!(matches!(
+            client_receives(raw_frame(2, &[0xff])).await,
+            Err(ClientError::ProtocolMismatch)
+        ));
+        assert!(matches!(
+            client_receives(error_frame(
+                WireErrorCode::UnknownServerId,
+                "diagnostic text is not contractual"
+            ))
+            .await,
+            Err(ClientError::UnknownServerId)
+        ));
+        for malformed in [
+            Vec::new(),
+            raw_frame(1, b"not json"),
+            raw_frame(1, br#"{"type":"success","result":{"type":"list"}}"#),
+            raw_frame(
+                1,
+                br#"{"type":"success","result":{"type":"list","servers":[],"extra":1}}"#,
+            ),
+        ] {
+            assert!(matches!(
+                client_receives(malformed).await,
+                Err(ClientError::DaemonUnavailable)
+            ));
+        }
+    }
+
+    #[test]
+    fn registry_list_is_sorted_and_preencoded_bytes_are_shared() {
+        let ids = ["survival".to_owned(), "creative".to_owned()];
+        let prepared = PreparedRegistry::new(ids.iter()).unwrap();
+        let (creative, _creative_authority) =
+            RuntimeStatusHandle::test("creative", LifecycleState::test_phase(ServerPhase::Stopped));
+        let (survival, _survival_authority) =
+            RuntimeStatusHandle::test("survival", LifecycleState::test_phase(ServerPhase::Stopped));
+        let registry = prepared
+            .activate(BTreeMap::from([
+                ("creative".to_owned(), creative),
+                ("survival".to_owned(), survival),
+            ]))
+            .unwrap();
+        let clone = registry.clone();
+        assert!(Arc::ptr_eq(
+            &registry.0.list_response,
+            &clone.0.list_response
+        ));
+        let Response::Success {
+            result: SuccessResult::List { servers },
+        } = serde_json::from_slice(frame_body(&registry.0.list_response)).unwrap()
+        else {
+            panic!("expected list response");
+        };
+        assert_eq!(servers, ["creative", "survival"]);
+    }
+
+    #[test]
+    fn preflight_rejects_oversized_list_and_worst_case_status() {
+        let list_ids = [
+            format!("a{}", "x".repeat(33_000)),
+            format!("b{}", "x".repeat(33_000)),
+        ];
+        let list_error = PreparedRegistry::new(list_ids.iter())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(list_error.contains("control protocol v1 response limit"));
+        assert!(list_error.contains("complete server list"));
+
+        let status_id = format!("a{}", "x".repeat(65_350));
+        let status_error = PreparedRegistry::new([&status_id].into_iter())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(status_error.contains("control protocol v1 response limit"));
+        assert!(status_error.contains("worst-case server status"));
+    }
+
+    #[test]
+    fn lifecycle_phase_and_failure_mappings_are_exact() {
+        let phases = [
+            (ServerPhase::Reconciling, "reconciling"),
+            (ServerPhase::Stopped, "stopped"),
+            (ServerPhase::Starting, "starting"),
+            (ServerPhase::Running, "running"),
+            (ServerPhase::Stopping, "stopping"),
+            (ServerPhase::Cooldown, "cooldown"),
+            (ServerPhase::External, "external"),
+            (ServerPhase::Conflict, "conflict"),
+        ];
+        for (internal, wire) in phases {
+            assert_eq!(WirePhase::from(internal).as_str(), wire);
+        }
+
+        let failures = [
+            (FailureCategory::LaunchFailed, "launch_failed"),
+            (FailureCategory::StartupTimedOut, "startup_timed_out"),
+            (FailureCategory::ExitedBeforeReady, "exited_before_ready"),
+            (FailureCategory::ExitedUnexpectedly, "exited_unexpectedly"),
+        ];
+        for (internal, wire) in failures {
+            assert_eq!(WireFailureCategory::from(internal).as_str(), wire);
+        }
+    }
+
+    #[test]
+    fn status_always_contains_exact_allowlisted_fields_and_explicit_nulls() {
+        let snapshot = LifecycleState::test_phase(ServerPhase::Stopped).status_snapshot();
+        let frame = status_frame("survival", snapshot, Instant::now());
+        let value: Value = serde_json::from_slice(frame_body(&frame)).unwrap();
+        let server = value["result"]["server"].as_object().unwrap();
+        let keys = server.keys().map(String::as_str).collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            [
+                "failure_category",
+                "failure_streak",
+                "phase",
+                "retry_after_ms",
+                "server_id"
+            ]
+        );
+        assert!(server["failure_category"].is_null());
+        assert!(server["retry_after_ms"].is_null());
+    }
+
+    #[test]
+    fn retry_milliseconds_ceil_and_expire_at_zero() {
+        let now = Instant::now();
+        assert_eq!(retry_milliseconds(now, now), 0);
+        assert_eq!(retry_milliseconds(now - Duration::from_secs(1), now), 0);
+        assert_eq!(retry_milliseconds(now + Duration::from_nanos(1), now), 1);
+        assert_eq!(retry_milliseconds(now + Duration::from_millis(1), now), 1);
+        assert_eq!(
+            retry_milliseconds(
+                now + Duration::from_millis(1) + Duration::from_nanos(1),
+                now
+            ),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn known_and_unknown_server_ids_have_contractual_results() {
+        let request = encode_frame(&Request::Status {
+            server_id: "survival".to_owned(),
+        })
+        .unwrap();
+        let (registry, _authority) =
+            one_server_registry(LifecycleState::test_phase(ServerPhase::Running));
+        let response = exchange(&request, registry).await;
+        assert!(matches!(
+            serde_json::from_slice::<Response>(frame_body(&response)).unwrap(),
+            Response::Success {
+                result: SuccessResult::Status { .. }
+            }
+        ));
+
+        let request = encode_frame(&Request::Status {
+            server_id: "missing".to_owned(),
+        })
+        .unwrap();
+        let (registry, _authority) =
+            one_server_registry(LifecycleState::test_phase(ServerPhase::Running));
+        let response = exchange(&request, registry).await;
+        assert!(matches!(
+            response_code(&response),
+            WireErrorCode::UnknownServerId
+        ));
+    }
+
+    #[tokio::test]
+    async fn closed_lifecycle_authority_closes_without_a_mixed_response() {
+        let (registry, authority) =
+            one_server_registry(LifecycleState::test_phase(ServerPhase::Running));
+        drop(authority);
+        let request = encode_frame(&Request::Status {
+            server_id: "survival".to_owned(),
+        })
+        .unwrap();
+        assert!(exchange(&request, registry).await.is_empty());
+    }
+
+    #[test]
+    fn snapshot_races_never_mix_fields_from_two_watch_values() {
+        let first = LifecycleState::test_status(ServerPhase::Stopped, None, 0, None);
+        let second = LifecycleState::test_status(
+            ServerPhase::Cooldown,
+            Some(FailureCategory::LaunchFailed),
+            2,
+            Some(Instant::now() + Duration::from_secs(10)),
+        );
+        let (handle, authority) = RuntimeStatusHandle::test("survival", first);
+        for index in 0..1_000 {
+            authority.send_replace(if index % 2 == 0 { second } else { first });
+            let snapshot = handle.snapshot().unwrap();
+            assert!(
+                (snapshot.phase == ServerPhase::Stopped
+                    && snapshot.failure.is_none()
+                    && snapshot.failure_streak == 0
+                    && snapshot.retry_at.is_none())
+                    || (snapshot.phase == ServerPhase::Cooldown
+                        && snapshot.failure == Some(FailureCategory::LaunchFailed)
+                        && snapshot.failure_streak == 2
+                        && snapshot.retry_at.is_some())
+            );
+        }
+    }
+
+    #[test]
+    fn encoded_responses_exclude_unallowlisted_runtime_details() {
+        let sentinels = [
+            "sentinel-password",
+            "sentinel-argument",
+            "sentinel-working-directory",
+            "127.0.0.1:25566",
+            "127.0.0.1:25575",
+        ];
+        let snapshot = LifecycleState::test_status(
+            ServerPhase::Cooldown,
+            Some(FailureCategory::LaunchFailed),
+            2,
+            Some(Instant::now() + Duration::from_secs(10)),
+        )
+        .status_snapshot();
+        let encoded = status_frame("survival", snapshot, Instant::now());
+        let text = String::from_utf8(frame_body(&encoded).to_vec()).unwrap();
+        for sentinel in sentinels {
+            assert!(!text.contains(sentinel));
+        }
+        for forbidden_field in [
+            "ownership",
+            "backend_authority",
+            "player_count",
+            "process_id",
+            "launch_generation",
+            "phase_started_at",
+        ] {
+            assert!(!text.contains(forbidden_field));
+        }
+    }
+
+    async fn deadline_case(
+        registry: Registry,
+        initial_write: &[u8],
+        capacity: usize,
+    ) -> Arc<Semaphore> {
+        let permits = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&permits).try_acquire_owned().unwrap();
+        let (mut client, server) = tokio::io::duplex(capacity);
+        let task = tokio::spawn(serve_accepted(server, registry, permit));
+        if !initial_write.is_empty() {
+            client.write_all(initial_write).await.unwrap();
+        }
+        tokio::task::yield_now().await;
+        advance(EXCHANGE_TIMEOUT).await;
+        task.await.unwrap();
+        permits
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_absolute_deadline_covers_slow_header_body_and_write() {
+        let (registry, _authority) =
+            one_server_registry(LifecycleState::test_phase(ServerPhase::Stopped));
+        assert_eq!(
+            deadline_case(registry, &[], 64).await.available_permits(),
+            1
+        );
+
+        let (registry, _authority) =
+            one_server_registry(LifecycleState::test_phase(ServerPhase::Stopped));
+        let partial_body = [100_u32.to_be_bytes().as_slice(), &[0, 1], b"{"].concat();
+        assert_eq!(
+            deadline_case(registry, &partial_body, 64)
+                .await
+                .available_permits(),
+            1
+        );
+
+        let ids = (0..100)
+            .map(|index| format!("server-{index:03}"))
+            .collect::<Vec<_>>();
+        let prepared = PreparedRegistry::new(ids.iter()).unwrap();
+        let mut handles = BTreeMap::new();
+        let mut authorities = Vec::new();
+        for id in &ids {
+            let (handle, authority) =
+                RuntimeStatusHandle::test(id, LifecycleState::test_phase(ServerPhase::Stopped));
+            handles.insert(id.clone(), handle);
+            authorities.push(authority);
+        }
+        let registry = prepared.activate(handles).unwrap();
+        let request = encode_frame(&Request::List).unwrap();
+        assert_eq!(
+            deadline_case(registry, &request, 64)
+                .await
+                .available_permits(),
+            1
+        );
+        drop(authorities);
+    }
+
+    #[tokio::test]
+    async fn cancellation_restores_the_control_permit() {
+        let permits = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&permits).try_acquire_owned().unwrap();
+        let (_client, server): (DuplexStream, DuplexStream) = tokio::io::duplex(64);
+        let (registry, _authority) =
+            one_server_registry(LifecycleState::test_phase(ServerPhase::Stopped));
+        let task = tokio::spawn(serve_accepted(server, registry, permit));
+        tokio::task::yield_now().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(permits.available_permits(), 1);
+    }
+
+    #[test]
+    fn thirty_two_permits_are_the_only_control_exchange_capacity() {
+        let permits = Arc::new(Semaphore::new(MAX_CONTROL_EXCHANGES));
+        let held = (0..MAX_CONTROL_EXCHANGES)
+            .map(|_| Arc::clone(&permits).try_acquire_owned().unwrap())
+            .collect::<Vec<_>>();
+        assert!(Arc::clone(&permits).try_acquire_owned().is_err());
+        drop(held);
+        assert_eq!(permits.available_permits(), MAX_CONTROL_EXCHANGES);
+    }
+}

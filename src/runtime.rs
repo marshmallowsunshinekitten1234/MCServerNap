@@ -16,7 +16,8 @@ use crate::context::ServerContext;
 use crate::endpoint::Endpoint;
 use crate::minecraft::{ClientRequest, ConnectionEnvelope, HandshakeIntent, MinecraftResponder};
 use crate::supervisor::{
-    self, BackendEndpoint, LifecycleState, ServerPhase, SupervisorConfig, WakeRequest,
+    self, BackendEndpoint, LifecycleState, LifecycleStatusSnapshot, ServerPhase, SupervisorConfig,
+    WakeRequest,
 };
 
 const PENDING_WAKE_CAPACITY: usize = 1;
@@ -73,6 +74,43 @@ pub struct ServerRuntime {
     supervisor: JoinHandle<Result<()>>,
     supervisor_shutdown: oneshot::Sender<()>,
     supervisor_wait_limit: Duration,
+}
+
+pub struct ActivatedServerRuntime {
+    pub runtime: ServerRuntime,
+    pub status: RuntimeStatusHandle,
+}
+
+#[derive(Clone)]
+pub struct RuntimeStatusHandle {
+    context: ServerContext,
+    lifecycle: watch::Receiver<LifecycleState>,
+}
+
+impl RuntimeStatusHandle {
+    pub(crate) fn server_id(&self) -> &str {
+        self.context.id()
+    }
+
+    pub(crate) fn snapshot(&self) -> Option<LifecycleStatusSnapshot> {
+        self.lifecycle.has_changed().ok()?;
+        Some(self.lifecycle.borrow().status_snapshot())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test(
+        server_id: &str,
+        lifecycle: LifecycleState,
+    ) -> (Self, watch::Sender<LifecycleState>) {
+        let (sender, receiver) = watch::channel(lifecycle);
+        (
+            Self {
+                context: ServerContext::new(server_id.to_owned()),
+                lifecycle: receiver,
+            },
+            sender,
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -271,7 +309,7 @@ impl PreparedServerRuntime {
 
 impl BoundServerRuntime {
     #[must_use]
-    pub fn activate(self) -> ServerRuntime {
+    pub fn activate(self) -> ActivatedServerRuntime {
         let BoundServerRuntime {
             bind_endpoint,
             listener,
@@ -300,6 +338,10 @@ impl BoundServerRuntime {
             BackendEndpoint::network(backend_endpoint.clone(), proxy_connect_timeout),
             Arc::clone(&backend_use),
         ));
+        let status = RuntimeStatusHandle {
+            context: context.clone(),
+            lifecycle: lifecycle.clone(),
+        };
         let client_context = ClientContext {
             context: context.clone(),
             lifecycle,
@@ -313,15 +355,18 @@ impl BoundServerRuntime {
 
         log::info!("[server={context}] Listening on {bind_endpoint}");
 
-        ServerRuntime {
-            context,
-            listener,
-            client_context,
-            connection_limit,
-            connections: JoinSet::new(),
-            supervisor,
-            supervisor_shutdown,
-            supervisor_wait_limit,
+        ActivatedServerRuntime {
+            status,
+            runtime: ServerRuntime {
+                context,
+                listener,
+                client_context,
+                connection_limit,
+                connections: JoinSet::new(),
+                supervisor,
+                supervisor_shutdown,
+                supervisor_wait_limit,
+            },
         }
     }
 }
@@ -721,6 +766,7 @@ mod tests {
             .await
             .expect("test runtime should bind")
             .activate()
+            .runtime
     }
 
     fn write_varint(value: i32, output: &mut Vec<u8>) {
@@ -1586,7 +1632,7 @@ mod tests {
         assert!(no_backend.is_err(), "binding must not probe the backend");
         assert!(no_launch.is_err(), "binding must not launch a process");
 
-        let runtime = bound.activate();
+        let runtime = bound.activate().runtime;
         assert_eq!(
             runtime.client_context.lifecycle.borrow().phase(),
             ServerPhase::Reconciling
@@ -1720,7 +1766,8 @@ mod tests {
         .bind()
         .await
         .unwrap()
-        .activate();
+        .activate()
+        .runtime;
         let second = ServerRuntime::prepare(
             runtime_config(
                 executable.to_string_lossy().into_owned(),
@@ -1734,7 +1781,8 @@ mod tests {
         .bind()
         .await
         .unwrap()
-        .activate();
+        .activate()
+        .runtime;
 
         assert!(Arc::ptr_eq(
             &first.connection_limit,
