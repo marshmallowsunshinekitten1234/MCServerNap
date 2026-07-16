@@ -57,24 +57,39 @@ name and set each named environment variable before starting the daemon.
 
 Stop the daemon with Ctrl+C. On Unix, SIGTERM is also supported.
 
-## Local status commands
+## Server control commands
 
-The daemon exposes a versioned, read-only local control endpoint. Run these
-commands as the same operating-system account that started the daemon. If a
-system service runs the daemon under a dedicated account, run these commands as
-that account too.
+Run control commands as the same operating-system account that started the
+daemon. If a system service runs the daemon under a dedicated account, run
+these commands as that account too.
 
-List configured server IDs or inspect one lifecycle status without loading the
-daemon configuration:
+List configured servers, check their status, or request a start or stop. These
+commands talk to the running MCServerNap process. The daemon uses the
+configuration it loaded at startup, so the commands do not reread the
+configuration file:
 
 ```console
-target/release/mcservernap list
-target/release/mcservernap status survival
+target/release/mcservernap server list
+target/release/mcservernap server status survival
+target/release/mcservernap server start survival
+target/release/mcservernap server stop survival
 ```
 
-Only the server ID, lifecycle phase, failure category and streak, and remaining
-retry delay are returned. Control requests cannot start, stop, or otherwise
-change a server.
+`server status` reports the current phase and recent failure or retry
+information. Start and stop are asynchronous: a successful command means the
+daemon accepted the request or no action was needed, not necessarily that
+Minecraft has finished starting or stopping. Use `server status` to follow
+progress.
+
+If the connection to the daemon fails before the result is known, the CLI
+reports an uncertain outcome and does not automatically resend the command.
+The command may already have been accepted, so check `server status` before
+deciding what to do next.
+
+`server stop` disconnects current players before stopping a Minecraft process
+started by MCServerNap. It does not disable future wake-ups: a later player can
+start the server again. MCServerNap never stops, restarts, or takes ownership of
+a Minecraft process it did not start.
 
 Control commands are available only on the local machine. On Unix, one daemon
 is supported per user account. On Windows, access is controlled by that
@@ -104,6 +119,11 @@ connect through the MCServerNap port. The launch command must keep Java in the
 foreground and preserve standard input; do not use a script that starts Java in
 the background and then exits.
 
+`command_timeout_seconds` applies separately to finishing active player
+connections and sending a graceful RCON or console stop command.
+`shutdown_timeout_seconds` then limits how long MCServerNap waits for the
+process to exit.
+
 ## Configuration notes
 
 Start from the example file and leave `schema_version = 3` unchanged. For
@@ -122,7 +142,9 @@ target/release/mcservernap stop --rcon-port 25575
 It uses `127.0.0.1` by default and reads the password from
 `MCSERVERNAP_RCON_PASSWORD`, or from `--rcon-pass`. This command talks directly
 to RCON and does not use the daemon configuration or its per-server
-`password_env` names.
+`password_env` names. It is distinct from `server stop`, remains usable when the
+listener configuration is missing or invalid, and never contacts the control
+daemon.
 
 ## Troubleshooting
 

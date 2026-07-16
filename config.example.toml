@@ -23,6 +23,7 @@ poll_interval_seconds = 60
 idle_timeout_seconds = 600
 startup_timeout_seconds = 600
 retry_interval_seconds = 2
+# Separately bounds proxy quiescence/exclusivity and graceful command delivery.
 command_timeout_seconds = 10
 shutdown_timeout_seconds = 30
 handshake_timeout_seconds = 5
