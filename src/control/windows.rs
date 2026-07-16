@@ -467,7 +467,7 @@ mod tests {
             .unwrap();
         malformed.write_all(&[0, 0, 0, 1]).await.unwrap();
         let ReadFrame::Version { version, body } = read_frame(&mut malformed).await.unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
         assert!(matches!(
             serde_json::from_slice::<Response>(&body).unwrap(),
             Response::Error { .. }
@@ -482,7 +482,7 @@ mod tests {
             .await
             .unwrap();
         let ReadFrame::Version { version, body } = read_frame(&mut client).await.unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
         assert!(matches!(
             serde_json::from_slice::<Response>(&body).unwrap(),
             Response::Success {

@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -16,11 +17,11 @@ use crate::context::ServerContext;
 use crate::endpoint::Endpoint;
 use crate::minecraft::{ClientRequest, ConnectionEnvelope, HandshakeIntent, MinecraftResponder};
 use crate::supervisor::{
-    self, BackendEndpoint, LifecycleState, LifecycleStatusSnapshot, ServerPhase, SupervisorConfig,
-    WakeRequest,
+    self, BackendEndpoint, FatalSignal, LifecycleState, LifecycleStatusSnapshot,
+    MUTATION_QUEUE_CAPACITY, MutationEnvelope, QuiescenceRequest, ServerPhase, SupervisorConfig,
+    WakeLatchRoot, WakeLatchSender, WakeRequest,
 };
 
-const PENDING_WAKE_CAPACITY: usize = 1;
 const SUPERVISOR_SHUTDOWN_MARGIN: Duration = Duration::from_secs(10);
 
 fn supervisor_shutdown_wait_limit(
@@ -28,10 +29,11 @@ fn supervisor_shutdown_wait_limit(
     shutdown_timeout: Duration,
 ) -> Result<Duration> {
     command_timeout
-        .checked_add(shutdown_timeout)
+        .checked_add(command_timeout)
+        .and_then(|combined| combined.checked_add(shutdown_timeout))
         .and_then(|combined| combined.checked_add(SUPERVISOR_SHUTDOWN_MARGIN))
         .context(
-            "command_timeout_seconds plus shutdown_timeout_seconds and the supervisor shutdown margin exceed the supported duration; reduce one of the timeout settings",
+            "twice command_timeout_seconds plus shutdown_timeout_seconds and the supervisor shutdown margin exceed the supported duration; reduce one of the timeout settings",
         )
 }
 
@@ -71,6 +73,14 @@ pub struct ServerRuntime {
     client_context: ClientContext,
     connection_limit: Arc<Semaphore>,
     connections: JoinSet<()>,
+    wake_latch: WakeLatchRoot,
+    quiescence: mpsc::Receiver<QuiescenceRequest>,
+    #[cfg(test)]
+    quiescence_requests: mpsc::Sender<QuiescenceRequest>,
+    quiescence_closed: bool,
+    fatal: watch::Receiver<bool>,
+    fatal_signal: FatalSignal,
+    runtime_drained: watch::Sender<bool>,
     supervisor: JoinHandle<Result<()>>,
     supervisor_shutdown: oneshot::Sender<()>,
     supervisor_wait_limit: Duration,
@@ -78,16 +88,20 @@ pub struct ServerRuntime {
 
 pub struct ActivatedServerRuntime {
     pub runtime: ServerRuntime,
-    pub status: RuntimeStatusHandle,
+    pub control: RuntimeControlHandle,
 }
 
 #[derive(Clone)]
-pub struct RuntimeStatusHandle {
+pub struct RuntimeControlHandle {
     context: ServerContext,
     lifecycle: watch::Receiver<LifecycleState>,
+    mutations: mpsc::Sender<MutationEnvelope>,
 }
 
-impl RuntimeStatusHandle {
+#[cfg(test)]
+pub(crate) type RuntimeStatusHandle = RuntimeControlHandle;
+
+impl RuntimeControlHandle {
     pub(crate) fn server_id(&self) -> &str {
         self.context.id()
     }
@@ -97,18 +111,46 @@ impl RuntimeStatusHandle {
         Some(self.lifecycle.borrow().status_snapshot())
     }
 
+    pub(crate) fn mutation_sender(&self) -> mpsc::Sender<MutationEnvelope> {
+        self.mutations.clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn test(
         server_id: &str,
         lifecycle: LifecycleState,
     ) -> (Self, watch::Sender<LifecycleState>) {
         let (sender, receiver) = watch::channel(lifecycle);
+        let (mutations, _receiver) = mpsc::channel(MUTATION_QUEUE_CAPACITY);
         (
             Self {
                 context: ServerContext::new(server_id.to_owned()),
                 lifecycle: receiver,
+                mutations,
             },
             sender,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_mutations(
+        server_id: &str,
+        lifecycle: LifecycleState,
+    ) -> (
+        Self,
+        watch::Sender<LifecycleState>,
+        mpsc::Receiver<MutationEnvelope>,
+    ) {
+        let (sender, receiver) = watch::channel(lifecycle);
+        let (mutations, mutation_receiver) = mpsc::channel(MUTATION_QUEUE_CAPACITY);
+        (
+            Self {
+                context: ServerContext::new(server_id.to_owned()),
+                lifecycle: receiver,
+                mutations,
+            },
+            sender,
+            mutation_receiver,
         )
     }
 }
@@ -117,7 +159,7 @@ impl RuntimeStatusHandle {
 struct ClientContext {
     context: ServerContext,
     lifecycle: watch::Receiver<LifecycleState>,
-    wake_requests: mpsc::Sender<WakeRequest>,
+    wake_requests: WakeLatchSender,
     backend_use: Arc<BackendUseCoordinator>,
     responder: Arc<MinecraftResponder>,
     backend_endpoint: Endpoint,
@@ -129,9 +171,15 @@ enum RunExit {
     Shutdown(Result<()>),
     Supervisor(std::result::Result<Result<()>, tokio::task::JoinError>),
     ClientTaskPanic(tokio::task::JoinError),
+    Fatal,
+    QuiescenceFailure(anyhow::Error),
 }
 
 impl ServerRuntime {
+    pub(crate) fn fatal_observer(&self) -> watch::Receiver<bool> {
+        self.fatal.clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn replace_supervisor<F, Fut>(&mut self, run: F)
     where
@@ -142,6 +190,14 @@ impl ServerRuntime {
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         self.supervisor_shutdown = shutdown_sender;
         self.supervisor = tokio::spawn(run(shutdown_receiver));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_client_task<F>(&mut self, task: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.connections.spawn(task);
     }
 
     pub fn prepare(
@@ -176,20 +232,132 @@ impl ServerRuntime {
         })
     }
 
+    // Keeping the prioritized runtime select in one place makes listener and drain ownership clear.
+    #[allow(clippy::too_many_lines)]
     pub async fn run_until<F>(mut self, shutdown: F) -> Result<()>
     where
         F: Future<Output = Result<()>>,
     {
         tokio::pin!(shutdown);
 
-        let exit = loop {
+        let exit = 'runtime: loop {
             tokio::select! {
                 biased;
 
                 result = &mut self.supervisor => break RunExit::Supervisor(result),
                 result = &mut shutdown => break RunExit::Shutdown(result),
+                changed = self.fatal.changed() => {
+                    if changed.is_ok() && *self.fatal.borrow() {
+                        break RunExit::Fatal;
+                    }
+                }
+                request = self.quiescence.recv(), if !self.quiescence_closed => {
+                    let Some(mut request) = request else {
+                        self.quiescence_closed = true;
+                        continue;
+                    };
+                    self.connections.abort_all();
+                    let mut interruption = None;
+                    let mut shutdown_result = None;
+                    let mut drain_panic = None;
+                    while !self.connections.is_empty() {
+                        if interruption.is_some() {
+                            if record_client_panic(
+                                self.connections.join_next().await,
+                                &mut drain_panic,
+                                "client task panicked during runtime quiescence",
+                            ) {
+                                self.fatal_signal.raise();
+                            }
+                            continue;
+                        }
+                        tokio::select! {
+                            biased;
+
+                            result = &mut self.supervisor => {
+                                interruption = Some(RunExit::Supervisor(result));
+                            }
+                            result = &mut shutdown, if shutdown_result.is_none() => {
+                                shutdown_result = Some(result);
+                            }
+                            changed = self.fatal.changed() => {
+                                match changed {
+                                    Ok(()) if *self.fatal.borrow_and_update() => {
+                                        interruption = Some(RunExit::Fatal);
+                                    }
+                                    Ok(()) => {}
+                                    Err(_) => {
+                                        self.fatal_signal.raise();
+                                        interruption = Some(RunExit::QuiescenceFailure(anyhow::anyhow!(
+                                            "fatal runtime signal closed during quiescence"
+                                        )));
+                                    }
+                                }
+                            }
+                            () = request.acknowledged.closed() => {
+                                self.fatal_signal.raise();
+                                interruption = Some(RunExit::QuiescenceFailure(anyhow::anyhow!(
+                                    "runtime quiescence acknowledgement receiver disappeared"
+                                )));
+                            }
+                            completed = self.connections.join_next() => {
+                                if record_client_panic(
+                                    completed,
+                                    &mut drain_panic,
+                                    "client task panicked during runtime quiescence",
+                                ) {
+                                    self.fatal_signal.raise();
+                                }
+                            }
+                        }
+                    }
+                    if interruption.is_none() && self.supervisor.is_finished() {
+                        interruption = Some(RunExit::Supervisor((&mut self.supervisor).await));
+                    }
+                    if interruption.is_none() && *self.fatal.borrow() {
+                        interruption = Some(RunExit::Fatal);
+                    }
+                    if interruption.is_none() && request.acknowledged.is_closed() {
+                        self.fatal_signal.raise();
+                        interruption = Some(RunExit::QuiescenceFailure(anyhow::anyhow!(
+                            "runtime quiescence acknowledgement receiver disappeared"
+                        )));
+                    }
+                    if interruption.is_none() && shutdown_result.is_none() {
+                        let shutdown_ready = std::future::poll_fn(|task| {
+                            Poll::Ready(match shutdown.as_mut().poll(task) {
+                                Poll::Ready(result) => Some(result),
+                                Poll::Pending => None,
+                            })
+                        })
+                        .await;
+                        if let Some(result) = shutdown_ready {
+                            shutdown_result = Some(result);
+                        }
+                    }
+                    if let Some(error) = drain_panic {
+                        self.fatal_signal.raise();
+                        let _ = request.acknowledged.send(Err(anyhow::anyhow!(error.to_string())));
+                        break 'runtime RunExit::QuiescenceFailure(error);
+                    }
+                    if let Some(exit) = interruption {
+                        break 'runtime exit;
+                    }
+                    if request.acknowledged.send(Ok(())).is_err()
+                        && !*self.fatal.borrow()
+                    {
+                        self.fatal_signal.raise();
+                        break 'runtime RunExit::QuiescenceFailure(anyhow::anyhow!(
+                            "runtime quiescence acknowledgement receiver disappeared"
+                        ));
+                    }
+                    if let Some(result) = shutdown_result {
+                        break 'runtime RunExit::Shutdown(result);
+                    }
+                }
                 completed = self.connections.join_next(), if !self.connections.is_empty() => {
                     if let Some(Err(error)) = completed {
+                        self.fatal_signal.raise();
                         break RunExit::ClientTaskPanic(error);
                     }
                 }
@@ -228,16 +396,19 @@ impl ServerRuntime {
             }
         };
 
+        self.wake_latch.close();
         self.connections.abort_all();
         let mut cleanup_client_panic = None;
         while let Some(completed) = self.connections.join_next().await {
-            if let Err(error) = completed
-                && error.is_panic()
-                && cleanup_client_panic.is_none()
-            {
-                cleanup_client_panic = Some(anyhow::anyhow!("client task panicked: {error}"));
+            if record_client_panic(
+                Some(completed),
+                &mut cleanup_client_panic,
+                "client task panicked",
+            ) {
+                self.fatal_signal.raise();
             }
         }
+        self.runtime_drained.send_replace(true);
 
         match exit {
             RunExit::Supervisor(result) => combine_runtime_errors(
@@ -259,19 +430,25 @@ impl ServerRuntime {
                 self.finish_shutdown(combine_runtime_errors(client_panic, cleanup_client_panic))
                     .await
             }
+            RunExit::QuiescenceFailure(error) => self.finish_shutdown(Err(error)).await,
+            RunExit::Fatal => {
+                let cleanup =
+                    await_supervisor_shutdown(&mut self.supervisor, self.supervisor_wait_limit)
+                        .await;
+                match cleanup {
+                    Ok(()) => Err(anyhow::anyhow!("server supervisor entered fatal shutdown")),
+                    Err(error) => {
+                        Err(error).context("server supervisor failed after fatal escalation")
+                    }
+                }
+            }
         }
     }
 
     async fn finish_shutdown(mut self, shutdown_result: Result<()>) -> Result<()> {
-        let shutdown_requested = self.supervisor_shutdown.send(()).is_ok();
-        let mut cleanup_result =
+        let _ = self.supervisor_shutdown.send(());
+        let cleanup_result =
             await_supervisor_shutdown(&mut self.supervisor, self.supervisor_wait_limit).await;
-        if !shutdown_requested && cleanup_result.is_ok() {
-            cleanup_result = Err(anyhow::anyhow!(
-                "server supervisor stopped before shutdown was requested"
-            ));
-        }
-
         match (shutdown_result, cleanup_result) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -291,6 +468,21 @@ fn combine_runtime_errors(primary: Result<()>, additional: Option<anyhow::Error>
             Err(primary.context(format!("another runtime failure occurred: {additional:#}")))
         }
     }
+}
+
+fn record_client_panic(
+    completed: Option<std::result::Result<(), tokio::task::JoinError>>,
+    panic: &mut Option<anyhow::Error>,
+    context: &'static str,
+) -> bool {
+    if let Some(Err(error)) = completed
+        && error.is_panic()
+        && panic.is_none()
+    {
+        *panic = Some(anyhow::anyhow!("{context}: {error}"));
+        return true;
+    }
+    false
 }
 
 impl PreparedServerRuntime {
@@ -326,21 +518,32 @@ impl BoundServerRuntime {
             connection_limit,
         } = inputs;
 
-        let (wake_requests, wake_receiver) = mpsc::channel(PENDING_WAKE_CAPACITY);
+        let (wake_latch, wake_requests, wake_receiver) = supervisor::wake_latch();
+        let (mutations, mutation_receiver) = mpsc::channel(MUTATION_QUEUE_CAPACITY);
+        let (quiescence_requests, quiescence) = mpsc::channel(1);
+        #[cfg(test)]
+        let test_quiescence_requests = quiescence_requests.clone();
+        let (fatal_signal, fatal) = FatalSignal::new();
+        let (runtime_drained, runtime_drained_receiver) = watch::channel(false);
         let (supervisor_shutdown, shutdown_receiver) = oneshot::channel();
         let (lifecycle_sender, lifecycle) = watch::channel(LifecycleState::reconciling());
         let backend_use = Arc::new(BackendUseCoordinator::new());
         let supervisor = tokio::spawn(supervisor::run(
             wake_receiver,
+            mutation_receiver,
+            quiescence_requests,
+            fatal_signal.clone(),
+            runtime_drained_receiver,
             shutdown_receiver,
             lifecycle_sender,
             supervisor_config,
             BackendEndpoint::network(backend_endpoint.clone(), proxy_connect_timeout),
             Arc::clone(&backend_use),
         ));
-        let status = RuntimeStatusHandle {
+        let control = RuntimeControlHandle {
             context: context.clone(),
             lifecycle: lifecycle.clone(),
+            mutations,
         };
         let client_context = ClientContext {
             context: context.clone(),
@@ -356,13 +559,21 @@ impl BoundServerRuntime {
         log::info!("[server={context}] Listening on {bind_endpoint}");
 
         ActivatedServerRuntime {
-            status,
+            control,
             runtime: ServerRuntime {
                 context,
                 listener,
                 client_context,
                 connection_limit,
                 connections: JoinSet::new(),
+                wake_latch,
+                quiescence,
+                #[cfg(test)]
+                quiescence_requests: test_quiescence_requests,
+                quiescence_closed: false,
+                fatal,
+                fatal_signal: fatal_signal.clone(),
+                runtime_drained,
                 supervisor,
                 supervisor_shutdown,
                 supervisor_wait_limit,
@@ -468,19 +679,13 @@ async fn handle_sampled_connection(
             ) {
                 match context
                     .wake_requests
-                    .try_send(WakeRequest::observed(observed_lifecycle))
+                    .enqueue(WakeRequest::observed(observed_lifecycle))
                 {
                     Ok(()) => log::info!(
                         "[server={}] Queued server wake-up request from {peer}",
                         context.context
                     ),
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        log::debug!(
-                            "[server={}] Wake-up request already pending",
-                            context.context
-                        );
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                    Err(supervisor::WakeLatchError::Closed) => {
                         bail!("server supervisor wake channel is closed");
                     }
                 }
@@ -677,6 +882,42 @@ mod tests {
     use crate::process::LaunchCommand;
     use crate::rcon::RconSecret;
     use crate::supervisor::RconConfig;
+
+    struct DropNotice(Option<oneshot::Sender<()>>);
+
+    impl Drop for DropNotice {
+        fn drop(&mut self) {
+            if let Some(notice) = self.0.take() {
+                let _ = notice.send(());
+            }
+        }
+    }
+
+    struct BlockingDrop {
+        started: Option<oneshot::Sender<()>>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Drop for BlockingDrop {
+        fn drop(&mut self) {
+            if let Some(started) = self.started.take() {
+                let _ = started.send(());
+            }
+            self.release
+                .recv()
+                .expect("test should release the blocked client-task drop");
+        }
+    }
+
+    struct ShutdownOnDrop(Option<oneshot::Sender<()>>);
+
+    impl Drop for ShutdownOnDrop {
+        fn drop(&mut self) {
+            if let Some(shutdown) = self.0.take() {
+                let _ = shutdown.send(());
+            }
+        }
+    }
 
     fn runtime_config(
         command: String,
@@ -879,16 +1120,13 @@ mod tests {
         .expect("proxy activity should reach the expected session count");
     }
 
-    fn assert_no_wake(wake_receiver: &mut mpsc::Receiver<WakeRequest>) {
-        assert!(matches!(
-            wake_receiver.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)
-        ));
+    fn assert_no_wake(wake_receiver: &mut supervisor::WakeLatchReceiver) {
+        assert!(wake_receiver.try_recv().is_none());
     }
 
     fn client_context_with_lifecycle(
         phase: ServerPhase,
-        wake_requests: mpsc::Sender<WakeRequest>,
+        wake_requests: WakeLatchSender,
         backend_port: u16,
     ) -> (ClientContext, watch::Sender<LifecycleState>) {
         let lifecycle_state = LifecycleState::test_phase(phase);
@@ -918,7 +1156,7 @@ mod tests {
             .local_addr()
             .expect("backend listener has an address")
             .port();
-        let (wake_sender, mut wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, mut wake_receiver) = supervisor::wake_latch();
         let (context, _lifecycle_authority) =
             client_context_with_lifecycle(phase, wake_sender, backend_port);
         let (mut client, server) = connected_pair().await;
@@ -988,7 +1226,7 @@ mod tests {
             .await
             .expect("backend listener should bind");
         let backend_port = backend_listener.local_addr().unwrap().port();
-        let (wake_sender, _wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, _wake_receiver) = supervisor::wake_latch();
         let (context, lifecycle_authority) =
             client_context_with_lifecycle(ServerPhase::Running, wake_sender, backend_port);
         let cycle = context.lifecycle.borrow().owned_running_cycle().unwrap();
@@ -1034,7 +1272,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn status_reader_first_finishes_replay_before_stopping() {
-        let (wake_sender, _wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, _wake_receiver) = supervisor::wake_latch();
         let (context, lifecycle_authority) =
             client_context_with_lifecycle(ServerPhase::Running, wake_sender, 9);
         let backend_use = Arc::clone(&context.backend_use);
@@ -1078,7 +1316,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_connect_revalidation_prevents_replay_to_a_changed_cycle() {
-        let (wake_sender, _wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, _wake_receiver) = supervisor::wake_latch();
         let (context, lifecycle_authority) =
             client_context_with_lifecycle(ServerPhase::Running, wake_sender, 9);
         let cycle = context.lifecycle.borrow().owned_running_cycle().unwrap();
@@ -1102,7 +1340,7 @@ mod tests {
 
     #[tokio::test]
     async fn login_session_is_established_only_after_complete_replay() {
-        let (wake_sender, _wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, _wake_receiver) = supervisor::wake_latch();
         let (context, _lifecycle_authority) =
             client_context_with_lifecycle(ServerPhase::Running, wake_sender, 9);
         let cycle = context.lifecycle.borrow().owned_running_cycle().unwrap();
@@ -1144,7 +1382,7 @@ mod tests {
 
     #[tokio::test]
     async fn cycle_change_at_replay_completion_rejects_session() {
-        let (wake_sender, _wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, _wake_receiver) = supervisor::wake_latch();
         let (context, lifecycle_authority) =
             client_context_with_lifecycle(ServerPhase::Running, wake_sender, 9);
         let cycle = context.lifecycle.borrow().owned_running_cycle().unwrap();
@@ -1169,7 +1407,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_replay_records_no_session_activity() {
-        let (wake_sender, _wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, _wake_receiver) = supervisor::wake_latch();
         let (context, _lifecycle_authority) =
             client_context_with_lifecycle(ServerPhase::Running, wake_sender, 9);
         let cycle = context.lifecycle.borrow().owned_running_cycle().unwrap();
@@ -1210,7 +1448,7 @@ mod tests {
         ] {
             let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let backend_port = backend_listener.local_addr().unwrap().port();
-            let (wake_sender, _wake_receiver) = mpsc::channel(1);
+            let (_wake_root, wake_sender, _wake_receiver) = supervisor::wake_latch();
             let (context, _lifecycle_authority) =
                 client_context_with_lifecycle(ServerPhase::Running, wake_sender, backend_port);
             let backend_use = Arc::clone(&context.backend_use);
@@ -1256,7 +1494,7 @@ mod tests {
     async fn status_releases_lease_after_replay_without_changing_activity() {
         let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_port = backend_listener.local_addr().unwrap().port();
-        let (wake_sender, _wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, _wake_receiver) = supervisor::wake_latch();
         let (context, _lifecycle_authority) =
             client_context_with_lifecycle(ServerPhase::Running, wake_sender, backend_port);
         let backend_use = Arc::clone(&context.backend_use);
@@ -1295,7 +1533,7 @@ mod tests {
 
     #[tokio::test]
     async fn sleeping_unknown_intent_closes_without_response_or_wake() {
-        let (wake_sender, mut wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, mut wake_receiver) = supervisor::wake_latch();
         let (context, _lifecycle_authority) =
             client_context_with_lifecycle(ServerPhase::Stopped, wake_sender, 9);
         let (mut client, server) = connected_pair().await;
@@ -1324,7 +1562,7 @@ mod tests {
     async fn sleeping_incompatible_login_disconnects_without_login_start_or_wake() {
         let version = crate::minecraft::MinecraftVersion::latest();
         let unsupported_protocol = version.protocol() - 1;
-        let (wake_sender, mut wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, mut wake_receiver) = supervisor::wake_latch();
         let (context, _lifecycle_authority) =
             client_context_with_lifecycle(ServerPhase::Stopped, wake_sender, 9);
         let (mut client, server) = connected_pair().await;
@@ -1356,7 +1594,7 @@ mod tests {
             (ServerPhase::Stopped, 3),
             (ServerPhase::Cooldown, 2),
         ] {
-            let (wake_sender, mut wake_receiver) = mpsc::channel(1);
+            let (_wake_root, wake_sender, wake_receiver) = supervisor::wake_latch();
             let (context, _lifecycle_authority) =
                 client_context_with_lifecycle(phase, wake_sender, 9);
             let observed = *context.lifecycle.borrow();
@@ -1395,7 +1633,7 @@ mod tests {
             .local_addr()
             .expect("backend listener has an address")
             .port();
-        let (wake_sender, mut wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, mut wake_receiver) = supervisor::wake_latch();
         let (context, lifecycle_sender) =
             client_context_with_lifecycle(ServerPhase::Stopped, wake_sender, backend_port);
         let backend_use = Arc::clone(&context.backend_use);
@@ -1454,7 +1692,7 @@ mod tests {
             .local_addr()
             .expect("backend listener has an address")
             .port();
-        let (wake_sender, mut wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, wake_receiver) = supervisor::wake_latch();
         let (context, lifecycle_sender) =
             client_context_with_lifecycle(ServerPhase::Running, wake_sender, backend_port);
         let (mut client, server) = connected_pair().await;
@@ -1496,7 +1734,7 @@ mod tests {
 
     #[tokio::test]
     async fn lifecycle_snapshot_remains_frozen_after_sampling() {
-        let (wake_sender, mut wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, wake_receiver) = supervisor::wake_latch();
         let (context, lifecycle_sender) =
             client_context_with_lifecycle(ServerPhase::Stopped, wake_sender, 9);
         let (mut client, server) = connected_pair().await;
@@ -1537,7 +1775,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_backend_failure_does_not_fall_back_or_wake() {
-        let (wake_sender, mut wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, mut wake_receiver) = supervisor::wake_latch();
         let (mut context, _lifecycle_authority) =
             client_context_with_lifecycle(ServerPhase::Running, wake_sender, 0);
         context.proxy_connect_timeout = Duration::from_millis(25);
@@ -1573,7 +1811,7 @@ mod tests {
 
     #[tokio::test]
     async fn conflict_disconnects_exactly_and_coalesces_demand() {
-        let (wake_sender, mut wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, wake_receiver) = supervisor::wake_latch();
         let (context, _lifecycle_authority) =
             client_context_with_lifecycle(ServerPhase::Conflict, wake_sender, 9);
         let mut responses = Vec::new();
@@ -1601,11 +1839,8 @@ mod tests {
         assert_eq!(responses[0], responses[1]);
         let text = String::from_utf8_lossy(&responses[0]);
         assert!(text.contains("MCServerNap cannot safely start the server"));
-        assert!(wake_receiver.try_recv().is_ok());
-        assert!(matches!(
-            wake_receiver.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
-        ));
+        assert!(wake_receiver.try_recv().is_some());
+        assert!(wake_receiver.try_recv().is_none());
     }
 
     #[tokio::test]
@@ -1725,7 +1960,9 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_watchdog_is_validated_before_listener_binding() {
-        let reserved_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let namespace = crate::test_support::allocate_tcp_namespace();
+        let [reserved_address] = crate::test_support::tcp_addresses(namespace);
+        let reserved_listener = TcpListener::bind(reserved_address).await.unwrap();
         let reserved_address = reserved_listener.local_addr().unwrap();
         let executable = std::env::current_exe().expect("test executable path should be known");
         let mut config = runtime_config(
@@ -2053,6 +2290,224 @@ mod tests {
             .expect("runtime should release its listener");
     }
 
+    #[tokio::test]
+    async fn normal_quiescence_drains_tasks_then_resumes_acceptance() {
+        let executable = std::env::current_exe().unwrap();
+        let mut runtime = bind_test_runtime(runtime_config(
+            executable.to_string_lossy().into_owned(),
+            Vec::new(),
+            Endpoint::new("127.0.0.1", 9),
+        ))
+        .await;
+        let address = runtime.listener.local_addr().unwrap();
+        let connection_limit = Arc::clone(&runtime.connection_limit);
+        let (task_started, started) = oneshot::channel();
+        let (task_dropped, dropped) = oneshot::channel();
+        runtime.connections.spawn(async move {
+            let _notice = DropNotice(Some(task_dropped));
+            task_started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        started.await.unwrap();
+
+        let (acknowledged, acknowledgement) = oneshot::channel();
+        runtime
+            .quiescence_requests
+            .try_send(QuiescenceRequest { acknowledged })
+            .unwrap();
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let runtime_task = tokio::spawn(runtime.run_until(async move {
+            shutdown_receiver
+                .await
+                .context("test shutdown sender was dropped")?;
+            Ok(())
+        }));
+
+        timeout(Duration::from_secs(2), dropped)
+            .await
+            .expect("quiescence should abort the client task")
+            .unwrap();
+        timeout(Duration::from_secs(2), acknowledgement)
+            .await
+            .expect("quiescence acknowledgement should be bounded")
+            .unwrap()
+            .unwrap();
+
+        let _client = TcpStream::connect(address).await.unwrap();
+        timeout(Duration::from_secs(2), async {
+            while connection_limit.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("listener acceptance should resume after acknowledgement");
+        shutdown_sender.send(()).unwrap();
+        runtime_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_before_queued_quiescence_still_reports_permanent_drain() {
+        let executable = std::env::current_exe().unwrap();
+        let mut runtime = bind_test_runtime(runtime_config(
+            executable.to_string_lossy().into_owned(),
+            Vec::new(),
+            Endpoint::new("127.0.0.1", 9),
+        ))
+        .await;
+        runtime.replace_supervisor(|shutdown| async move {
+            shutdown
+                .await
+                .context("runtime should request supervisor shutdown")?;
+            Ok(())
+        });
+        let mut drained = runtime.runtime_drained.subscribe();
+        let fatal = runtime.fatal_observer();
+        let (acknowledged, acknowledgement) = oneshot::channel();
+        runtime
+            .quiescence_requests
+            .try_send(QuiescenceRequest { acknowledged })
+            .unwrap();
+
+        runtime.run_until(async { Ok(()) }).await.unwrap();
+        assert!(acknowledgement.await.is_err());
+        if !*drained.borrow_and_update() {
+            drained.changed().await.unwrap();
+        }
+        assert!(*drained.borrow());
+        assert!(!*fatal.borrow());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_while_client_task_is_draining_acknowledges_after_join() {
+        let executable = std::env::current_exe().unwrap();
+        let mut runtime = bind_test_runtime(runtime_config(
+            executable.to_string_lossy().into_owned(),
+            Vec::new(),
+            Endpoint::new("127.0.0.1", 9),
+        ))
+        .await;
+        runtime.replace_supervisor(|shutdown| async move {
+            shutdown
+                .await
+                .context("runtime should request supervisor shutdown")?;
+            Ok(())
+        });
+        let (drop_started, dropping) = oneshot::channel();
+        let (release_drop, released) = std::sync::mpsc::channel();
+        let (task_started, started) = oneshot::channel();
+        runtime.connections.spawn(async move {
+            let _guard = BlockingDrop {
+                started: Some(drop_started),
+                release: released,
+            };
+            task_started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        started.await.unwrap();
+        let (acknowledged, acknowledgement) = oneshot::channel();
+        runtime
+            .quiescence_requests
+            .try_send(QuiescenceRequest { acknowledged })
+            .unwrap();
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let runtime_task = tokio::spawn(runtime.run_until(async move {
+            shutdown_receiver
+                .await
+                .context("test should request runtime shutdown")?;
+            Ok(())
+        }));
+
+        dropping
+            .await
+            .expect("quiescence should begin dropping the client task");
+        shutdown_sender.send(()).unwrap();
+        release_drop.send(()).unwrap();
+        acknowledgement
+            .await
+            .expect("runtime should retain acknowledgement ownership")
+            .expect("completed drainage should be acknowledged");
+        runtime_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_after_final_client_drop_still_precedes_acknowledged_exit() {
+        let executable = std::env::current_exe().unwrap();
+        let mut runtime = bind_test_runtime(runtime_config(
+            executable.to_string_lossy().into_owned(),
+            Vec::new(),
+            Endpoint::new("127.0.0.1", 9),
+        ))
+        .await;
+        runtime.replace_supervisor(|shutdown| async move {
+            shutdown
+                .await
+                .context("runtime should request supervisor shutdown")?;
+            Ok(())
+        });
+        let (shutdown_sender, shutdown_receiver) = oneshot::channel();
+        let (task_started, started) = oneshot::channel();
+        runtime.connections.spawn(async move {
+            let _guard = ShutdownOnDrop(Some(shutdown_sender));
+            task_started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        started.await.unwrap();
+        let (acknowledged, acknowledgement) = oneshot::channel();
+        runtime
+            .quiescence_requests
+            .try_send(QuiescenceRequest { acknowledged })
+            .unwrap();
+
+        let result = runtime
+            .run_until(async move {
+                shutdown_receiver
+                    .await
+                    .context("final client drop should request shutdown")?;
+                Ok(())
+            })
+            .await;
+        acknowledgement
+            .await
+            .expect("runtime should retain acknowledgement ownership")
+            .expect("empty JoinSet should be acknowledged before exit");
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_quiescence_is_fatal_and_publishes_drain() {
+        let executable = std::env::current_exe().unwrap();
+        let runtime = bind_test_runtime(runtime_config(
+            executable.to_string_lossy().into_owned(),
+            Vec::new(),
+            Endpoint::new("127.0.0.1", 9),
+        ))
+        .await;
+        let mut drained = runtime.runtime_drained.subscribe();
+        let (acknowledged, acknowledgement) = oneshot::channel();
+        drop(acknowledgement);
+        runtime
+            .quiescence_requests
+            .try_send(QuiescenceRequest { acknowledged })
+            .unwrap();
+
+        let error = timeout(
+            Duration::from_secs(2),
+            runtime.run_until(std::future::pending()),
+        )
+        .await
+        .expect("cancelled quiescence cleanup should be bounded")
+        .expect_err("a missing acknowledgement receiver is fatal");
+        assert!(
+            error
+                .to_string()
+                .contains("quiescence acknowledgement receiver disappeared")
+        );
+        if !*drained.borrow_and_update() {
+            drained.changed().await.unwrap();
+        }
+        assert!(*drained.borrow());
+    }
+
     #[test]
     fn supervisor_watchdog_includes_all_shutdown_budgets() {
         let command_delivery = Duration::from_secs(7);
@@ -2060,7 +2515,7 @@ mod tests {
 
         assert_eq!(
             supervisor_shutdown_wait_limit(command_delivery, graceful_exit).unwrap(),
-            command_delivery + graceful_exit + SUPERVISOR_SHUTDOWN_MARGIN
+            command_delivery + command_delivery + graceful_exit + SUPERVISOR_SHUTDOWN_MARGIN
         );
     }
 
@@ -2071,8 +2526,8 @@ mod tests {
         let forced_reaping = Duration::from_secs(5);
         let watchdog = supervisor_shutdown_wait_limit(command_delivery, graceful_exit).unwrap();
 
-        assert_eq!(watchdog, Duration::from_secs(50));
-        assert!(command_delivery + graceful_exit + forced_reaping <= watchdog);
+        assert_eq!(watchdog, Duration::from_secs(60));
+        assert!(command_delivery + command_delivery + graceful_exit + forced_reaping <= watchdog);
     }
 
     #[test]

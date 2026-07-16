@@ -7,12 +7,15 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout_at};
 
-use crate::runtime::RuntimeStatusHandle;
-use crate::supervisor::{FailureCategory, LifecycleStatusSnapshot, ServerPhase};
+use crate::runtime::RuntimeControlHandle;
+use crate::supervisor::{
+    AdmissionGate, FailureCategory, LifecycleStatusSnapshot, MutationEnvelope, MutationError,
+    MutationOperation, MutationSuccess, ServerPhase,
+};
 
 #[cfg(unix)]
 mod unix;
@@ -24,7 +27,7 @@ pub(crate) use unix::{BoundEndpoint, InstanceLock};
 #[cfg(windows)]
 pub(crate) use windows::{BoundEndpoint, InstanceLock};
 
-const PROTOCOL_VERSION: u16 = 1;
+const PROTOCOL_VERSION: u16 = 2;
 const MAX_PAYLOAD_LENGTH: u32 = 65_536;
 const MAX_CONTROL_EXCHANGES: usize = 32;
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -33,23 +36,75 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Request {
     List,
-    Status { server_id: String },
+    Status {
+        server_id: String,
+    },
+    Start {
+        server_id: String,
+        request_id: RequestId,
+        expected_command_revision: u64,
+    },
+    Stop {
+        server_id: String,
+        request_id: RequestId,
+        expected_command_revision: u64,
+    },
+    Restart {
+        server_id: String,
+        request_id: RequestId,
+        expected_command_revision: u64,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+struct RequestId(String);
+
+impl RequestId {
+    fn new(value: String) -> Option<Self> {
+        (value.len() == 32
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        .then_some(Self(value))
+    }
+
+    fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for RequestId {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| serde::de::Error::custom("invalid request ID"))
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RequestDocument {
     #[serde(rename = "type")]
-    operation: RequestOperation,
+    operation: RequestDocumentOperation,
     #[serde(default)]
     server_id: Present<String>,
+    #[serde(default)]
+    request_id: Present<RequestId>,
+    #[serde(default)]
+    expected_command_revision: Present<u64>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum RequestOperation {
+enum RequestDocumentOperation {
     List,
     Status,
+    Start,
+    Stop,
+    Restart,
 }
 
 #[derive(Default)]
@@ -71,15 +126,60 @@ where
     }
 }
 
-impl RequestDocument {
-    fn into_request(self) -> Option<Request> {
-        match (self.operation, self.server_id) {
-            (RequestOperation::List, Present::Missing) => Some(Request::List),
-            (RequestOperation::Status, Present::Value(server_id)) => {
-                Some(Request::Status { server_id })
-            }
-            (RequestOperation::List, Present::Value(_))
-            | (RequestOperation::Status, Present::Missing) => None,
+impl<'de> Deserialize<'de> for Request {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let document = RequestDocument::deserialize(deserializer)?;
+        match (
+            document.operation,
+            document.server_id,
+            document.request_id,
+            document.expected_command_revision,
+        ) {
+            (
+                RequestDocumentOperation::List,
+                Present::Missing,
+                Present::Missing,
+                Present::Missing,
+            ) => Ok(Self::List),
+            (
+                RequestDocumentOperation::Status,
+                Present::Value(server_id),
+                Present::Missing,
+                Present::Missing,
+            ) => Ok(Self::Status { server_id }),
+            (
+                operation @ (RequestDocumentOperation::Start
+                | RequestDocumentOperation::Stop
+                | RequestDocumentOperation::Restart),
+                Present::Value(server_id),
+                Present::Value(request_id),
+                Present::Value(expected_command_revision),
+            ) => Ok(match operation {
+                RequestDocumentOperation::Start => Self::Start {
+                    server_id,
+                    request_id,
+                    expected_command_revision,
+                },
+                RequestDocumentOperation::Stop => Self::Stop {
+                    server_id,
+                    request_id,
+                    expected_command_revision,
+                },
+                RequestDocumentOperation::Restart => Self::Restart {
+                    server_id,
+                    request_id,
+                    expected_command_revision,
+                },
+                RequestDocumentOperation::List | RequestDocumentOperation::Status => {
+                    unreachable!("matched only mutation operations")
+                }
+            }),
+            _ => Err(serde::de::Error::custom(
+                "request fields do not match the operation",
+            )),
         }
     }
 }
@@ -158,12 +258,55 @@ impl From<FailureCategory> for WireFailureCategory {
     }
 }
 
-#[derive(Clone, Copy, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum WireErrorCode {
     MalformedRequest,
     UnsupportedProtocolVersion,
+    UnsupportedOperation,
     UnknownServerId,
+    OperationRejected,
+    ExternalBackendNotOwned,
+    ConflictingBackendEvidence,
+    OperationInProgress,
+    StaleCommandRevision,
+    RequestIdConflict,
+    CommandQueueFull,
+    InternalFailure,
+}
+
+impl WireErrorCode {
+    const ALL: [Self; 12] = [
+        Self::MalformedRequest,
+        Self::UnsupportedProtocolVersion,
+        Self::UnsupportedOperation,
+        Self::UnknownServerId,
+        Self::OperationRejected,
+        Self::ExternalBackendNotOwned,
+        Self::ConflictingBackendEvidence,
+        Self::OperationInProgress,
+        Self::StaleCommandRevision,
+        Self::RequestIdConflict,
+        Self::CommandQueueFull,
+        Self::InternalFailure,
+    ];
+
+    const fn message(self) -> &'static str {
+        match self {
+            Self::MalformedRequest => "malformed request",
+            Self::UnsupportedProtocolVersion => "unsupported control protocol version",
+            Self::UnsupportedOperation => "unsupported operation",
+            Self::UnknownServerId => "unknown server ID",
+            Self::OperationRejected => "operation rejected",
+            Self::ExternalBackendNotOwned => "external backend is not owned",
+            Self::ConflictingBackendEvidence => "backend evidence conflicts",
+            Self::OperationInProgress => "operation in progress",
+            Self::StaleCommandRevision => "command revision is stale",
+            Self::RequestIdConflict => "request ID conflicts",
+            Self::CommandQueueFull => "command queue is full",
+            Self::InternalFailure => "internal failure",
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -194,6 +337,18 @@ struct StatusFields<'a> {
     failure_category: Option<WireFailureCategory>,
     failure_streak: u32,
     retry_after_ms: Option<u64>,
+    command_revision: u64,
+}
+
+#[derive(Serialize)]
+struct OperationResult<'a> {
+    #[serde(rename = "type")]
+    result_type: &'static str,
+    server_id: &'a str,
+    operation: &'static str,
+    request_id: &'a str,
+    command_revision: u64,
+    disposition: &'static str,
 }
 
 #[derive(Serialize)]
@@ -221,6 +376,7 @@ enum Response {
 enum SuccessResult {
     List { servers: Vec<String> },
     Status { server: ReceivedStatus },
+    Operation { operation: ReceivedOperation },
 }
 
 #[derive(Deserialize)]
@@ -231,6 +387,17 @@ struct ReceivedStatus {
     failure_category: RequiredNullable<WireFailureCategory>,
     failure_streak: u32,
     retry_after_ms: RequiredNullable<u64>,
+    command_revision: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceivedOperation {
+    server_id: String,
+    operation: String,
+    request_id: String,
+    command_revision: u64,
+    disposition: String,
 }
 
 struct RequiredNullable<T>(Option<T>);
@@ -261,6 +428,7 @@ pub struct ServerStatus {
     failure_category: Option<WireFailureCategory>,
     failure_streak: u32,
     retry_after_ms: Option<u64>,
+    command_revision: u64,
 }
 
 impl ServerStatus {
@@ -291,6 +459,42 @@ impl ServerStatus {
     pub const fn retry_after_ms(&self) -> Option<u64> {
         self.retry_after_ms
     }
+
+    #[must_use]
+    pub const fn command_revision(&self) -> u64 {
+        self.command_revision
+    }
+}
+
+pub struct OperationStatus {
+    server_id: String,
+    operation: String,
+    request_id: String,
+    command_revision: u64,
+    disposition: String,
+}
+
+impl OperationStatus {
+    #[must_use]
+    pub fn server_id(&self) -> &str {
+        &self.server_id
+    }
+    #[must_use]
+    pub fn operation(&self) -> &str {
+        &self.operation
+    }
+    #[must_use]
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+    #[must_use]
+    pub const fn command_revision(&self) -> u64 {
+        self.command_revision
+    }
+    #[must_use]
+    pub fn disposition(&self) -> &str {
+        &self.disposition
+    }
 }
 
 #[derive(Debug)]
@@ -298,6 +502,7 @@ pub enum ClientError {
     DaemonUnavailable,
     ProtocolMismatch,
     UnknownServerId,
+    SubmissionUncertain,
     Operation(String),
 }
 
@@ -310,6 +515,9 @@ impl fmt::Display for ClientError {
                 formatter.write_str("the client and daemon use incompatible control protocols")
             }
             Self::UnknownServerId => formatter.write_str("unknown server ID"),
+            Self::SubmissionUncertain => formatter.write_str(
+                "the mutation outcome could not be validated; submission may or may not have been admitted",
+            ),
             Self::Operation(message) => formatter.write_str(message),
         }
     }
@@ -335,7 +543,7 @@ impl PreparedRegistry {
         };
         let list_response = encode_frame(&list).map_err(|error| {
             anyhow::anyhow!(
-                "control protocol v1 response limit exceeded by the complete server list: {error}"
+                "control protocol v2 response limit exceeded by the complete server list: {error}"
             )
         })?;
 
@@ -353,14 +561,49 @@ impl PreparedRegistry {
                     failure_category: Some(WireFailureCategory::ExitedUnexpectedly),
                     failure_streak: u32::MAX,
                     retry_after_ms: Some(u64::MAX),
+                    command_revision: u64::MAX,
                 },
             },
         };
         encode_frame(&worst_case).map_err(|error| {
             anyhow::anyhow!(
-                "control protocol v1 response limit exceeded by a worst-case server status: {error}"
+                "control protocol v2 response limit exceeded by a worst-case server status: {error}"
             )
         })?;
+
+        let request_id = "ffffffffffffffffffffffffffffffff";
+        for operation in ["start", "stop", "restart"] {
+            let worst_case = SuccessEnvelope {
+                response_type: "success",
+                result: OperationResult {
+                    result_type: "operation",
+                    server_id: longest_id,
+                    operation,
+                    request_id,
+                    command_revision: u64::MAX,
+                    disposition: "already_satisfied",
+                },
+            };
+            encode_frame(&worst_case).map_err(|error| {
+                anyhow::anyhow!(
+                    "control protocol v2 response limit exceeded by a worst-case {operation} success: {error}"
+                )
+            })?;
+        }
+        for code in WireErrorCode::ALL {
+            encode_frame(&ErrorEnvelope {
+                response_type: "error",
+                error: ErrorFields {
+                    code,
+                    message: code.message(),
+                },
+            })
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "control protocol v2 response limit exceeded by the {code:?} error: {error}"
+                )
+            })?;
+        }
 
         Ok(Self {
             server_ids,
@@ -370,7 +613,7 @@ impl PreparedRegistry {
 
     pub(crate) fn activate(
         self,
-        handles: BTreeMap<String, RuntimeStatusHandle>,
+        handles: BTreeMap<String, RuntimeControlHandle>,
     ) -> Result<Registry> {
         ensure!(
             handles.len() == self.server_ids.len()
@@ -397,7 +640,7 @@ impl PreparedRegistry {
 pub(crate) struct Registry(Arc<RegistryInner>);
 
 struct RegistryInner {
-    handles: BTreeMap<String, RuntimeStatusHandle>,
+    handles: BTreeMap<String, RuntimeControlHandle>,
     list_response: Arc<[u8]>,
 }
 
@@ -453,7 +696,6 @@ impl ControlServer {
             .stop()
             .context("control endpoint cleanup failed");
         clients.abort_all();
-        let _ = admission_stopped.send(());
         let mut client_panics = Vec::new();
         while let Some(completed) = clients.join_next().await {
             if let Err(error) = completed
@@ -462,6 +704,8 @@ impl ControlServer {
                 client_panics.push(anyhow::anyhow!("control-client task panicked: {error}"));
             }
         }
+        let _ = admission_stopped.send(());
+        drop(self.registry);
 
         combine_control_results(accept_result, endpoint_result, client_panics, |error| {
             log::error!("Additional control failure during shutdown: {error:#}");
@@ -535,10 +779,7 @@ where
 {
     let request = match read_frame(stream).await {
         Ok(ReadFrame::Version { version, .. }) if version != PROTOCOL_VERSION => {
-            let response = error_frame(
-                WireErrorCode::UnsupportedProtocolVersion,
-                "unsupported control protocol version",
-            );
+            let response = constant_error_frame(WireErrorCode::UnsupportedProtocolVersion);
             stream
                 .write_all(&response)
                 .await
@@ -546,11 +787,8 @@ where
             return Ok(());
         }
         Ok(ReadFrame::Version { body, .. }) => {
-            let Some(request) = serde_json::from_slice::<RequestDocument>(&body)
-                .ok()
-                .and_then(RequestDocument::into_request)
-            else {
-                let response = error_frame(WireErrorCode::MalformedRequest, "malformed request");
+            let Ok(request) = serde_json::from_slice::<Request>(&body) else {
+                let response = constant_error_frame(WireErrorCode::MalformedRequest);
                 stream
                     .write_all(&response)
                     .await
@@ -564,7 +802,7 @@ where
                 "Control request framing rejected (declared payload length: {:?})",
                 error.declared_length
             );
-            let response = error_frame(WireErrorCode::MalformedRequest, "malformed request");
+            let response = constant_error_frame(WireErrorCode::MalformedRequest);
             stream
                 .write_all(&response)
                 .await
@@ -580,7 +818,7 @@ where
             .map_err(|_| ExchangeError::Client)?,
         Request::Status { server_id } => {
             let Some(handle) = registry.0.handles.get(&server_id) else {
-                let response = error_frame(WireErrorCode::UnknownServerId, "unknown server ID");
+                let response = constant_error_frame(WireErrorCode::UnknownServerId);
                 stream
                     .write_all(&response)
                     .await
@@ -596,8 +834,165 @@ where
                 .await
                 .map_err(|_| ExchangeError::Client)?;
         }
+        Request::Restart { .. } => {
+            let response = constant_error_frame(WireErrorCode::UnsupportedOperation);
+            stream
+                .write_all(&response)
+                .await
+                .map_err(|_| ExchangeError::Client)?;
+        }
+        Request::Start {
+            server_id,
+            request_id,
+            expected_command_revision,
+        } => {
+            serve_mutation(
+                stream,
+                registry,
+                server_id,
+                request_id,
+                expected_command_revision,
+                MutationOperation::Start,
+            )
+            .await?;
+        }
+        Request::Stop {
+            server_id,
+            request_id,
+            expected_command_revision,
+        } => {
+            serve_mutation(
+                stream,
+                registry,
+                server_id,
+                request_id,
+                expected_command_revision,
+                MutationOperation::Stop,
+            )
+            .await?;
+        }
     }
     Ok(())
+}
+
+struct AdmissionCancellation {
+    gate: Arc<AdmissionGate>,
+    active: bool,
+}
+
+impl AdmissionCancellation {
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for AdmissionCancellation {
+    fn drop(&mut self) {
+        if self.active {
+            self.gate.cancel();
+        }
+    }
+}
+
+async fn serve_mutation<S>(
+    stream: &mut S,
+    registry: &Registry,
+    server_id: String,
+    request_id: RequestId,
+    expected_command_revision: u64,
+    operation: MutationOperation,
+) -> Result<(), ExchangeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let Some(handle) = registry.0.handles.get(&server_id) else {
+        let response = constant_error_frame(WireErrorCode::UnknownServerId);
+        stream
+            .write_all(&response)
+            .await
+            .map_err(|_| ExchangeError::Client)?;
+        return Ok(());
+    };
+    let sender = handle.mutation_sender();
+    let permit = match sender.try_reserve_owned() {
+        Ok(permit) => permit,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            let response = constant_error_frame(WireErrorCode::CommandQueueFull);
+            stream
+                .write_all(&response)
+                .await
+                .map_err(|_| ExchangeError::Client)?;
+            return Ok(());
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            let response = constant_error_frame(WireErrorCode::InternalFailure);
+            stream
+                .write_all(&response)
+                .await
+                .map_err(|_| ExchangeError::Client)?;
+            return Ok(());
+        }
+    };
+    let gate = Arc::new(AdmissionGate::pending());
+    let mut cancellation = AdmissionCancellation {
+        gate: Arc::clone(&gate),
+        active: true,
+    };
+    let (reply, reply_receiver) = oneshot::channel();
+    permit.send(MutationEnvelope {
+        operation,
+        request_id: request_id.into_string(),
+        expected_command_revision,
+        reply,
+        admission: gate,
+    });
+
+    let mut extra = [0_u8; 1];
+    tokio::pin!(reply_receiver);
+    let reply = tokio::select! {
+        biased;
+
+        result = &mut reply_receiver => result.map_err(|_| ExchangeError::Client)?,
+        _ = stream.read(&mut extra) => return Err(ExchangeError::Client),
+    };
+    cancellation.disarm();
+    let response = match reply {
+        Ok(success) => operation_frame(&success),
+        Err(error) => mutation_error_frame(error),
+    };
+    stream
+        .write_all(&response)
+        .await
+        .map_err(|_| ExchangeError::Client)?;
+    Ok(())
+}
+
+fn operation_frame(success: &MutationSuccess) -> Vec<u8> {
+    encode_frame(&SuccessEnvelope {
+        response_type: "success",
+        result: OperationResult {
+            result_type: "operation",
+            server_id: &success.server_id,
+            operation: success.operation.as_str(),
+            request_id: &success.request_id,
+            command_revision: success.command_revision,
+            disposition: success.disposition.as_str(),
+        },
+    })
+    .expect("prepared operation response bound must cover every success")
+}
+
+fn mutation_error_frame(error: MutationError) -> Vec<u8> {
+    let code = match error {
+        MutationError::OperationRejected => WireErrorCode::OperationRejected,
+        MutationError::ExternalBackendNotOwned => WireErrorCode::ExternalBackendNotOwned,
+        MutationError::ConflictingBackendEvidence => WireErrorCode::ConflictingBackendEvidence,
+        MutationError::OperationInProgress => WireErrorCode::OperationInProgress,
+        MutationError::StaleCommandRevision => WireErrorCode::StaleCommandRevision,
+        MutationError::RequestIdConflict => WireErrorCode::RequestIdConflict,
+        MutationError::InternalFailure => WireErrorCode::InternalFailure,
+    };
+    constant_error_frame(code)
 }
 
 fn status_frame(
@@ -617,6 +1012,7 @@ fn status_frame(
                 retry_after_ms: snapshot
                     .retry_at
                     .map(|retry_at| retry_milliseconds(retry_at, snapshot_now)),
+                command_revision: snapshot.command_revision,
             },
         },
     };
@@ -627,7 +1023,7 @@ fn retry_milliseconds(retry_at: Instant, snapshot_now: Instant) -> u64 {
     let remaining = retry_at.saturating_duration_since(snapshot_now);
     let milliseconds = remaining.as_millis();
     let rounded = milliseconds + u128::from(!remaining.subsec_nanos().is_multiple_of(1_000_000));
-    u64::try_from(rounded).expect("supervisor retry delays must fit the v1 millisecond field")
+    u64::try_from(rounded).expect("supervisor retry delays must fit the v2 millisecond field")
 }
 
 fn error_frame(code: WireErrorCode, message: &'static str) -> Vec<u8> {
@@ -635,7 +1031,11 @@ fn error_frame(code: WireErrorCode, message: &'static str) -> Vec<u8> {
         response_type: "error",
         error: ErrorFields { code, message },
     })
-    .expect("protocol-v1 error responses are bounded constants")
+    .expect("protocol-v2 error responses are bounded constants")
+}
+
+fn constant_error_frame(code: WireErrorCode) -> Vec<u8> {
+    error_frame(code, code.message())
 }
 
 fn encode_frame(value: &impl Serialize) -> Result<Vec<u8>> {
@@ -737,7 +1137,9 @@ where
 pub async fn list() -> std::result::Result<Vec<String>, ClientError> {
     match request(Request::List).await? {
         SuccessResult::List { servers } => validate_server_list(servers),
-        SuccessResult::Status { .. } => Err(ClientError::DaemonUnavailable),
+        SuccessResult::Status { .. } | SuccessResult::Operation { .. } => {
+            Err(ClientError::DaemonUnavailable)
+        }
     }
 }
 
@@ -758,12 +1160,115 @@ pub async fn status(server_id: String) -> std::result::Result<ServerStatus, Clie
                 failure_category: server.failure_category.0,
                 failure_streak: server.failure_streak,
                 retry_after_ms: server.retry_after_ms.0,
+                command_revision: server.command_revision,
             })
         }
-        SuccessResult::Status { .. } | SuccessResult::List { .. } => {
-            Err(ClientError::DaemonUnavailable)
-        }
+        SuccessResult::Status { .. }
+        | SuccessResult::List { .. }
+        | SuccessResult::Operation { .. } => Err(ClientError::DaemonUnavailable),
     }
+}
+
+pub async fn start(
+    server_id: String,
+    request_id: String,
+    expected_command_revision: u64,
+) -> std::result::Result<OperationStatus, ClientError> {
+    let expected_result_revision = expected_command_revision.checked_add(1);
+    mutate(
+        Request::Start {
+            server_id: server_id.clone(),
+            request_id: RequestId::new(request_id.clone())
+                .ok_or_else(|| ClientError::Operation("invalid request ID".to_owned()))?,
+            expected_command_revision,
+        },
+        server_id,
+        request_id,
+        "start",
+        expected_result_revision,
+    )
+    .await
+}
+
+pub async fn stop(
+    server_id: String,
+    request_id: String,
+    expected_command_revision: u64,
+) -> std::result::Result<OperationStatus, ClientError> {
+    let expected_result_revision = expected_command_revision.checked_add(1);
+    mutate(
+        Request::Stop {
+            server_id: server_id.clone(),
+            request_id: RequestId::new(request_id.clone())
+                .ok_or_else(|| ClientError::Operation("invalid request ID".to_owned()))?,
+            expected_command_revision,
+        },
+        server_id,
+        request_id,
+        "stop",
+        expected_result_revision,
+    )
+    .await
+}
+
+async fn mutate(
+    request: Request,
+    expected_server_id: String,
+    expected_request_id: String,
+    expected_operation: &'static str,
+    expected_result_revision: Option<u64>,
+) -> std::result::Result<OperationStatus, ClientError> {
+    let deadline = Instant::now() + EXCHANGE_TIMEOUT;
+    let frame =
+        encode_frame(&request).map_err(|error| ClientError::Operation(error.to_string()))?;
+    let mut stream = platform_connect(deadline)
+        .await
+        .map_err(|_| ClientError::DaemonUnavailable)?;
+    let result = match timeout_at(deadline, client_exchange(&mut stream, &frame)).await {
+        Ok(result) => result.map_err(|error| match error {
+            ClientError::DaemonUnavailable => ClientError::SubmissionUncertain,
+            other => other,
+        })?,
+        Err(_) => return Err(ClientError::SubmissionUncertain),
+    };
+    match result {
+        SuccessResult::Operation { operation } => validate_mutation_success(
+            operation,
+            &expected_server_id,
+            &expected_request_id,
+            expected_operation,
+            expected_result_revision,
+        ),
+        _ => Err(ClientError::SubmissionUncertain),
+    }
+}
+
+fn validate_mutation_success(
+    operation: ReceivedOperation,
+    expected_server_id: &str,
+    expected_request_id: &str,
+    expected_operation: &str,
+    expected_result_revision: Option<u64>,
+) -> std::result::Result<OperationStatus, ClientError> {
+    if operation.server_id != expected_server_id
+        || operation.request_id != expected_request_id
+        || operation.operation != expected_operation
+        || Some(operation.command_revision) != expected_result_revision
+        || !matches!(
+            operation.disposition.as_str(),
+            "accepted" | "already_satisfied"
+        )
+    {
+        return Err(ClientError::SubmissionUncertain);
+    }
+
+    Ok(OperationStatus {
+        server_id: operation.server_id,
+        operation: operation.operation,
+        request_id: operation.request_id,
+        command_revision: operation.command_revision,
+        disposition: operation.disposition,
+    })
 }
 
 async fn request(request: Request) -> std::result::Result<SuccessResult, ClientError> {
@@ -812,6 +1317,33 @@ where
             WireErrorCode::UnknownServerId => Err(ClientError::UnknownServerId),
             WireErrorCode::UnsupportedProtocolVersion => Err(ClientError::ProtocolMismatch),
             WireErrorCode::MalformedRequest => Err(ClientError::DaemonUnavailable),
+            WireErrorCode::UnsupportedOperation => {
+                Err(ClientError::Operation("unsupported operation".to_owned()))
+            }
+            WireErrorCode::OperationRejected => {
+                Err(ClientError::Operation("operation rejected".to_owned()))
+            }
+            WireErrorCode::ExternalBackendNotOwned => Err(ClientError::Operation(
+                "external backend is not owned".to_owned(),
+            )),
+            WireErrorCode::ConflictingBackendEvidence => Err(ClientError::Operation(
+                "backend evidence conflicts".to_owned(),
+            )),
+            WireErrorCode::OperationInProgress => {
+                Err(ClientError::Operation("operation in progress".to_owned()))
+            }
+            WireErrorCode::StaleCommandRevision => Err(ClientError::Operation(
+                "command revision is stale".to_owned(),
+            )),
+            WireErrorCode::RequestIdConflict => {
+                Err(ClientError::Operation("request ID conflicts".to_owned()))
+            }
+            WireErrorCode::CommandQueueFull => {
+                Err(ClientError::Operation("command queue is full".to_owned()))
+            }
+            WireErrorCode::InternalFailure => {
+                Err(ClientError::Operation("daemon internal failure".to_owned()))
+            }
         },
     }
 }
@@ -885,7 +1417,10 @@ mod tests {
     fn frame_body(frame: &[u8]) -> &[u8] {
         let payload_length = u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize;
         assert_eq!(frame.len(), payload_length + 4);
-        assert_eq!(u16::from_be_bytes(frame[4..6].try_into().unwrap()), 1);
+        assert_eq!(
+            u16::from_be_bytes(frame[4..6].try_into().unwrap()),
+            PROTOCOL_VERSION
+        );
         &frame[6..]
     }
 
@@ -895,6 +1430,84 @@ mod tests {
             panic!("expected an error response");
         };
         error.code
+    }
+
+    fn received_operation(revision: u64, disposition: &str) -> ReceivedOperation {
+        ReceivedOperation {
+            server_id: "survival".to_owned(),
+            operation: "start".to_owned(),
+            request_id: "11111111111111111111111111111111".to_owned(),
+            command_revision: revision,
+            disposition: disposition.to_owned(),
+        }
+    }
+
+    fn validate_test_operation(
+        operation: ReceivedOperation,
+        expected_revision: Option<u64>,
+    ) -> std::result::Result<OperationStatus, ClientError> {
+        validate_mutation_success(
+            operation,
+            "survival",
+            "11111111111111111111111111111111",
+            "start",
+            expected_revision,
+        )
+    }
+
+    #[test]
+    fn mutation_success_requires_the_exact_next_revision() {
+        for disposition in ["accepted", "already_satisfied"] {
+            let status = validate_test_operation(received_operation(13, disposition), Some(13))
+                .expect("the exact next revision should be accepted");
+            assert_eq!(status.command_revision(), 13);
+            assert_eq!(status.disposition(), disposition);
+        }
+
+        // An exact server-side replay returns the same originally expected next revision.
+        assert_eq!(
+            validate_test_operation(received_operation(13, "accepted"), Some(13))
+                .unwrap()
+                .command_revision(),
+            13
+        );
+
+        for revision in [11, 12, 14, u64::MAX] {
+            assert!(matches!(
+                validate_test_operation(received_operation(revision, "accepted"), Some(13)),
+                Err(ClientError::SubmissionUncertain)
+            ));
+        }
+        assert!(matches!(
+            validate_test_operation(received_operation(u64::MAX, "accepted"), None),
+            Err(ClientError::SubmissionUncertain)
+        ));
+    }
+
+    #[test]
+    fn mutation_success_identity_and_disposition_remain_strict() {
+        let mut cases = Vec::new();
+
+        let mut wrong_server = received_operation(13, "accepted");
+        wrong_server.server_id = "creative".to_owned();
+        cases.push(wrong_server);
+
+        let mut wrong_request = received_operation(13, "accepted");
+        wrong_request.request_id = "22222222222222222222222222222222".to_owned();
+        cases.push(wrong_request);
+
+        let mut wrong_operation = received_operation(13, "accepted");
+        wrong_operation.operation = "stop".to_owned();
+        cases.push(wrong_operation);
+
+        cases.push(received_operation(13, "unknown"));
+
+        for operation in cases {
+            assert!(matches!(
+                validate_test_operation(operation, Some(13)),
+                Err(ClientError::SubmissionUncertain)
+            ));
+        }
     }
 
     fn combine_test_results(
@@ -980,9 +1593,9 @@ mod tests {
     }
 
     #[test]
-    fn frame_bytes_are_exact_big_endian_protocol_v1() {
+    fn frame_bytes_are_exact_big_endian_protocol_v2() {
         let frame = encode_frame(&Request::List).unwrap();
-        let mut expected = vec![0, 0, 0, 17, 0, 1];
+        let mut expected = vec![0, 0, 0, 17, 0, 2];
         expected.extend_from_slice(br#"{"type":"list"}"#);
         assert_eq!(frame, expected);
     }
@@ -1094,11 +1707,138 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mutation_request_schema_and_request_ids_are_strict() {
+        for (body, expected_operation) in [
+            (
+                br#"{"type":"start","server_id":"survival","request_id":"11111111111111111111111111111111","expected_command_revision":12}"#.as_slice(),
+                "start",
+            ),
+            (
+                br#"{"type":"stop","server_id":"survival","request_id":"22222222222222222222222222222222","expected_command_revision":12}"#.as_slice(),
+                "stop",
+            ),
+            (
+                br#"{"type":"restart","server_id":"survival","request_id":"abcdefabcdefabcdefabcdefabcdefab","expected_command_revision":12}"#.as_slice(),
+                "restart",
+            ),
+        ] {
+            let request = serde_json::from_slice::<Request>(body).unwrap();
+            let operation = match request {
+                Request::Start { .. } => "start",
+                Request::Stop { .. } => "stop",
+                Request::Restart { .. } => "restart",
+                Request::List | Request::Status { .. } => "read_only",
+            };
+            assert_eq!(operation, expected_operation);
+        }
+
+        for request_id in [
+            "1111111111111111111111111111111",
+            "111111111111111111111111111111111",
+            "ABCDEFABCDEFABCDEFABCDEFABCDEFAB",
+            "gggggggggggggggggggggggggggggggg",
+            "11111111-1111-1111-1111-111111111111",
+        ] {
+            let body = format!(
+                r#"{{"type":"start","server_id":"survival","request_id":"{request_id}","expected_command_revision":0}}"#
+            );
+            assert!(
+                serde_json::from_str::<Request>(&body).is_err(),
+                "accepted {request_id}"
+            );
+        }
+        for body in [
+            br#"{"type":"start","server_id":"survival","request_id":"11111111111111111111111111111111"}"#.as_slice(),
+            br#"{"type":"stop","server_id":"survival","request_id":"11111111111111111111111111111111","expected_command_revision":0,"extra":1}"#.as_slice(),
+            br#"{"type":"restart","server_id":"survival","request_id":"11111111111111111111111111111111","request_id":"11111111111111111111111111111111","expected_command_revision":0}"#.as_slice(),
+        ] {
+            assert!(serde_json::from_slice::<Request>(body).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_restart_is_unsupported_without_supervisor_admission() {
+        let (registry, _authority) =
+            one_server_registry(LifecycleState::test_phase(ServerPhase::Stopped));
+        let request = Request::Restart {
+            server_id: "survival".to_owned(),
+            request_id: RequestId::new("11111111111111111111111111111111".to_owned()).unwrap(),
+            expected_command_revision: 0,
+        };
+        let response = exchange(&encode_frame(&request).unwrap(), registry).await;
+        assert_eq!(
+            response_code(&response),
+            WireErrorCode::UnsupportedOperation
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_eof_cancels_an_enqueued_pending_mutation() {
+        let prepared = PreparedRegistry::new([&"survival".to_owned()].into_iter()).unwrap();
+        let (handle, _authority, mut mutations) = RuntimeStatusHandle::test_with_mutations(
+            "survival",
+            LifecycleState::test_phase(ServerPhase::Stopped),
+        );
+        let registry = prepared
+            .activate(BTreeMap::from([("survival".to_owned(), handle)]))
+            .unwrap();
+        let permits = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&permits).try_acquire_owned().unwrap();
+        let (mut client, server) = tokio::io::duplex(1_024);
+        let task = tokio::spawn(serve_accepted(server, registry, permit));
+        let request = Request::Start {
+            server_id: "survival".to_owned(),
+            request_id: RequestId::new("11111111111111111111111111111111".to_owned()).unwrap(),
+            expected_command_revision: 0,
+        };
+        client
+            .write_all(&encode_frame(&request).unwrap())
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+        let envelope = mutations.recv().await.unwrap();
+        task.await.unwrap();
+        assert!(envelope.admission.is_cancelled());
+        assert!(!envelope.admission.is_admitted());
+    }
+
+    #[tokio::test]
+    async fn thirty_third_mutation_is_rejected_without_waiting() {
+        let prepared = PreparedRegistry::new([&"survival".to_owned()].into_iter()).unwrap();
+        let (handle, _authority, _mutations) = RuntimeStatusHandle::test_with_mutations(
+            "survival",
+            LifecycleState::test_phase(ServerPhase::Stopped),
+        );
+        let sender = handle.mutation_sender();
+        for index in 0..32 {
+            let permit = sender.clone().try_reserve_owned().unwrap();
+            let (reply, _receiver) = oneshot::channel();
+            permit.send(MutationEnvelope {
+                operation: MutationOperation::Start,
+                request_id: format!("{index:032x}"),
+                expected_command_revision: 0,
+                reply,
+                admission: Arc::new(AdmissionGate::pending()),
+            });
+        }
+        let registry = prepared
+            .activate(BTreeMap::from([("survival".to_owned(), handle)]))
+            .unwrap();
+        let request = Request::Stop {
+            server_id: "survival".to_owned(),
+            request_id: RequestId::new("ffffffffffffffffffffffffffffffff".to_owned()).unwrap(),
+            expected_command_revision: 0,
+        };
+        let response = exchange(&encode_frame(&request).unwrap(), registry).await;
+        assert_eq!(response_code(&response), WireErrorCode::CommandQueueFull);
+    }
+
     #[tokio::test]
     async fn truncated_headers_and_bodies_are_malformed() {
         for request in [
             vec![0, 0, 0],
-            [10_u32.to_be_bytes().as_slice(), &[0, 1], b"{}"].concat(),
+            [10_u32.to_be_bytes().as_slice(), &[0, 2], b"{}"].concat(),
         ] {
             let (registry, _authority) =
                 one_server_registry(LifecycleState::test_phase(ServerPhase::Stopped));
@@ -1111,16 +1851,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn version_one_succeeds_and_other_versions_skip_json() {
+    async fn version_two_succeeds_and_other_versions_skip_json() {
         let (registry, _authority) =
             one_server_registry(LifecycleState::test_phase(ServerPhase::Stopped));
-        let response = exchange(&raw_frame(1, br#"{"type":"list"}"#), registry).await;
+        let response = exchange(&raw_frame(2, br#"{"type":"list"}"#), registry).await;
         assert!(matches!(
             serde_json::from_slice::<Response>(frame_body(&response)).unwrap(),
             Response::Success { .. }
         ));
 
-        for version in [0, 2] {
+        for version in [0, 1, 3] {
             let (registry, _authority) =
                 one_server_registry(LifecycleState::test_phase(ServerPhase::Stopped));
             let response = exchange(&raw_frame(version, &[0xff, 0xff]), registry).await;
@@ -1135,16 +1875,16 @@ mod tests {
     async fn incompatible_response_version_is_observed_without_reading_json() {
         let (mut writer, mut reader) = tokio::io::duplex(16);
         writer.write_all(&65_536_u32.to_be_bytes()).await.unwrap();
-        writer.write_all(&2_u16.to_be_bytes()).await.unwrap();
+        writer.write_all(&1_u16.to_be_bytes()).await.unwrap();
         let ReadFrame::Version { version, body } = read_frame(&mut reader).await.unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 1);
         assert!(body.is_empty());
     }
 
     #[tokio::test]
     async fn client_classifies_protocol_unknown_and_malformed_daemon_responses() {
         assert!(matches!(
-            client_receives(raw_frame(2, &[0xff])).await,
+            client_receives(raw_frame(1, &[0xff])).await,
             Err(ClientError::ProtocolMismatch)
         ));
         assert!(matches!(
@@ -1157,10 +1897,10 @@ mod tests {
         ));
         for malformed in [
             Vec::new(),
-            raw_frame(1, b"not json"),
-            raw_frame(1, br#"{"type":"success","result":{"type":"list"}}"#),
+            raw_frame(2, b"not json"),
+            raw_frame(2, br#"{"type":"success","result":{"type":"list"}}"#),
             raw_frame(
-                1,
+                2,
                 br#"{"type":"success","result":{"type":"list","servers":[],"extra":1}}"#,
             ),
         ] {
@@ -1168,6 +1908,37 @@ mod tests {
                 client_receives(malformed).await,
                 Err(ClientError::DaemonUnavailable)
             ));
+        }
+    }
+
+    #[tokio::test]
+    async fn client_maps_every_protocol_v2_error_code() {
+        for code in WireErrorCode::ALL {
+            let Err(error) = client_receives(constant_error_frame(code)).await else {
+                panic!("wire errors must not be successful client results");
+            };
+            match code {
+                WireErrorCode::MalformedRequest => {
+                    assert!(matches!(error, ClientError::DaemonUnavailable));
+                }
+                WireErrorCode::UnsupportedProtocolVersion => {
+                    assert!(matches!(error, ClientError::ProtocolMismatch));
+                }
+                WireErrorCode::UnknownServerId => {
+                    assert!(matches!(error, ClientError::UnknownServerId));
+                }
+                WireErrorCode::UnsupportedOperation
+                | WireErrorCode::OperationRejected
+                | WireErrorCode::ExternalBackendNotOwned
+                | WireErrorCode::ConflictingBackendEvidence
+                | WireErrorCode::OperationInProgress
+                | WireErrorCode::StaleCommandRevision
+                | WireErrorCode::RequestIdConflict
+                | WireErrorCode::CommandQueueFull
+                | WireErrorCode::InternalFailure => {
+                    assert!(matches!(error, ClientError::Operation(_)));
+                }
+            }
         }
     }
 
@@ -1209,7 +1980,7 @@ mod tests {
             .err()
             .unwrap()
             .to_string();
-        assert!(list_error.contains("control protocol v1 response limit"));
+        assert!(list_error.contains("control protocol v2 response limit"));
         assert!(list_error.contains("complete server list"));
 
         let status_id = format!("a{}", "x".repeat(65_350));
@@ -1217,7 +1988,7 @@ mod tests {
             .err()
             .unwrap()
             .to_string();
-        assert!(status_error.contains("control protocol v1 response limit"));
+        assert!(status_error.contains("control protocol v2 response limit"));
         assert!(status_error.contains("worst-case server status"));
     }
 
@@ -1258,6 +2029,7 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "command_revision",
                 "failure_category",
                 "failure_streak",
                 "phase",
@@ -1414,7 +2186,7 @@ mod tests {
 
         let (registry, _authority) =
             one_server_registry(LifecycleState::test_phase(ServerPhase::Stopped));
-        let partial_body = [100_u32.to_be_bytes().as_slice(), &[0, 1], b"{"].concat();
+        let partial_body = [100_u32.to_be_bytes().as_slice(), &[0, 2], b"{"].concat();
         assert_eq!(
             deadline_case(registry, &partial_body, 64)
                 .await

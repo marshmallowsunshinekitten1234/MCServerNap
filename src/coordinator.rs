@@ -435,14 +435,33 @@ fn spawn_runtime(
     let runtime_stop = runtime_stop.clone();
     let returned_context = context.clone();
     let task = runtimes.spawn(async move {
+        let mut fatal = runtime.fatal_observer();
         let shutdown_delivered = Arc::new(AtomicBool::new(false));
         let delivered_by_shutdown = Arc::clone(&shutdown_delivered);
-        let runtime_task = tokio::spawn(runtime.run_until(async move {
+        let mut runtime_task = tokio::spawn(runtime.run_until(async move {
             runtime_stop.wait().await;
             delivered_by_shutdown.store(true, Ordering::Release);
             Ok(())
         }));
-        match runtime_task.await {
+        let mut fatal_closed = false;
+        let runtime_result = loop {
+            tokio::select! {
+                biased;
+
+                result = &mut runtime_task => break result,
+                changed = fatal.changed(), if !fatal_closed => {
+                    match changed {
+                        Ok(()) if *fatal.borrow_and_update() => {
+                            runtime_shutdown.request();
+                            break runtime_task.await;
+                        }
+                        Ok(()) => {}
+                        Err(_) => fatal_closed = true,
+                    }
+                }
+            }
+        };
+        match runtime_result {
             Ok(result) => {
                 let shutdown_was_delivered = shutdown_delivered.load(Ordering::Acquire);
                 match (result, shutdown_was_delivered) {
@@ -489,7 +508,7 @@ impl BoundDaemon {
         let mut runtimes = JoinSet::new();
         let mut contexts = HashMap::new();
         let expected_runtime_count = self.servers.len();
-        let mut status_handles = BTreeMap::new();
+        let mut control_handles = BTreeMap::new();
         let mut control_preparation = self.control;
         let mut control_endpoint = self.control_endpoint;
         let mut control_shutdown = None;
@@ -511,8 +530,8 @@ impl BoundDaemon {
             if shutdown.is_pending() {
                 break;
             }
-            let ActivatedServerRuntime { runtime, status } = bound.activate();
-            status_handles.insert(context.id().to_owned(), status);
+            let ActivatedServerRuntime { runtime, control } = bound.activate();
+            control_handles.insert(context.id().to_owned(), control);
             #[cfg(test)]
             let mut runtime = runtime;
             #[cfg(test)]
@@ -539,12 +558,12 @@ impl BoundDaemon {
         )
         .await;
 
-        if status_handles.len() == expected_runtime_count
+        if control_handles.len() == expected_runtime_count
             && !shutdown.is_pending()
             && let (Some(prepared), Some(mut endpoint)) =
                 (control_preparation.take(), control_endpoint.take())
         {
-            match prepared.activate(status_handles) {
+            match prepared.activate(control_handles) {
                 Ok(registry) => {
                     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
                     let (stopped_sender, stopped_receiver) = oneshot::channel();
@@ -554,7 +573,7 @@ impl BoundDaemon {
                         ControlServer::new(endpoint, registry)
                             .run(shutdown_receiver, stopped_sender),
                     ));
-                    log::info!("Local control protocol v1 is ready");
+                    log::info!("Local control protocol v2 is ready");
                 }
                 Err(error) => {
                     shutdown.fail(error.context("control registry activation failed"));
@@ -675,11 +694,14 @@ fn record_control_result(
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::net::TcpListener as StdTcpListener;
+    use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
     use std::path::PathBuf;
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+
+    const TCP_NAMESPACE_ENV: &str = "MCSERVERNAP_TEST_TCP_NAMESPACE";
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -691,14 +713,50 @@ mod tests {
         ))
     }
 
-    fn server_table(id: &str, listener_port: u16, backend_port: u16, workdir: &str) -> String {
+    fn run_isolated_fixture(name: &str) {
+        let namespace = crate::test_support::allocate_tcp_namespace();
+        let output = Command::new(std::env::current_exe().expect("test executable should exist"))
+            .args(["--ignored", "--exact", name, "--quiet"])
+            .env(TCP_NAMESPACE_ENV, namespace.to_string())
+            .output()
+            .expect("isolated coordinator fixture should run");
+        assert!(
+            output.status.success(),
+            "isolated coordinator fixture failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn isolated_public_listeners<const N: usize>() -> (Ipv4Addr, [StdTcpListener; N]) {
+        // These fixtures deliberately release exact ports during ownership transfer. Give
+        // each isolated child a coordinated loopback address and non-dynamic port window.
+        let namespace = std::env::var(TCP_NAMESPACE_ENV)
+            .expect("isolated coordinator fixture should receive a TCP namespace")
+            .parse::<u8>()
+            .expect("isolated coordinator TCP namespace should be valid");
+        let address = crate::test_support::tcp_address(namespace);
+        let addresses = crate::test_support::tcp_addresses::<N>(namespace);
+        let listeners = addresses.map(|address| {
+            StdTcpListener::bind(address).expect("isolated public listener reservation should bind")
+        });
+        (address, listeners)
+    }
+
+    fn server_table(
+        id: &str,
+        listener_address: Ipv4Addr,
+        listener_port: u16,
+        backend_port: u16,
+        workdir: &str,
+    ) -> String {
         format!(
             r#"
 [servers.{id}]
 minecraft_version = "26.2"
 
 [servers.{id}.listener]
-address = "127.0.0.1"
+address = "{listener_address}"
 port = {listener_port}
 
 [servers.{id}.backend]
@@ -734,6 +792,7 @@ bold = true
     }
 
     fn write_two_server_config(
+        listener_address: Ipv4Addr,
         first_listener: u16,
         second_listener: u16,
         first_backend: u16,
@@ -744,8 +803,20 @@ bold = true
         fs::create_dir_all(directory.join("survival")).unwrap();
         let contents = format!(
             "schema_version = 3\nmax_connections = 1\n{}{}",
-            server_table("creative", first_listener, first_backend, "creative"),
-            server_table("survival", second_listener, second_backend, "survival")
+            server_table(
+                "creative",
+                listener_address,
+                first_listener,
+                first_backend,
+                "creative"
+            ),
+            server_table(
+                "survival",
+                listener_address,
+                second_listener,
+                second_backend,
+                "survival"
+            )
         );
         let path = directory.join("cfg.toml");
         fs::write(&path, contents).unwrap();
@@ -753,6 +824,7 @@ bold = true
     }
 
     fn write_three_server_config(
+        listener_address: Ipv4Addr,
         listener_ports: [u16; 3],
         backend_ports: [u16; 3],
     ) -> (PathBuf, PathBuf) {
@@ -763,9 +835,27 @@ bold = true
         }
         let contents = format!(
             "schema_version = 3\nmax_connections = 3\n{}{}{}",
-            server_table("alpha", listener_ports[0], backend_ports[0], "alpha"),
-            server_table("beta", listener_ports[1], backend_ports[1], "beta"),
-            server_table("gamma", listener_ports[2], backend_ports[2], "gamma")
+            server_table(
+                "alpha",
+                listener_address,
+                listener_ports[0],
+                backend_ports[0],
+                "alpha"
+            ),
+            server_table(
+                "beta",
+                listener_address,
+                listener_ports[1],
+                backend_ports[1],
+                "beta"
+            ),
+            server_table(
+                "gamma",
+                listener_address,
+                listener_ports[2],
+                backend_ports[2],
+                "gamma"
+            )
         );
         let path = directory.join("cfg.toml");
         fs::write(&path, contents).unwrap();
@@ -973,13 +1063,115 @@ bold = true
         while waiters.join_next().await.is_some() {}
     }
 
+    #[test]
+    fn client_panic_starts_other_runtime_cleanup_before_local_cleanup_finishes() {
+        run_isolated_fixture(
+            "coordinator::tests::client_panic_starts_other_runtime_cleanup_before_local_cleanup_finishes_fixture",
+        );
+    }
+
     #[tokio::test]
-    async fn originating_fatal_remains_primary_while_runtime_cleanups_overlap() {
-        let public = [
-            StdTcpListener::bind("127.0.0.1:0").unwrap(),
-            StdTcpListener::bind("127.0.0.1:0").unwrap(),
-            StdTcpListener::bind("127.0.0.1:0").unwrap(),
+    #[ignore = "runs through the parallel-safe public test wrapper"]
+    async fn client_panic_starts_other_runtime_cleanup_before_local_cleanup_finishes_fixture() {
+        let (listener_address, [first_public, second_public]) = isolated_public_listeners();
+        let first_backend = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let second_backend = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let first_address = first_public.local_addr().unwrap();
+        let second_address = second_public.local_addr().unwrap();
+        let (directory, path) = write_two_server_config(
+            listener_address,
+            first_address.port(),
+            second_address.port(),
+            first_backend.local_addr().unwrap().port(),
+            second_backend.local_addr().unwrap().port(),
+        );
+        drop((first_public, second_public));
+
+        let mut bound = DaemonCoordinator::prepare(&path)
+            .unwrap()
+            .bind_all()
+            .await
+            .unwrap();
+        let (panic_sender, panic_receiver) = oneshot::channel();
+        let (ready_sender, mut ready_receiver) = mpsc::unbounded_channel();
+        let (cleanup_sender, mut cleanup_receiver) = mpsc::unbounded_channel();
+        let (release_sender, release_receiver) = oneshot::channel();
+
+        let first_ready = ready_sender.clone();
+        let first_cleanup = cleanup_sender.clone();
+        bound.runtime_overrides.push_back(Box::new(move |runtime| {
+            runtime.spawn_client_task(async move {
+                panic_receiver.await.unwrap();
+                panic!("intentional coordinator client panic");
+            });
+            runtime.replace_supervisor(move |shutdown| async move {
+                first_ready.send("creative").unwrap();
+                shutdown.await.unwrap();
+                first_cleanup.send("creative").unwrap();
+                release_receiver.await.unwrap();
+                Ok(())
+            });
+        }));
+
+        bound.runtime_overrides.push_back(Box::new(move |runtime| {
+            runtime.replace_supervisor(move |shutdown| async move {
+                ready_sender.send("survival").unwrap();
+                shutdown.await.unwrap();
+                cleanup_sender.send("survival").unwrap();
+                Ok(())
+            });
+        }));
+
+        let shutdown = Shutdown::new();
+        let (_fatal_sender, fatal_receiver) = mpsc::unbounded_channel();
+        let daemon = tokio::spawn(async move {
+            let mut signals = pending_signal_watcher();
+            bound
+                .activate_and_run(shutdown, fatal_receiver, &mut signals)
+                .await
+        });
+
+        let mut ready = [
+            ready_receiver.recv().await.unwrap(),
+            ready_receiver.recv().await.unwrap(),
         ];
+        ready.sort_unstable();
+        assert_eq!(ready, ["creative", "survival"]);
+        panic_sender.send(()).unwrap();
+
+        let mut cleaning = [
+            cleanup_receiver.recv().await.unwrap(),
+            cleanup_receiver.recv().await.unwrap(),
+        ];
+        cleaning.sort_unstable();
+        assert_eq!(cleaning, ["creative", "survival"]);
+        assert!(!daemon.is_finished());
+        release_sender.send(()).unwrap();
+
+        let error = daemon
+            .await
+            .unwrap()
+            .expect_err("a Minecraft client panic must fail the daemon");
+        let message = format!("{error:#}");
+        assert!(message.contains("server=creative"));
+        assert!(message.contains("client task panicked"));
+
+        StdTcpListener::bind(first_address).unwrap();
+        StdTcpListener::bind(second_address).unwrap();
+        fs::remove_dir_all(directory).ok();
+    }
+
+    #[test]
+    fn originating_fatal_remains_primary_while_runtime_cleanups_overlap() {
+        run_isolated_fixture(
+            "coordinator::tests::originating_fatal_remains_primary_while_runtime_cleanups_overlap_fixture",
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "runs through the parallel-safe public test wrapper"]
+    async fn originating_fatal_remains_primary_while_runtime_cleanups_overlap_fixture() {
+        let (listener_address, public) = isolated_public_listeners();
         let backend = [
             StdTcpListener::bind("127.0.0.1:0").unwrap(),
             StdTcpListener::bind("127.0.0.1:0").unwrap(),
@@ -991,7 +1183,8 @@ bold = true
         let backend_ports = backend
             .each_ref()
             .map(|listener| listener.local_addr().unwrap().port());
-        let (directory, path) = write_three_server_config(listener_ports, backend_ports);
+        let (directory, path) =
+            write_three_server_config(listener_address, listener_ports, backend_ports);
         drop(public);
 
         let mut bound = DaemonCoordinator::prepare(&path)
@@ -1067,10 +1260,17 @@ bold = true
         fs::remove_dir_all(directory).ok();
     }
 
+    #[test]
+    fn bind_all_is_inert_and_holds_every_listener() {
+        run_isolated_fixture(
+            "coordinator::tests::bind_all_is_inert_and_holds_every_listener_fixture",
+        );
+    }
+
     #[tokio::test]
-    async fn bind_all_is_inert_and_holds_every_listener() {
-        let first_public = StdTcpListener::bind("127.0.0.1:0").unwrap();
-        let second_public = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    #[ignore = "runs through the parallel-safe public test wrapper"]
+    async fn bind_all_is_inert_and_holds_every_listener_fixture() {
+        let (listener_address, [first_public, second_public]) = isolated_public_listeners();
         let first_backend = StdTcpListener::bind("127.0.0.1:0").unwrap();
         let second_backend = StdTcpListener::bind("127.0.0.1:0").unwrap();
         first_backend.set_nonblocking(true).unwrap();
@@ -1078,6 +1278,7 @@ bold = true
         let first_public_address = first_public.local_addr().unwrap();
         let second_public_address = second_public.local_addr().unwrap();
         let (directory, path) = write_two_server_config(
+            listener_address,
             first_public_address.port(),
             second_public_address.port(),
             first_backend.local_addr().unwrap().port(),
@@ -1107,10 +1308,17 @@ bold = true
         fs::remove_dir_all(directory).ok();
     }
 
+    #[test]
+    fn later_bind_failure_releases_earlier_listeners_without_activation() {
+        run_isolated_fixture(
+            "coordinator::tests::later_bind_failure_releases_earlier_listeners_without_activation_fixture",
+        );
+    }
+
     #[tokio::test]
-    async fn later_bind_failure_releases_earlier_listeners_without_activation() {
-        let first_public = StdTcpListener::bind("127.0.0.1:0").unwrap();
-        let second_public = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    #[ignore = "runs through the parallel-safe public test wrapper"]
+    async fn later_bind_failure_releases_earlier_listeners_without_activation_fixture() {
+        let (listener_address, [first_public, second_public]) = isolated_public_listeners();
         let first_backend = StdTcpListener::bind("127.0.0.1:0").unwrap();
         let second_backend = StdTcpListener::bind("127.0.0.1:0").unwrap();
         first_backend.set_nonblocking(true).unwrap();
@@ -1118,6 +1326,7 @@ bold = true
         let first_address = first_public.local_addr().unwrap();
         let second_address = second_public.local_addr().unwrap();
         let (directory, path) = write_two_server_config(
+            listener_address,
             first_address.port(),
             second_address.port(),
             first_backend.local_addr().unwrap().port(),
@@ -1145,10 +1354,17 @@ bold = true
         fs::remove_dir_all(directory).ok();
     }
 
+    #[test]
+    fn shutdown_pending_during_activation_prevents_every_supervisor() {
+        run_isolated_fixture(
+            "coordinator::tests::shutdown_pending_during_activation_prevents_every_supervisor_fixture",
+        );
+    }
+
     #[tokio::test]
-    async fn shutdown_pending_during_activation_prevents_every_supervisor() {
-        let first_public = StdTcpListener::bind("127.0.0.1:0").unwrap();
-        let second_public = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    #[ignore = "runs through the parallel-safe public test wrapper"]
+    async fn shutdown_pending_during_activation_prevents_every_supervisor_fixture() {
+        let (listener_address, [first_public, second_public]) = isolated_public_listeners();
         let first_backend = StdTcpListener::bind("127.0.0.1:0").unwrap();
         let second_backend = StdTcpListener::bind("127.0.0.1:0").unwrap();
         first_backend.set_nonblocking(true).unwrap();
@@ -1156,6 +1372,7 @@ bold = true
         let first_address = first_public.local_addr().unwrap();
         let second_address = second_public.local_addr().unwrap();
         let (directory, path) = write_two_server_config(
+            listener_address,
             first_address.port(),
             second_address.port(),
             first_backend.local_addr().unwrap().port(),
@@ -1189,16 +1406,24 @@ bold = true
         fs::remove_dir_all(directory).ok();
     }
 
+    #[test]
+    fn first_runtime_failure_prevents_later_activation() {
+        run_isolated_fixture(
+            "coordinator::tests::first_runtime_failure_prevents_later_activation_fixture",
+        );
+    }
+
     #[tokio::test]
-    async fn first_runtime_failure_prevents_later_activation() {
-        let first_public = StdTcpListener::bind("127.0.0.1:0").unwrap();
-        let second_public = StdTcpListener::bind("127.0.0.1:0").unwrap();
+    #[ignore = "runs through the parallel-safe public test wrapper"]
+    async fn first_runtime_failure_prevents_later_activation_fixture() {
+        let (listener_address, [first_public, second_public]) = isolated_public_listeners();
         let first_backend = StdTcpListener::bind("127.0.0.1:0").unwrap();
         let second_backend = StdTcpListener::bind("127.0.0.1:0").unwrap();
         second_backend.set_nonblocking(true).unwrap();
         let first_address = first_public.local_addr().unwrap();
         let second_address = second_public.local_addr().unwrap();
         let (directory, path) = write_two_server_config(
+            listener_address,
             first_address.port(),
             second_address.port(),
             first_backend.local_addr().unwrap().port(),
@@ -1223,7 +1448,9 @@ bold = true
             .activate_and_run(shutdown, fatal_receiver, &mut signals)
             .await
             .expect_err("first runtime panic must stop activation");
-        assert!(error.to_string().contains("server=creative"));
+        let message = format!("{error:#}");
+        assert!(message.contains("server=creative"));
+        assert!(message.contains("supervisor panicked"));
         assert_eq!(
             second_backend.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock

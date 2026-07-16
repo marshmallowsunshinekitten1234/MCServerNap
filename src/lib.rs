@@ -11,3 +11,6 @@ pub mod process;
 pub mod rcon;
 pub mod runtime;
 pub mod supervisor;
+
+#[cfg(test)]
+pub(crate) mod test_support;

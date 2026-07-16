@@ -34,12 +34,10 @@ struct Cli {
 enum Commands {
     /// Listen on every configured public endpoint and manage its backend.
     Listen,
-    /// List the server IDs exposed by the daemon for this OS principal.
-    List,
-    /// Show the daemon's current lifecycle status for one server.
-    Status {
-        /// Configured server ID.
-        server_id: String,
+    /// Inspect or mutate servers through the local control daemon.
+    Server {
+        #[command(subcommand)]
+        command: ServerCommand,
     },
     /// Send `stop` directly to an already-running Minecraft server via RCON.
     Stop {
@@ -55,6 +53,18 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum ServerCommand {
+    /// List the server IDs exposed by the daemon for this OS principal.
+    List,
+    /// Show the daemon's current lifecycle status for one server.
+    Status { server_id: String },
+    /// Admit asynchronous start intent for one server.
+    Start { server_id: String },
+    /// Explicitly stop one owned server process.
+    Stop { server_id: String },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -68,11 +78,15 @@ async fn main() -> Result<()> {
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Listen => DaemonCoordinator::run(&cli.config).await,
-        Commands::List => {
+        Commands::Server {
+            command: ServerCommand::List,
+        } => {
             print_output(&format_list(&control::list().await?))?;
             Ok(())
         }
-        Commands::Status { server_id } => {
+        Commands::Server {
+            command: ServerCommand::Status { server_id },
+        } => {
             let status = control::status(server_id).await?;
             print_output(&format_status(
                 status.server_id(),
@@ -80,9 +94,16 @@ async fn run(cli: Cli) -> Result<()> {
                 status.failure_category(),
                 status.failure_streak(),
                 status.retry_after_ms(),
+                status.command_revision(),
             ))?;
             Ok(())
         }
+        Commands::Server {
+            command: ServerCommand::Start { server_id },
+        } => mutate_server(server_id, "start").await,
+        Commands::Server {
+            command: ServerCommand::Stop { server_id },
+        } => mutate_server(server_id, "stop").await,
         Commands::Stop {
             rcon_host,
             rcon_port,
@@ -111,6 +132,7 @@ fn format_status(
     failure_category: Option<&str>,
     failure_streak: u32,
     retry_after_ms: Option<u64>,
+    command_revision: u64,
 ) -> String {
     let mut output = format!("server: {server_id}\nphase: {phase}\n");
     if let Some(failure) = failure_category {
@@ -125,7 +147,71 @@ fn format_status(
         )
         .expect("writing to a String cannot fail");
     }
+    writeln!(output, "command revision: {command_revision}")
+        .expect("writing to a String cannot fail");
     output
+}
+
+async fn mutate_server(server_id: String, operation: &'static str) -> Result<()> {
+    let status = control::status(server_id.clone()).await?;
+    let expected_revision = status.command_revision();
+    let request_id =
+        generate_request_id().context("failed to obtain OS randomness for request ID")?;
+    let result = match operation {
+        "start" => control::start(server_id.clone(), request_id.clone(), expected_revision).await,
+        "stop" => control::stop(server_id.clone(), request_id.clone(), expected_revision).await,
+        _ => unreachable!("CLI exposes only start and stop mutations"),
+    };
+    match result {
+        Ok(result) => {
+            print_output(&format!(
+                "{} {} (request {}, command revision {}). Use `mcservernap server status {}` to observe eventual state.\n",
+                result.operation(),
+                result.disposition(),
+                result.request_id(),
+                result.command_revision(),
+                result.server_id(),
+            ))?;
+            Ok(())
+        }
+        Err(control::ClientError::SubmissionUncertain) => {
+            let diagnostic = control::status(server_id).await;
+            let diagnostic_text = match diagnostic {
+                Ok(status) if status.command_revision() != expected_revision => format!(
+                    "The current command revision is {}; that change may belong to this request or another mutation.",
+                    status.command_revision()
+                ),
+                Ok(_) => "The command revision is unchanged, but that still cannot prove absence while server-side cancellation is racing.".to_owned(),
+                Err(_) => "A diagnostic status query also failed.".to_owned(),
+            };
+            Err(anyhow::anyhow!(
+                "{operation} submission has an ambiguous outcome (request ID {request_id}, expected command revision {expected_revision}). {diagnostic_text} The request was not resent."
+            ))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn generate_request_id() -> Result<String, getrandom::Error> {
+    generate_request_id_with(|bytes| getrandom::fill(bytes))
+}
+
+fn generate_request_id_with<E>(
+    fill: impl FnOnce(&mut [u8; 16]) -> std::result::Result<(), E>,
+) -> std::result::Result<String, E> {
+    let mut bytes = [0_u8; 16];
+    fill(&mut bytes)?;
+    Ok(request_id_from_bytes(bytes))
+}
+
+fn request_id_from_bytes(bytes: [u8; 16]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = [0_u8; 32];
+    for (index, byte) in bytes.into_iter().enumerate() {
+        encoded[index * 2] = HEX[usize::from(byte >> 4)];
+        encoded[index * 2 + 1] = HEX[usize::from(byte & 0x0f)];
+    }
+    String::from_utf8(encoded.to_vec()).expect("lowercase hexadecimal is valid UTF-8")
 }
 
 async fn stop_via_rcon(endpoint: &Endpoint, password: &str) -> Result<()> {
@@ -164,29 +250,78 @@ mod tests {
 
     #[test]
     fn parses_read_only_control_commands_and_retains_clap_usage_exit_two() {
-        let list =
-            Cli::try_parse_from(["mcservernap", "--config", "definitely-invalid.toml", "list"])
-                .unwrap();
-        assert!(matches!(list.command, Commands::List));
+        let list = Cli::try_parse_from([
+            "mcservernap",
+            "--config",
+            "definitely-invalid.toml",
+            "server",
+            "list",
+        ])
+        .unwrap();
+        assert!(matches!(
+            list.command,
+            Commands::Server {
+                command: ServerCommand::List
+            }
+        ));
 
         let status = Cli::try_parse_from([
             "mcservernap",
             "--config",
             "definitely-invalid.toml",
+            "server",
             "status",
             "survival",
         ])
         .unwrap();
         assert!(matches!(
             status.command,
-            Commands::Status { ref server_id } if server_id == "survival"
+            Commands::Server {
+                command: ServerCommand::Status { ref server_id }
+            } if server_id == "survival"
         ));
         assert_eq!(
-            Cli::try_parse_from(["mcservernap", "status"])
+            Cli::try_parse_from(["mcservernap", "server", "status"])
                 .err()
                 .unwrap()
                 .exit_code(),
             2
+        );
+        assert!(Cli::try_parse_from(["mcservernap", "list"]).is_err());
+        assert!(Cli::try_parse_from(["mcservernap", "status", "survival"]).is_err());
+        assert!(Cli::try_parse_from(["mcservernap", "server", "restart", "survival"]).is_err());
+        for operation in ["start", "stop"] {
+            let cli =
+                Cli::try_parse_from(["mcservernap", "server", operation, "survival"]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Commands::Server {
+                    command: ServerCommand::Start { ref server_id }
+                        | ServerCommand::Stop { ref server_id }
+                } if server_id == "survival"
+            ));
+        }
+    }
+
+    #[test]
+    fn request_id_encoding_is_exact_lowercase_hexadecimal() {
+        assert_eq!(
+            request_id_from_bytes([
+                0x00, 0x01, 0x0f, 0x10, 0x2a, 0x7f, 0x80, 0xab, 0xcd, 0xef, 0x11, 0x22, 0x33, 0x44,
+                0x55, 0xff,
+            ]),
+            "00010f102a7f80abcdef1122334455ff"
+        );
+        let generated = generate_request_id().unwrap();
+        assert_eq!(generated.len(), 32);
+        assert!(
+            generated
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_eq!(
+            generate_request_id_with(|_| Err("entropy unavailable")),
+            Err("entropy unavailable")
         );
     }
 
@@ -202,13 +337,14 @@ mod tests {
                 "cooldown",
                 Some("launch_failed"),
                 2,
-                Some(8_400)
+                Some(8_400),
+                12,
             ),
-            "server: survival\nphase: cooldown\nfailure: launch_failed\nfailure streak: 2\nretry after: 8.4s\n"
+            "server: survival\nphase: cooldown\nfailure: launch_failed\nfailure streak: 2\nretry after: 8.4s\ncommand revision: 12\n"
         );
         assert_eq!(
-            format_status("creative", "running", None, 0, None),
-            "server: creative\nphase: running\nfailure streak: 0\n"
+            format_status("creative", "running", None, 0, None, 0),
+            "server: creative\nphase: running\nfailure streak: 0\ncommand revision: 0\n"
         );
     }
 

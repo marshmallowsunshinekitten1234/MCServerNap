@@ -1,13 +1,15 @@
 use std::future::Future;
 use std::io::ErrorKind;
 use std::process::ExitStatus;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot::error::TryRecvError;
-use tokio::sync::{OwnedRwLockWriteGuard, mpsc, oneshot, watch};
+use tokio::sync::{Notify, OwnedRwLockWriteGuard, mpsc, oneshot, watch};
 use tokio::time::{Instant, sleep_until, timeout, timeout_at};
 
 use crate::backend_use::{BackendCycle, BackendUseCoordinator, CurrentCycleActivity};
@@ -17,6 +19,287 @@ use crate::process::{self, LaunchCommand, OwnedProcess};
 use crate::rcon::{self, RconClient, RconProbeClassification, RconSecret};
 
 const STABILITY_WINDOW: Duration = Duration::from_secs(60);
+pub(crate) const MUTATION_QUEUE_CAPACITY: usize = 32;
+
+const ADMISSION_PENDING: u8 = 0;
+const ADMISSION_CANCELLED: u8 = 1;
+const ADMISSION_ADMITTED: u8 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MutationOperation {
+    Start,
+    Stop,
+}
+
+impl MutationOperation {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MutationDisposition {
+    Accepted,
+    AlreadySatisfied,
+}
+
+impl MutationDisposition {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::AlreadySatisfied => "already_satisfied",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MutationSuccess {
+    pub(crate) server_id: String,
+    pub(crate) operation: MutationOperation,
+    pub(crate) request_id: String,
+    pub(crate) command_revision: u64,
+    pub(crate) disposition: MutationDisposition,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MutationError {
+    OperationRejected,
+    ExternalBackendNotOwned,
+    ConflictingBackendEvidence,
+    OperationInProgress,
+    StaleCommandRevision,
+    RequestIdConflict,
+    InternalFailure,
+}
+
+pub(crate) type MutationReply = std::result::Result<MutationSuccess, MutationError>;
+
+#[derive(Debug)]
+pub(crate) struct AdmissionGate(AtomicU8);
+
+impl AdmissionGate {
+    pub(crate) const fn pending() -> Self {
+        Self(AtomicU8::new(ADMISSION_PENDING))
+    }
+
+    pub(crate) fn cancel(&self) -> bool {
+        self.0
+            .compare_exchange(
+                ADMISSION_PENDING,
+                ADMISSION_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn admit(&self) -> bool {
+        self.0
+            .compare_exchange(
+                ADMISSION_PENDING,
+                ADMISSION_ADMITTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire) == ADMISSION_CANCELLED
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_admitted(&self) -> bool {
+        self.0.load(Ordering::Acquire) == ADMISSION_ADMITTED
+    }
+}
+
+pub(crate) struct MutationEnvelope {
+    pub(crate) operation: MutationOperation,
+    pub(crate) request_id: String,
+    pub(crate) expected_command_revision: u64,
+    pub(crate) reply: oneshot::Sender<MutationReply>,
+    pub(crate) admission: Arc<AdmissionGate>,
+}
+
+#[derive(Clone)]
+pub(crate) struct FatalSignal {
+    sender: watch::Sender<bool>,
+}
+
+impl FatalSignal {
+    pub(crate) fn new() -> (Self, watch::Receiver<bool>) {
+        let (sender, receiver) = watch::channel(false);
+        (Self { sender }, receiver)
+    }
+
+    pub(crate) fn raise(&self) {
+        self.sender.send_replace(true);
+    }
+}
+
+pub(crate) struct QuiescenceRequest {
+    pub(crate) acknowledged: oneshot::Sender<Result<()>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct FreshnessKey {
+    command_revision: u64,
+    launch_generation: u64,
+}
+
+struct WakeLatchState {
+    pending: Option<WakeRequest>,
+    closed: bool,
+}
+
+struct WakeLatchInner {
+    state: Mutex<WakeLatchState>,
+    changed: Notify,
+}
+
+pub(crate) struct WakeLatchRoot {
+    inner: Arc<WakeLatchInner>,
+}
+
+#[derive(Clone)]
+pub(crate) struct WakeLatchSender {
+    inner: Arc<WakeLatchInner>,
+}
+
+pub(crate) struct WakeLatchReceiver {
+    inner: Arc<WakeLatchInner>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WakeLatchError {
+    Closed,
+}
+
+pub(crate) fn wake_latch() -> (WakeLatchRoot, WakeLatchSender, WakeLatchReceiver) {
+    let inner = Arc::new(WakeLatchInner {
+        state: Mutex::new(WakeLatchState {
+            pending: None,
+            closed: false,
+        }),
+        changed: Notify::new(),
+    });
+    (
+        WakeLatchRoot {
+            inner: Arc::clone(&inner),
+        },
+        WakeLatchSender {
+            inner: Arc::clone(&inner),
+        },
+        WakeLatchReceiver { inner },
+    )
+}
+
+impl WakeLatchRoot {
+    pub(crate) fn close(&self) {
+        let mut state = self.inner.state.lock().expect("wake latch mutex poisoned");
+        state.closed = true;
+        state.pending = None;
+        drop(state);
+        self.inner.changed.notify_waiters();
+    }
+}
+
+impl WakeLatchSender {
+    pub(crate) fn enqueue(&self, request: WakeRequest) -> Result<(), WakeLatchError> {
+        let mut state = self.inner.state.lock().expect("wake latch mutex poisoned");
+        if state.closed {
+            return Err(WakeLatchError::Closed);
+        }
+        let notify = match state.pending {
+            None => {
+                state.pending = Some(request);
+                true
+            }
+            Some(pending) if request.freshness() > pending.freshness() => {
+                state.pending = Some(request);
+                true
+            }
+            Some(_) => false,
+        };
+        drop(state);
+        if notify {
+            self.inner.changed.notify_one();
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn close(&self) {
+        let mut state = self.inner.state.lock().expect("wake latch mutex poisoned");
+        state.closed = true;
+        state.pending = None;
+        drop(state);
+        self.inner.changed.notify_waiters();
+    }
+
+    #[cfg(test)]
+    async fn wait_until_empty(&self) -> Result<(), WakeLatchError> {
+        loop {
+            let notified = self.inner.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let state = self.inner.state.lock().expect("wake latch mutex poisoned");
+                if state.closed {
+                    return Err(WakeLatchError::Closed);
+                }
+                if state.pending.is_none() {
+                    return Ok(());
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+impl WakeLatchReceiver {
+    async fn recv(&self) -> Option<WakeRequest> {
+        loop {
+            let notified = self.inner.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut state = self.inner.state.lock().expect("wake latch mutex poisoned");
+                if state.closed {
+                    return None;
+                }
+                if let Some(request) = state.pending.take() {
+                    drop(state);
+                    self.inner.changed.notify_waiters();
+                    return Some(request);
+                }
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn try_recv(&self) -> Option<WakeRequest> {
+        let mut state = self.inner.state.lock().expect("wake latch mutex poisoned");
+        let request = state.pending.take();
+        drop(state);
+        if request.is_some() {
+            self.inner.changed.notify_waiters();
+        }
+        request
+    }
+
+    fn is_closed(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .expect("wake latch mutex poisoned")
+            .closed
+    }
+}
 
 macro_rules! server_debug {
     ($config:expr, $($argument:tt)*) => {
@@ -72,6 +355,7 @@ pub(crate) enum FailureCategory {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LifecycleState {
     phase: ServerPhase,
+    command_revision: u64,
     launch_generation: u64,
     failure: Option<FailureCategory>,
     failure_streak: u32,
@@ -86,12 +370,14 @@ pub(crate) struct LifecycleStatusSnapshot {
     pub(crate) failure: Option<FailureCategory>,
     pub(crate) failure_streak: u32,
     pub(crate) retry_at: Option<Instant>,
+    pub(crate) command_revision: u64,
 }
 
 impl LifecycleState {
     pub(crate) fn reconciling() -> Self {
         Self {
             phase: ServerPhase::Reconciling,
+            command_revision: 0,
             launch_generation: 0,
             failure: None,
             failure_streak: 0,
@@ -105,6 +391,7 @@ impl LifecycleState {
     pub(crate) fn stopped() -> Self {
         Self {
             phase: ServerPhase::Stopped,
+            command_revision: 0,
             launch_generation: 0,
             failure: None,
             failure_streak: 0,
@@ -124,6 +411,7 @@ impl LifecycleState {
             failure: self.failure,
             failure_streak: self.failure_streak,
             retry_at: self.retry_at,
+            command_revision: self.command_revision,
         }
     }
 
@@ -141,8 +429,13 @@ impl LifecycleState {
         };
         let state = Self {
             phase,
+            command_revision: 0,
+            launch_generation: 0,
+            failure: None,
+            failure_streak: 0,
+            phase_started_at: Instant::now(),
+            retry_at: None,
             reconciliation_evidence,
-            ..Self::stopped()
         };
         assert!(state.invariant_holds());
         state
@@ -155,11 +448,16 @@ impl LifecycleState {
         failure_streak: u32,
         retry_at: Option<Instant>,
     ) -> Self {
+        let base = Self::test_phase(phase);
         Self {
+            phase: base.phase,
+            command_revision: base.command_revision,
+            launch_generation: base.launch_generation,
             failure,
             failure_streak,
+            phase_started_at: base.phase_started_at,
             retry_at,
-            ..Self::test_phase(phase)
+            reconciliation_evidence: base.reconciliation_evidence,
         }
     }
 
@@ -193,6 +491,7 @@ impl WakeRequest {
 
     fn can_start(self, current: LifecycleState) -> bool {
         current.phase == ServerPhase::Stopped
+            && self.observed.command_revision == current.command_revision
             && self.observed.launch_generation == current.launch_generation
             && matches!(
                 self.observed.phase,
@@ -215,6 +514,7 @@ impl WakeRequest {
 
     fn requests_retry(self, current: LifecycleState) -> bool {
         current.failure.is_some()
+            && self.observed.command_revision == current.command_revision
             && self.observed.failure == current.failure
             && self.observed.failure_streak == current.failure_streak
             && self.observed.launch_generation == current.launch_generation
@@ -223,6 +523,13 @@ impl WakeRequest {
                 ServerPhase::Stopping | ServerPhase::Cooldown
             )
             && matches!(current.phase, ServerPhase::Stopping | ServerPhase::Cooldown)
+    }
+
+    const fn freshness(self) -> FreshnessKey {
+        FreshnessKey {
+            command_revision: self.observed.command_revision,
+            launch_generation: self.observed.launch_generation,
+        }
     }
 }
 
@@ -278,6 +585,7 @@ enum ReadinessOutcome {
     Exited(ExitStatus),
     ProcessWaitFailed(std::io::Error),
     Shutdown,
+    ExplicitStop,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -380,14 +688,303 @@ impl ReconciliationResult {
 }
 
 struct SupervisorControl {
-    wake_requests: mpsc::Receiver<WakeRequest>,
+    wake_requests: WakeLatchReceiver,
+    mutations: mpsc::Receiver<MutationEnvelope>,
     shutdown: oneshot::Receiver<()>,
     lifecycle: watch::Sender<LifecycleState>,
+    last_admission: Option<MutationSuccess>,
+    launch_demand: bool,
+    stopping_reason: Option<StoppingReason>,
+    reconciliation_mode: ReconciliationMode,
+    fatal: FatalSignal,
+    runtime_drained: watch::Receiver<bool>,
+    mutations_closed: bool,
+    quiescence: mpsc::Sender<QuiescenceRequest>,
+    fatal_error: Option<anyhow::Error>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StoppingReason {
+    AutomaticIdle,
+    FailureCleanup,
+    Explicit,
+    DaemonShutdown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReconciliationMode {
+    Initial,
+    FinalGate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MutationEffect {
+    None,
+    StopOwned,
+}
+
+struct AdmissionPlan {
+    next: LifecycleState,
+    disposition: MutationDisposition,
+    effect: MutationEffect,
+    launch_demand: bool,
+    stopping_reason: Option<StoppingReason>,
 }
 
 impl SupervisorControl {
-    async fn wait_for_reconciliation_demand(&mut self) -> bool {
+    fn raise_fatal(&mut self, message: &'static str) {
+        if self.fatal_error.is_none() {
+            self.fatal_error = Some(anyhow::anyhow!(message));
+        }
+        self.fatal.raise();
+    }
+
+    fn terminal_result(&mut self) -> Result<()> {
+        match self.fatal_error.take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn next_launch_generation(&mut self) -> Option<u64> {
+        let current = self.current_lifecycle();
+        if let Some(next) = current.launch_generation.checked_add(1) {
+            Some(next)
+        } else {
+            self.raise_fatal("lifecycle launch generation exhausted");
+            None
+        }
+    }
+
+    fn handle_mutation(
+        &mut self,
+        envelope: MutationEnvelope,
+        config: &SupervisorConfig,
+    ) -> MutationEffect {
+        if envelope.admission.is_cancelled() {
+            return MutationEffect::None;
+        }
+
+        if let Some(last) = &self.last_admission
+            && last.request_id == envelope.request_id
+        {
+            let original_expected = last.command_revision.checked_sub(1);
+            if last.operation == envelope.operation
+                && original_expected == Some(envelope.expected_command_revision)
+            {
+                let _ = envelope.reply.send(Ok(last.clone()));
+            } else {
+                let _ = envelope.reply.send(Err(MutationError::RequestIdConflict));
+            }
+            return MutationEffect::None;
+        }
+
+        let current = self.current_lifecycle();
+        if envelope.expected_command_revision != current.command_revision {
+            let _ = envelope
+                .reply
+                .send(Err(MutationError::StaleCommandRevision));
+            return MutationEffect::None;
+        }
+        let Some(next_revision) = current.command_revision.checked_add(1) else {
+            self.raise_fatal("lifecycle command revision exhausted");
+            let _ = envelope.reply.send(Err(MutationError::InternalFailure));
+            return MutationEffect::None;
+        };
+
+        let plan = match self.plan_mutation(envelope.operation, current, next_revision) {
+            Ok(plan) => plan,
+            Err(error) => {
+                let _ = envelope.reply.send(Err(error));
+                return MutationEffect::None;
+            }
+        };
+        if !envelope.admission.admit() {
+            return MutationEffect::None;
+        }
+
+        self.launch_demand = plan.launch_demand;
+        self.stopping_reason = plan.stopping_reason;
+        self.publish(plan.next);
+        let success = MutationSuccess {
+            server_id: config.context.id().to_owned(),
+            operation: envelope.operation,
+            request_id: envelope.request_id,
+            command_revision: next_revision,
+            disposition: plan.disposition,
+        };
+        self.last_admission = Some(success.clone());
+        let _ = envelope.reply.send(Ok(success));
+        plan.effect
+    }
+
+    fn plan_mutation(
+        &self,
+        operation: MutationOperation,
+        current: LifecycleState,
+        next_revision: u64,
+    ) -> std::result::Result<AdmissionPlan, MutationError> {
+        let next = LifecycleState {
+            phase: current.phase,
+            command_revision: next_revision,
+            launch_generation: current.launch_generation,
+            failure: current.failure,
+            failure_streak: current.failure_streak,
+            phase_started_at: current.phase_started_at,
+            retry_at: current.retry_at,
+            reconciliation_evidence: current.reconciliation_evidence,
+        };
+        match operation {
+            MutationOperation::Start => self.plan_start(current, next),
+            MutationOperation::Stop => self.plan_stop(current, next),
+        }
+    }
+
+    fn plan_start(
+        &self,
+        current: LifecycleState,
+        next: LifecycleState,
+    ) -> std::result::Result<AdmissionPlan, MutationError> {
+        let mut launch_demand = self.launch_demand;
+        let disposition = match current.phase {
+            ServerPhase::Reconciling
+                if self.reconciliation_mode == ReconciliationMode::Initial && !launch_demand =>
+            {
+                launch_demand = true;
+                MutationDisposition::Accepted
+            }
+            ServerPhase::Reconciling | ServerPhase::Starting => {
+                return Err(MutationError::OperationInProgress);
+            }
+            ServerPhase::Stopped => {
+                launch_demand = true;
+                MutationDisposition::Accepted
+            }
+            ServerPhase::Running => MutationDisposition::AlreadySatisfied,
+            ServerPhase::Stopping => match self.stopping_reason {
+                Some(StoppingReason::AutomaticIdle | StoppingReason::FailureCleanup) => {
+                    if launch_demand {
+                        return Err(MutationError::OperationInProgress);
+                    }
+                    launch_demand = true;
+                    MutationDisposition::Accepted
+                }
+                Some(StoppingReason::Explicit) => {
+                    return Err(MutationError::OperationInProgress);
+                }
+                Some(StoppingReason::DaemonShutdown) | None => {
+                    return Err(MutationError::OperationRejected);
+                }
+            },
+            ServerPhase::Cooldown => {
+                if launch_demand {
+                    return Err(MutationError::OperationInProgress);
+                }
+                launch_demand = true;
+                MutationDisposition::Accepted
+            }
+            ServerPhase::External => return Err(MutationError::ExternalBackendNotOwned),
+            ServerPhase::Conflict
+                if current.reconciliation_evidence == ReconciliationEvidence::Inconclusive =>
+            {
+                launch_demand = true;
+                MutationDisposition::Accepted
+            }
+            ServerPhase::Conflict => {
+                return Err(MutationError::ConflictingBackendEvidence);
+            }
+        };
+
+        Ok(AdmissionPlan {
+            next,
+            disposition,
+            effect: MutationEffect::None,
+            launch_demand,
+            stopping_reason: self.stopping_reason,
+        })
+    }
+
+    fn plan_stop(
+        &self,
+        current: LifecycleState,
+        mut next: LifecycleState,
+    ) -> std::result::Result<AdmissionPlan, MutationError> {
+        let launch_demand = false;
+        let mut stopping_reason = self.stopping_reason;
+        let mut effect = MutationEffect::None;
+        let disposition = match current.phase {
+            ServerPhase::Reconciling if self.reconciliation_mode == ReconciliationMode::Initial => {
+                return Err(MutationError::OperationRejected);
+            }
+            ServerPhase::Reconciling | ServerPhase::Starting | ServerPhase::Running => {
+                if current.phase == ServerPhase::Reconciling {
+                    return Err(MutationError::OperationInProgress);
+                }
+                next.phase = ServerPhase::Stopping;
+                next.phase_started_at = Instant::now();
+                next.retry_at = None;
+                next.reconciliation_evidence = ReconciliationEvidence::None;
+                stopping_reason = Some(StoppingReason::Explicit);
+                effect = MutationEffect::StopOwned;
+                MutationDisposition::Accepted
+            }
+            ServerPhase::Stopped | ServerPhase::Cooldown => MutationDisposition::AlreadySatisfied,
+            ServerPhase::Stopping => match stopping_reason {
+                Some(StoppingReason::AutomaticIdle) => {
+                    stopping_reason = Some(StoppingReason::Explicit);
+                    MutationDisposition::Accepted
+                }
+                Some(StoppingReason::FailureCleanup) => {
+                    if self.launch_demand {
+                        MutationDisposition::Accepted
+                    } else {
+                        MutationDisposition::AlreadySatisfied
+                    }
+                }
+                Some(StoppingReason::Explicit) => {
+                    return Err(MutationError::OperationInProgress);
+                }
+                Some(StoppingReason::DaemonShutdown) | None => {
+                    return Err(MutationError::OperationRejected);
+                }
+            },
+            ServerPhase::External => return Err(MutationError::ExternalBackendNotOwned),
+            ServerPhase::Conflict => {
+                return Err(MutationError::ConflictingBackendEvidence);
+            }
+        };
+
+        Ok(AdmissionPlan {
+            next,
+            disposition,
+            effect,
+            launch_demand,
+            stopping_reason,
+        })
+    }
+
+    fn receive_mutation(
+        &mut self,
+        envelope: Option<MutationEnvelope>,
+        config: &SupervisorConfig,
+    ) -> MutationEffect {
+        if let Some(envelope) = envelope {
+            self.handle_mutation(envelope, config)
+        } else {
+            self.mutations_closed = true;
+            MutationEffect::None
+        }
+    }
+
+    async fn wait_for_reconciliation_demand(&mut self, config: &SupervisorConfig) -> bool {
         loop {
+            if self.shutdown_pending() {
+                return false;
+            }
+            if self.launch_demand {
+                self.launch_demand = false;
+                return true;
+            }
             // Closure is terminal even when the one-slot wake latch is still occupied.
             if self.wake_requests.is_closed() {
                 return false;
@@ -397,6 +994,9 @@ impl SupervisorControl {
                 biased;
 
                 _ = &mut self.shutdown => return false,
+                envelope = self.mutations.recv(), if !self.mutations_closed => {
+                    let _ = self.receive_mutation(envelope, config);
+                }
                 request = self.wake_requests.recv() => {
                     let Some(request) = request else {
                         return false;
@@ -405,6 +1005,7 @@ impl SupervisorControl {
                     if request.can_start(current)
                         || request.requests_conflict_reconciliation(current)
                     {
+                        self.launch_demand = false;
                         return true;
                     }
                 }
@@ -413,6 +1014,9 @@ impl SupervisorControl {
     }
 
     fn shutdown_pending(&mut self) -> bool {
+        if self.fatal_error.is_some() {
+            return true;
+        }
         if self.wake_requests.is_closed() {
             return true;
         }
@@ -425,10 +1029,16 @@ impl SupervisorControl {
 
     fn publish(&self, next: LifecycleState) {
         assert!(next.invariant_holds(), "invalid lifecycle state: {next:?}");
+        let current = self.current_lifecycle();
+        assert!(
+            next.command_revision >= current.command_revision
+                && next.launch_generation >= current.launch_generation,
+            "lifecycle counter moved backwards: {current:?} -> {next:?}"
+        );
         self.lifecycle.send_replace(next);
     }
 
-    fn record_launch_success(&self) {
+    fn record_launch_success(&self, next_generation: u64) {
         let current = self.current_lifecycle();
         assert_eq!(current.phase, ServerPhase::Reconciling);
         assert_ne!(
@@ -438,7 +1048,8 @@ impl SupervisorControl {
         // Every request that observed the pre-launch phase belongs to the same coalesced burst.
         self.publish(LifecycleState {
             phase: ServerPhase::Starting,
-            launch_generation: current.launch_generation.wrapping_add(1),
+            command_revision: current.command_revision,
+            launch_generation: next_generation,
             failure: current.failure,
             failure_streak: current.failure_streak,
             phase_started_at: Instant::now(),
@@ -447,7 +1058,7 @@ impl SupervisorControl {
         });
     }
 
-    fn record_launch_failure(&self) -> Instant {
+    fn record_launch_failure(&self, next_generation: u64) -> Instant {
         let current = self.current_lifecycle();
         assert_eq!(current.phase, ServerPhase::Reconciling);
         assert_ne!(
@@ -460,7 +1071,8 @@ impl SupervisorControl {
         let retry_at = now + retry_delay;
         self.publish(LifecycleState {
             phase: ServerPhase::Cooldown,
-            launch_generation: current.launch_generation.wrapping_add(1),
+            command_revision: current.command_revision,
+            launch_generation: next_generation,
             failure: Some(FailureCategory::LaunchFailed),
             failure_streak,
             phase_started_at: now,
@@ -486,6 +1098,7 @@ impl SupervisorControl {
         let retry_at = now + retry_delay;
         self.publish(LifecycleState {
             phase: ServerPhase::Cooldown,
+            command_revision: current.command_revision,
             launch_generation: current.launch_generation,
             failure: Some(failure),
             failure_streak,
@@ -496,7 +1109,7 @@ impl SupervisorControl {
         retry_at
     }
 
-    fn begin_failure_cleanup(&self, failure: FailureCategory) -> Duration {
+    fn begin_failure_cleanup(&mut self, failure: FailureCategory) -> Duration {
         let current = self.current_lifecycle();
         assert_eq!(current.phase, ServerPhase::Starting);
         assert_eq!(
@@ -504,8 +1117,10 @@ impl SupervisorControl {
             ReconciliationEvidence::None
         );
         let failure_streak = current.failure_streak.saturating_add(1);
+        self.stopping_reason = Some(StoppingReason::FailureCleanup);
         self.publish(LifecycleState {
             phase: ServerPhase::Stopping,
+            command_revision: current.command_revision,
             launch_generation: current.launch_generation,
             failure: Some(failure),
             failure_streak,
@@ -527,6 +1142,7 @@ impl SupervisorControl {
         let retry_at = now + retry_delay;
         self.publish(LifecycleState {
             phase: ServerPhase::Cooldown,
+            command_revision: current.command_revision,
             launch_generation: current.launch_generation,
             failure: current.failure,
             failure_streak: current.failure_streak,
@@ -546,6 +1162,7 @@ impl SupervisorControl {
         );
         self.publish(LifecycleState {
             phase: current.phase,
+            command_revision: current.command_revision,
             launch_generation: current.launch_generation,
             failure: None,
             failure_streak: 0,
@@ -567,6 +1184,7 @@ impl SupervisorControl {
         backend_use.begin_cycle(cycle, running_since);
         self.publish(LifecycleState {
             phase: ServerPhase::Running,
+            command_revision: current.command_revision,
             launch_generation: current.launch_generation,
             failure: current.failure,
             failure_streak: current.failure_streak,
@@ -577,11 +1195,13 @@ impl SupervisorControl {
         cycle
     }
 
-    fn begin_idle_stop(&self, cycle: BackendCycle) {
+    fn begin_idle_stop(&mut self, cycle: BackendCycle) {
         let current = self.current_lifecycle();
         assert_eq!(current.owned_running_cycle(), Some(cycle));
+        self.stopping_reason = Some(StoppingReason::AutomaticIdle);
         self.publish(LifecycleState {
             phase: ServerPhase::Stopping,
+            command_revision: current.command_revision,
             launch_generation: current.launch_generation,
             failure: None,
             failure_streak: 0,
@@ -591,7 +1211,7 @@ impl SupervisorControl {
         });
     }
 
-    fn set_phase(&self, phase: ServerPhase) {
+    fn set_phase(&mut self, phase: ServerPhase) {
         assert!(matches!(
             phase,
             ServerPhase::Stopped
@@ -607,6 +1227,7 @@ impl SupervisorControl {
         );
         self.publish(LifecycleState {
             phase,
+            command_revision: current.command_revision,
             launch_generation: current.launch_generation,
             failure: current.failure,
             failure_streak: current.failure_streak,
@@ -614,16 +1235,21 @@ impl SupervisorControl {
             retry_at: None,
             reconciliation_evidence: ReconciliationEvidence::None,
         });
+        if phase != ServerPhase::Stopping {
+            self.stopping_reason = None;
+        }
     }
 
-    fn begin_reconciliation(&self) -> ReconciliationEvidence {
+    fn begin_reconciliation(&mut self) -> ReconciliationEvidence {
         let current = self.current_lifecycle();
         assert!(matches!(
             current.phase,
             ServerPhase::Stopped | ServerPhase::Cooldown | ServerPhase::Conflict
         ));
+        self.reconciliation_mode = ReconciliationMode::FinalGate;
         self.publish(LifecycleState {
             phase: ServerPhase::Reconciling,
+            command_revision: current.command_revision,
             launch_generation: current.launch_generation,
             failure: current.failure,
             failure_streak: current.failure_streak,
@@ -639,6 +1265,7 @@ impl SupervisorControl {
         assert_eq!(current.phase, ServerPhase::Reconciling);
         self.publish(LifecycleState {
             phase: ServerPhase::Stopped,
+            command_revision: current.command_revision,
             launch_generation: current.launch_generation,
             failure: current.failure,
             failure_streak: current.failure_streak,
@@ -648,62 +1275,105 @@ impl SupervisorControl {
         });
     }
 
-    fn publish_external(&self, consume_demand: bool) {
+    fn publish_clean_stopped_after_reap(&mut self) {
+        let current = self.current_lifecycle();
+        assert_eq!(current.phase, ServerPhase::Stopping);
+        self.publish(LifecycleState {
+            phase: ServerPhase::Stopped,
+            command_revision: current.command_revision,
+            launch_generation: current.launch_generation,
+            failure: None,
+            failure_streak: 0,
+            phase_started_at: Instant::now(),
+            retry_at: None,
+            reconciliation_evidence: ReconciliationEvidence::None,
+        });
+        self.stopping_reason = None;
+    }
+
+    fn publish_external(&mut self, consume_demand: bool) -> bool {
         let current = self.current_lifecycle();
         assert!(matches!(
             current.phase,
             ServerPhase::Reconciling | ServerPhase::External
         ));
+        let launch_generation = if consume_demand {
+            let Some(next) = self.next_launch_generation() else {
+                return false;
+            };
+            next
+        } else {
+            current.launch_generation
+        };
         self.publish(LifecycleState {
             phase: ServerPhase::External,
-            launch_generation: if consume_demand {
-                current.launch_generation.wrapping_add(1)
-            } else {
-                current.launch_generation
-            },
+            command_revision: current.command_revision,
+            launch_generation,
             failure: current.failure,
             failure_streak: current.failure_streak,
             phase_started_at: Instant::now(),
             retry_at: None,
             reconciliation_evidence: ReconciliationEvidence::Positive,
         });
+        true
     }
 
-    fn publish_conflict(&self, evidence: ReconciliationEvidence, consume_demand: bool) {
+    fn publish_conflict(&mut self, evidence: ReconciliationEvidence, consume_demand: bool) -> bool {
         assert_ne!(evidence, ReconciliationEvidence::None);
         let current = self.current_lifecycle();
         assert!(matches!(
             current.phase,
             ServerPhase::Reconciling | ServerPhase::External
         ));
+        let launch_generation = if consume_demand {
+            let Some(next) = self.next_launch_generation() else {
+                return false;
+            };
+            next
+        } else {
+            current.launch_generation
+        };
         self.publish(LifecycleState {
             phase: ServerPhase::Conflict,
-            launch_generation: if consume_demand {
-                current.launch_generation.wrapping_add(1)
-            } else {
-                current.launch_generation
-            },
+            command_revision: current.command_revision,
+            launch_generation,
             failure: current.failure,
             failure_streak: current.failure_streak,
             phase_started_at: Instant::now(),
             retry_at: None,
             reconciliation_evidence: evidence,
         });
+        true
     }
 
     async fn wait_for_cooldown(
         &mut self,
+        config: &SupervisorConfig,
         retry_at: Instant,
-        mut retry_pending: bool,
+        retry_pending: bool,
     ) -> CooldownOutcome {
+        self.launch_demand |= retry_pending;
         loop {
             if self.shutdown_pending() {
                 self.set_phase(ServerPhase::Stopped);
                 return CooldownOutcome::Shutdown;
             }
 
+            if !self.mutations_closed {
+                match self.mutations.try_recv() {
+                    Ok(envelope) => {
+                        let _ = self.handle_mutation(envelope, config);
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        self.mutations_closed = true;
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => {}
+                }
+            }
+
             if Instant::now() >= retry_at {
-                if retry_pending {
+                if self.launch_demand {
+                    self.launch_demand = false;
                     return CooldownOutcome::Launch;
                 }
                 self.set_phase(ServerPhase::Stopped);
@@ -717,13 +1387,16 @@ impl SupervisorControl {
                     self.set_phase(ServerPhase::Stopped);
                     return CooldownOutcome::Shutdown;
                 }
+                envelope = self.mutations.recv(), if !self.mutations_closed => {
+                    let _ = self.receive_mutation(envelope, config);
+                }
                 request = self.wake_requests.recv() => {
                     let Some(request) = request else {
                         self.set_phase(ServerPhase::Stopped);
                         return CooldownOutcome::Shutdown;
                     };
-                    if request.requests_retry(self.current_lifecycle()) && !retry_pending {
-                        retry_pending = true;
+                    if request.requests_retry(self.current_lifecycle()) {
+                        self.launch_demand = true;
                     }
                 }
                 () = sleep_until(retry_at) => {}
@@ -733,10 +1406,7 @@ impl SupervisorControl {
 }
 
 enum ReconciliationWaitOutcome {
-    Completed {
-        result: ReconciliationResult,
-        startup_demand: bool,
-    },
+    Completed(ReconciliationResult),
     Shutdown,
 }
 
@@ -825,11 +1495,28 @@ async fn wait_for_reconciliation(
 ) -> ReconciliationWaitOutcome {
     let probe = reconciliation_probe(config, backend);
     tokio::pin!(probe);
-    let mut startup_demand = false;
+    let mut mutation_preceded_probe = false;
 
     loop {
-        if control.wake_requests.is_closed() {
+        if control.shutdown_pending() {
             return ReconciliationWaitOutcome::Shutdown;
+        }
+        if mutation_preceded_probe {
+            if let Some(request) = control.wake_requests.try_recv() {
+                latch_reconciliation_wake(control, config, request, latch_startup_demand);
+            } else if control.wake_requests.is_closed() {
+                return ReconciliationWaitOutcome::Shutdown;
+            }
+            let completed = std::future::poll_fn(|task| {
+                Poll::Ready(match probe.as_mut().poll(task) {
+                    Poll::Ready(result) => Some(result),
+                    Poll::Pending => None,
+                })
+            })
+            .await;
+            if let Some(result) = completed {
+                return ReconciliationWaitOutcome::Completed(result);
+            }
         }
 
         tokio::select! {
@@ -838,32 +1525,48 @@ async fn wait_for_reconciliation(
             _ = &mut control.shutdown => {
                 return ReconciliationWaitOutcome::Shutdown;
             }
-            result = &mut probe => {
-                return ReconciliationWaitOutcome::Completed {
-                    result,
-                    startup_demand,
-                };
+            envelope = control.mutations.recv(), if !control.mutations_closed => {
+                let _ = control.receive_mutation(envelope, config);
+                mutation_preceded_probe = true;
             }
             request = control.wake_requests.recv() => {
                 let Some(request) = request else {
                     return ReconciliationWaitOutcome::Shutdown;
                 };
-                if latch_startup_demand
-                    && !startup_demand
-                    && request.observed == control.current_lifecycle()
-                {
-                    startup_demand = true;
-                    server_info!(config, "Latched one server wake-up request during startup reconciliation");
-                } else {
-                    server_debug!(config, "Ignoring coalesced server wake-up request during reconciliation");
-                }
+                latch_reconciliation_wake(control, config, request, latch_startup_demand);
+            }
+            result = &mut probe => {
+                return ReconciliationWaitOutcome::Completed(result);
             }
         }
     }
 }
 
+fn latch_reconciliation_wake(
+    control: &mut SupervisorControl,
+    config: &SupervisorConfig,
+    request: WakeRequest,
+    latch_startup_demand: bool,
+) {
+    if latch_startup_demand
+        && !control.launch_demand
+        && request.observed == control.current_lifecycle()
+    {
+        control.launch_demand = true;
+        server_info!(
+            config,
+            "Latched one server wake-up request during startup reconciliation"
+        );
+    } else {
+        server_debug!(
+            config,
+            "Ignoring coalesced server wake-up request during reconciliation"
+        );
+    }
+}
+
 fn publish_conflict_observation(
-    control: &SupervisorControl,
+    control: &mut SupervisorControl,
     config: &SupervisorConfig,
     result: &ReconciliationResult,
     evidence: ReconciliationEvidence,
@@ -872,7 +1575,9 @@ fn publish_conflict_observation(
 ) {
     let sticky_positive = evidence == ReconciliationEvidence::Positive;
     let classification = result.conflict_classification(sticky_positive);
-    control.publish_conflict(evidence, consume_demand);
+    if !control.publish_conflict(evidence, consume_demand) {
+        return;
+    }
     if conflict_warning_changed(last_conflict, classification) {
         let next_step = if sticky_positive {
             "restore full external readiness and try another login, or, after independently verifying process exit, restart the listener to clear remembered evidence"
@@ -896,12 +1601,14 @@ fn publish_conflict_observation(
 }
 
 fn publish_external_backend(
-    control: &SupervisorControl,
+    control: &mut SupervisorControl,
     config: &SupervisorConfig,
     consume_demand: bool,
     last_conflict: &mut Option<ConflictClassification>,
 ) {
-    control.publish_external(consume_demand);
+    if !control.publish_external(consume_demand) {
+        return;
+    }
     server_info!(
         config,
         "Detected a ready external backend; proxying without process ownership or automatic shutdown"
@@ -926,13 +1633,12 @@ async fn reconcile_startup(
     backend: &BackendEndpoint,
     last_conflict: &mut Option<ConflictClassification>,
 ) -> StartupReconciliationOutcome {
-    let ReconciliationWaitOutcome::Completed {
-        result,
-        startup_demand,
-    } = wait_for_reconciliation(control, config, backend, true).await
+    let ReconciliationWaitOutcome::Completed(result) =
+        wait_for_reconciliation(control, config, backend, true).await
     else {
         return StartupReconciliationOutcome::Shutdown;
     };
+    let startup_demand = std::mem::take(&mut control.launch_demand);
     result.log_details(config);
     if control.shutdown_pending() {
         return StartupReconciliationOutcome::Shutdown;
@@ -984,7 +1690,7 @@ async fn reconcile_final_gate(
     last_conflict: &mut Option<ConflictClassification>,
 ) -> FinalGateOutcome {
     let prior_evidence = control.begin_reconciliation();
-    let ReconciliationWaitOutcome::Completed { result, .. } =
+    let ReconciliationWaitOutcome::Completed(result) =
         wait_for_reconciliation(control, config, backend, false).await
     else {
         return FinalGateOutcome::Shutdown;
@@ -1054,7 +1760,7 @@ async fn monitor_external_server(
     let mut next_poll = Instant::now() + config.poll_interval;
 
     loop {
-        if control.wake_requests.is_closed() {
+        if control.shutdown_pending() {
             return ExternalMonitorOutcome::Shutdown;
         }
 
@@ -1062,6 +1768,9 @@ async fn monitor_external_server(
             biased;
 
             _ = &mut control.shutdown => return ExternalMonitorOutcome::Shutdown,
+            envelope = control.mutations.recv(), if !control.mutations_closed => {
+                let _ = control.receive_mutation(envelope, config);
+            }
             request = control.wake_requests.recv() => {
                 if request.is_none() {
                     return ExternalMonitorOutcome::Shutdown;
@@ -1072,7 +1781,7 @@ async fn monitor_external_server(
             () = sleep_until(next_poll) => {}
         }
 
-        let ReconciliationWaitOutcome::Completed { result, .. } =
+        let ReconciliationWaitOutcome::Completed(result) =
             wait_for_reconciliation(control, config, backend, false).await
         else {
             return ExternalMonitorOutcome::Shutdown;
@@ -1125,8 +1834,14 @@ fn log_current_failure_cooldown(config: &SupervisorConfig, control: &SupervisorC
     );
 }
 
+// This is the single composition root for the supervisor's owned channels and state-machine loop.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn run(
-    wake_requests: mpsc::Receiver<WakeRequest>,
+    wake_requests: WakeLatchReceiver,
+    mutations: mpsc::Receiver<MutationEnvelope>,
+    quiescence: mpsc::Sender<QuiescenceRequest>,
+    fatal: FatalSignal,
+    runtime_drained: watch::Receiver<bool>,
     shutdown: oneshot::Receiver<()>,
     lifecycle: watch::Sender<LifecycleState>,
     config: SupervisorConfig,
@@ -1135,8 +1850,18 @@ pub(crate) async fn run(
 ) -> Result<()> {
     let mut control = SupervisorControl {
         wake_requests,
+        mutations,
         shutdown,
         lifecycle,
+        last_admission: None,
+        launch_demand: false,
+        stopping_reason: None,
+        reconciliation_mode: ReconciliationMode::Initial,
+        fatal,
+        runtime_drained,
+        mutations_closed: false,
+        quiescence,
+        fatal_error: None,
     };
     assert_eq!(control.current_lifecycle().phase, ServerPhase::Reconciling);
     assert!(control.current_lifecycle().invariant_holds());
@@ -1145,7 +1870,7 @@ pub(crate) async fn run(
         match reconcile_startup(&mut control, &config, &backend, &mut last_conflict).await {
             StartupReconciliationOutcome::Launch => true,
             StartupReconciliationOutcome::Idle => false,
-            StartupReconciliationOutcome::Shutdown => return Ok(()),
+            StartupReconciliationOutcome::Shutdown => return control.terminal_result(),
         };
 
     loop {
@@ -1153,28 +1878,31 @@ pub(crate) async fn run(
             match monitor_external_server(&mut control, &config, &backend, &mut last_conflict).await
             {
                 ExternalMonitorOutcome::Conflict => {}
-                ExternalMonitorOutcome::Shutdown => return Ok(()),
+                ExternalMonitorOutcome::Shutdown => return control.terminal_result(),
             }
         }
 
-        if !launch_pending && !control.wait_for_reconciliation_demand().await {
+        if !launch_pending && !control.wait_for_reconciliation_demand(&config).await {
             if control.current_lifecycle().phase == ServerPhase::Stopped {
                 control.set_phase(ServerPhase::Stopped);
             }
-            return Ok(());
+            return control.terminal_result();
         }
         launch_pending = false;
 
         if control.shutdown_pending() {
-            return Ok(());
+            return control.terminal_result();
         }
 
         match reconcile_final_gate(&mut control, &config, &backend, &mut last_conflict).await {
             FinalGateOutcome::Launch => {}
             FinalGateOutcome::Blocked => continue,
-            FinalGateOutcome::Shutdown => return Ok(()),
+            FinalGateOutcome::Shutdown => return control.terminal_result(),
         }
 
+        let Some(next_generation) = control.next_launch_generation() else {
+            return control.terminal_result();
+        };
         let child = match process::launch(&config.launch) {
             Ok(child) => {
                 server_info!(
@@ -1183,17 +1911,17 @@ pub(crate) async fn run(
                     config.launch.program,
                     config.launch.arguments
                 );
-                control.record_launch_success();
+                control.record_launch_success(next_generation);
                 child
             }
             Err(error) => {
                 server_error!(config, "Unable to start the Minecraft server: {error:#}");
-                let retry_at = control.record_launch_failure();
+                let retry_at = control.record_launch_failure(next_generation);
                 log_current_failure_cooldown(&config, &control);
-                match control.wait_for_cooldown(retry_at, false).await {
+                match control.wait_for_cooldown(&config, retry_at, false).await {
                     CooldownOutcome::Launch => launch_pending = true,
                     CooldownOutcome::Stopped => {}
-                    CooldownOutcome::Shutdown => return Ok(()),
+                    CooldownOutcome::Shutdown => return control.terminal_result(),
                 }
                 continue;
             }
@@ -1215,15 +1943,20 @@ pub(crate) async fn run(
                 retry_pending,
             } => {
                 log_current_failure_cooldown(&config, &control);
-                match control.wait_for_cooldown(retry_at, retry_pending).await {
+                match control
+                    .wait_for_cooldown(&config, retry_at, retry_pending)
+                    .await
+                {
                     CooldownOutcome::Launch => launch_pending = true,
                     CooldownOutcome::Stopped => {}
-                    CooldownOutcome::Shutdown => return Ok(()),
+                    CooldownOutcome::Shutdown => return control.terminal_result(),
                 }
             }
             CycleOutcome::Shutdown => {
-                control.set_phase(ServerPhase::Stopped);
-                return Ok(());
+                if control.fatal_error.is_none() {
+                    control.set_phase(ServerPhase::Stopped);
+                }
+                return control.terminal_result();
             }
         }
     }
@@ -1265,12 +1998,15 @@ async fn run_server_cycle(
             return reap_after_wait_error(child, control, config, error).await;
         }
         ReadinessOutcome::Shutdown => {
-            return stop_for_shutdown(child, control, config).await;
+            return stop_for_shutdown(child, control, config, backend_use).await;
+        }
+        ReadinessOutcome::ExplicitStop => {
+            return stop_explicit_server(child, control, config, backend_use).await;
         }
     }
 
     if control.shutdown_pending() {
-        return stop_for_shutdown(child, control, config).await;
+        return stop_for_shutdown(child, control, config, backend_use).await;
     }
     if let Some(rcon) = &config.rcon {
         server_info!(config, "RCON is ready at {}", rcon.endpoint);
@@ -1289,6 +2025,39 @@ async fn run_server_cycle(
     .await
 }
 
+fn readiness_deadline_outcome(
+    child: &mut OwnedProcess,
+    control: &mut SupervisorControl,
+    config: &SupervisorConfig,
+) -> ReadinessOutcome {
+    match child.try_wait() {
+        Ok(Some(status)) => return ReadinessOutcome::Exited(status),
+        Ok(None) => {}
+        Err(error) => return ReadinessOutcome::ProcessWaitFailed(error),
+    }
+    if !control.mutations_closed {
+        match control.mutations.try_recv() {
+            Ok(envelope) => {
+                if control.handle_mutation(envelope, config) == MutationEffect::StopOwned {
+                    return ReadinessOutcome::ExplicitStop;
+                }
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                control.mutations_closed = true;
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {}
+        }
+    }
+    if control.shutdown_pending() {
+        return ReadinessOutcome::Shutdown;
+    }
+    match child.try_wait() {
+        Ok(Some(status)) => ReadinessOutcome::Exited(status),
+        Ok(None) => ReadinessOutcome::StartupTimedOut,
+        Err(error) => ReadinessOutcome::ProcessWaitFailed(error),
+    }
+}
+
 async fn wait_for_readiness(
     child: &mut OwnedProcess,
     control: &mut SupervisorControl,
@@ -1299,12 +2068,11 @@ async fn wait_for_readiness(
     let mut failed_attempts = 0u64;
 
     loop {
+        if control.shutdown_pending() {
+            return ReadinessOutcome::Shutdown;
+        }
         if Instant::now() >= deadline {
-            return match child.try_wait() {
-                Ok(Some(status)) => ReadinessOutcome::Exited(status),
-                Ok(None) => ReadinessOutcome::StartupTimedOut,
-                Err(error) => ReadinessOutcome::ProcessWaitFailed(error),
-            };
+            return readiness_deadline_outcome(child, control, config);
         }
 
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1336,18 +2104,24 @@ async fn wait_for_readiness(
             biased;
 
             _ = &mut control.shutdown => return ReadinessOutcome::Shutdown,
+            status = child.wait() => {
+                return match status {
+                    Ok(status) => ReadinessOutcome::Exited(status),
+                    Err(error) => ReadinessOutcome::ProcessWaitFailed(error),
+                };
+            }
+            envelope = control.mutations.recv(), if !control.mutations_closed => {
+                if control.receive_mutation(envelope, config) == MutationEffect::StopOwned {
+                    return ReadinessOutcome::ExplicitStop;
+                }
+                continue;
+            }
             request = control.wake_requests.recv() => {
                 if request.is_none() {
                     return ReadinessOutcome::Shutdown;
                 }
                 server_debug!(config, "Ignoring duplicate start request during startup");
                 continue;
-            }
-            status = child.wait() => {
-                return match status {
-                    Ok(status) => ReadinessOutcome::Exited(status),
-                    Err(error) => ReadinessOutcome::ProcessWaitFailed(error),
-                };
             }
             result = connect => {
                 match result {
@@ -1369,17 +2143,22 @@ async fn wait_for_readiness(
             biased;
 
             _ = &mut control.shutdown => return ReadinessOutcome::Shutdown,
-            request = control.wake_requests.recv() => {
-                if request.is_none() {
-                    return ReadinessOutcome::Shutdown;
-                }
-                server_debug!(config, "Ignoring duplicate start request during startup");
-            }
             status = child.wait() => {
                 return match status {
                     Ok(status) => ReadinessOutcome::Exited(status),
                     Err(error) => ReadinessOutcome::ProcessWaitFailed(error),
                 };
+            }
+            envelope = control.mutations.recv(), if !control.mutations_closed => {
+                if control.receive_mutation(envelope, config) == MutationEffect::StopOwned {
+                    return ReadinessOutcome::ExplicitStop;
+                }
+            }
+            request = control.wake_requests.recv() => {
+                if request.is_none() {
+                    return ReadinessOutcome::Shutdown;
+                }
+                server_debug!(config, "Ignoring duplicate start request during startup");
             }
             () = sleep_until(retry_at) => {}
         }
@@ -1391,6 +2170,7 @@ enum IdleExclusiveOutcome {
     ActivityChanged,
     Shutdown,
     ChildWait(std::io::Result<ExitStatus>),
+    ExplicitStop,
 }
 
 enum FinalRconCheck {
@@ -1398,6 +2178,7 @@ enum FinalRconCheck {
     Veto(Option<RconClient>),
     Shutdown,
     ChildWait(std::io::Result<ExitStatus>),
+    ExplicitStop,
 }
 
 enum IdlePlayerCheck {
@@ -1405,6 +2186,7 @@ enum IdlePlayerCheck {
     Veto,
     Shutdown,
     ChildWait(std::io::Result<ExitStatus>),
+    ExplicitStop,
 }
 
 struct RunningMonitorState {
@@ -1469,6 +2251,7 @@ enum RunningMonitorOutcome {
     Committed,
     Shutdown,
     ChildWait(std::io::Result<ExitStatus>),
+    ExplicitStop,
 }
 
 fn complete_stability_window(
@@ -1501,7 +2284,7 @@ async fn acquire_idle_exclusive(
     tokio::pin!(exclusive);
 
     loop {
-        if control.wake_requests.is_closed() {
+        if control.shutdown_pending() {
             return IdleExclusiveOutcome::Shutdown;
         }
         let activity_changed = backend_use.activity_notified();
@@ -1514,13 +2297,18 @@ async fn acquire_idle_exclusive(
             biased;
 
             _ = &mut control.shutdown => return IdleExclusiveOutcome::Shutdown,
+            status = child.wait() => return IdleExclusiveOutcome::ChildWait(status),
+            envelope = control.mutations.recv(), if !control.mutations_closed => {
+                if control.receive_mutation(envelope, config) == MutationEffect::StopOwned {
+                    return IdleExclusiveOutcome::ExplicitStop;
+                }
+            }
             request = control.wake_requests.recv() => {
                 if request.is_none() {
                     return IdleExclusiveOutcome::Shutdown;
                 }
                 server_debug!(config, "Ignoring start request because the server is already running");
             }
-            status = child.wait() => return IdleExclusiveOutcome::ChildWait(status),
             () = sleep_until(state.stable_at), if state.stability_pending => {
                 match complete_stability_window(child, control, config, &mut state.stability_pending) {
                     Ok(Some(status)) => return IdleExclusiveOutcome::ChildWait(Ok(status)),
@@ -1552,26 +2340,32 @@ async fn final_rcon_player_check(
         Command(std::result::Result<Result<String>, tokio::time::error::Elapsed>),
         Shutdown,
         ChildWait(std::io::Result<ExitStatus>),
+        ExplicitStop,
     }
 
     let outcome = {
         let command = timeout(config.command_timeout, client.command("list"));
         tokio::pin!(command);
         loop {
-            if control.wake_requests.is_closed() {
+            if control.shutdown_pending() {
                 break WaitOutcome::Shutdown;
             }
             tokio::select! {
                 biased;
 
                 _ = &mut control.shutdown => break WaitOutcome::Shutdown,
+                status = child.wait() => break WaitOutcome::ChildWait(status),
+                envelope = control.mutations.recv(), if !control.mutations_closed => {
+                    if control.receive_mutation(envelope, config) == MutationEffect::StopOwned {
+                        break WaitOutcome::ExplicitStop;
+                    }
+                }
                 request = control.wake_requests.recv() => {
                     if request.is_none() {
                         break WaitOutcome::Shutdown;
                     }
                     server_debug!(config, "Ignoring start request because the server is already running");
                 }
-                status = child.wait() => break WaitOutcome::ChildWait(status),
                 () = sleep_until(state.stable_at), if state.stability_pending => {
                     match complete_stability_window(child, control, config, &mut state.stability_pending) {
                         Ok(Some(status)) => break WaitOutcome::ChildWait(Ok(status)),
@@ -1612,6 +2406,7 @@ async fn final_rcon_player_check(
         }
         WaitOutcome::Shutdown => FinalRconCheck::Shutdown,
         WaitOutcome::ChildWait(status) => FinalRconCheck::ChildWait(status),
+        WaitOutcome::ExplicitStop => FinalRconCheck::ExplicitStop,
     }
 }
 
@@ -1661,6 +2456,7 @@ async fn confirm_idle_player_state(
         }
         FinalRconCheck::Shutdown => IdlePlayerCheck::Shutdown,
         FinalRconCheck::ChildWait(status) => IdlePlayerCheck::ChildWait(status),
+        FinalRconCheck::ExplicitStop => IdlePlayerCheck::ExplicitStop,
     }
 }
 
@@ -1680,6 +2476,7 @@ async fn attempt_expired_idle_stop(
             IdleExclusiveOutcome::ChildWait(status) => {
                 return RunningMonitorOutcome::ChildWait(status);
             }
+            IdleExclusiveOutcome::ExplicitStop => return RunningMonitorOutcome::ExplicitStop,
         };
 
     let activity = backend_use.activity_snapshot();
@@ -1712,6 +2509,7 @@ async fn attempt_expired_idle_stop(
         IdlePlayerCheck::ChildWait(status) => {
             return RunningMonitorOutcome::ChildWait(status);
         }
+        IdlePlayerCheck::ExplicitStop => return RunningMonitorOutcome::ExplicitStop,
     }
 
     if control.current_lifecycle().owned_running_cycle() != Some(state.cycle) {
@@ -1754,6 +2552,9 @@ async fn advance_running_monitor(
     backend_use: &BackendUseCoordinator,
     state: &mut RunningMonitorState,
 ) -> RunningMonitorOutcome {
+    if control.shutdown_pending() {
+        return RunningMonitorOutcome::Shutdown;
+    }
     let activity_changed = backend_use.activity_notified();
     tokio::pin!(activity_changed);
     let effective_anchor = state.effective_idle_anchor(backend_use.activity_snapshot());
@@ -1767,12 +2568,23 @@ async fn advance_running_monitor(
         PlayerInspection::ProxyOnly => None,
         PlayerInspection::ConfiguredRcon { next_poll, .. } => Some(*next_poll),
     };
+    if next_poll.is_some_and(|deadline| Instant::now() >= deadline) {
+        return poll_player_presence_responsive(child, control, config, state).await;
+    }
     let stable_at = state.stable_at;
     let stability_pending = state.stability_pending;
     tokio::select! {
         biased;
 
         _ = &mut control.shutdown => RunningMonitorOutcome::Shutdown,
+        status = child.wait() => RunningMonitorOutcome::ChildWait(status),
+        envelope = control.mutations.recv(), if !control.mutations_closed => {
+            if control.receive_mutation(envelope, config) == MutationEffect::StopOwned {
+                RunningMonitorOutcome::ExplicitStop
+            } else {
+                RunningMonitorOutcome::Continue
+            }
+        }
         request = control.wake_requests.recv() => {
             if request.is_none() {
                 RunningMonitorOutcome::Shutdown
@@ -1781,7 +2593,6 @@ async fn advance_running_monitor(
                 RunningMonitorOutcome::Continue
             }
         }
-        status = child.wait() => RunningMonitorOutcome::ChildWait(status),
         () = sleep_until(stable_at), if stability_pending => {
             match complete_stability_window(child, control, config, &mut state.stability_pending) {
                 Ok(Some(status)) => RunningMonitorOutcome::ChildWait(Ok(status)),
@@ -1797,7 +2608,6 @@ async fn advance_running_monitor(
                 std::future::pending::<()>().await;
             }
         } => {
-            poll_player_presence(&mut state.player_inspection, config).await;
             RunningMonitorOutcome::Continue
         }
         () = async {
@@ -1807,6 +2617,38 @@ async fn advance_running_monitor(
                 std::future::pending::<()>().await;
             }
         } => RunningMonitorOutcome::Continue,
+    }
+}
+
+async fn poll_player_presence_responsive(
+    child: &mut OwnedProcess,
+    control: &mut SupervisorControl,
+    config: &SupervisorConfig,
+    state: &mut RunningMonitorState,
+) -> RunningMonitorOutcome {
+    let poll = poll_player_presence(&mut state.player_inspection, config);
+    tokio::pin!(poll);
+    loop {
+        if control.shutdown_pending() {
+            return RunningMonitorOutcome::Shutdown;
+        }
+        tokio::select! {
+            biased;
+
+            _ = &mut control.shutdown => return RunningMonitorOutcome::Shutdown,
+            status = child.wait() => return RunningMonitorOutcome::ChildWait(status),
+            envelope = control.mutations.recv(), if !control.mutations_closed => {
+                if control.receive_mutation(envelope, config) == MutationEffect::StopOwned {
+                    return RunningMonitorOutcome::ExplicitStop;
+                }
+            }
+            request = control.wake_requests.recv() => {
+                if request.is_none() {
+                    return RunningMonitorOutcome::Shutdown;
+                }
+            }
+            () = &mut poll => return RunningMonitorOutcome::Continue,
+        }
     }
 }
 
@@ -1829,7 +2671,7 @@ async fn monitor_running_server(
             }
             RunningMonitorOutcome::Shutdown => {
                 drop(state);
-                return stop_for_shutdown(child, control, config).await;
+                return stop_for_shutdown(child, control, config, backend_use).await;
             }
             RunningMonitorOutcome::ChildWait(status) => {
                 drop(state);
@@ -1841,6 +2683,10 @@ async fn monitor_running_server(
                     FailureCategory::ExitedUnexpectedly,
                 )
                 .await;
+            }
+            RunningMonitorOutcome::ExplicitStop => {
+                drop(state);
+                return stop_explicit_server(child, control, config, backend_use).await;
             }
         }
     }
@@ -1960,20 +2806,317 @@ async fn reap_after_wait_error(
     wait_error: std::io::Error,
 ) -> Result<CycleOutcome> {
     control.set_phase(ServerPhase::Stopping);
-    stop_and_reap(&mut child, config)
-        .await
-        .with_context(|| format!("cleanup failed after server process wait error: {wait_error}"))?;
+    if let Err(cleanup_error) = stop_and_reap(&mut child, config).await {
+        let forced_cleanup = force_and_reap(&mut child, config).await;
+        return match forced_cleanup {
+            Ok(()) => Err(wait_error).context(format!(
+                "cleanup failed after server process wait error: {cleanup_error:#}"
+            )),
+            Err(forced_error) => Err(wait_error).context(format!(
+                "cleanup failed after server process wait error: {cleanup_error:#}; forced cleanup also failed: {forced_error:#}"
+            )),
+        };
+    }
     control.set_phase(ServerPhase::Stopped);
     Err(wait_error).context("failed to wait for the server process")
+}
+
+struct QuiescenceOutcome {
+    exclusive: OwnedRwLockWriteGuard<()>,
+    child_status: Option<std::io::Result<ExitStatus>>,
+    shutdown_received: bool,
+}
+
+#[allow(clippy::too_many_lines)]
+async fn quiesce_runtime_and_acquire_exclusive(
+    child: &mut OwnedProcess,
+    control: &mut SupervisorControl,
+    config: &SupervisorConfig,
+    backend_use: &BackendUseCoordinator,
+) -> Result<QuiescenceOutcome> {
+    let deadline = Instant::now() + config.command_timeout;
+    let mut exclusive = Box::pin(backend_use.acquire_exclusive());
+    let mut guard = std::future::poll_fn(|task| {
+        Poll::Ready(match exclusive.as_mut().poll(task) {
+            Poll::Ready(guard) => Some(guard),
+            Poll::Pending => None,
+        })
+    })
+    .await;
+
+    let (acknowledged, mut acknowledgement) = oneshot::channel();
+    control
+        .quiescence
+        .try_send(QuiescenceRequest { acknowledged })
+        .map_err(|error| anyhow::anyhow!("runtime quiescence request failed: {error}"))?;
+    let mut child_status = None;
+    let mut shutdown_received = false;
+    let mut acknowledgement_open = true;
+
+    loop {
+        if shutdown_received && *control.runtime_drained.borrow_and_update() {
+            break;
+        }
+        tokio::select! {
+            biased;
+
+            _ = &mut control.shutdown, if !shutdown_received => {
+                shutdown_received = true;
+            }
+            status = child.wait(), if child_status.is_none() => {
+                child_status = Some(status);
+            }
+            envelope = control.mutations.recv(), if !control.mutations_closed => {
+                let _ = control.receive_mutation(envelope, config);
+                if control.fatal_error.is_some() {
+                    anyhow::bail!("supervisor entered fatal shutdown during runtime quiescence");
+                }
+            }
+            request = control.wake_requests.recv(), if !shutdown_received => {
+                let Some(request) = request else {
+                    shutdown_received = true;
+                    continue;
+                };
+                if request.requests_restart(control.current_lifecycle()) {
+                    control.launch_demand = true;
+                }
+            }
+            result = &mut acknowledgement, if acknowledgement_open => {
+                match result {
+                    Ok(result) => {
+                        result?;
+                        break;
+                    }
+                    Err(_) if shutdown_received => {
+                        acknowledgement_open = false;
+                    }
+                    Err(error) => {
+                        return Err(error)
+                            .context("runtime quiescence acknowledgement channel closed");
+                    }
+                }
+            }
+            changed = control.runtime_drained.changed(), if shutdown_received => {
+                changed.context("runtime-drain indication closed during daemon shutdown")?;
+            }
+            () = sleep_until(deadline) => {
+                anyhow::bail!("runtime quiescence timed out");
+            }
+        }
+    }
+
+    if let Some(guard) = guard.take() {
+        return Ok(QuiescenceOutcome {
+            exclusive: guard,
+            child_status,
+            shutdown_received,
+        });
+    }
+    loop {
+        tokio::select! {
+            biased;
+
+            _ = &mut control.shutdown, if !shutdown_received => {
+                shutdown_received = true;
+            }
+            status = child.wait(), if child_status.is_none() => {
+                child_status = Some(status);
+            }
+            envelope = control.mutations.recv(), if !control.mutations_closed => {
+                let _ = control.receive_mutation(envelope, config);
+                if control.fatal_error.is_some() {
+                    anyhow::bail!("supervisor entered fatal shutdown while acquiring backend-use exclusivity");
+                }
+            }
+            request = control.wake_requests.recv(), if !shutdown_received => {
+                let Some(request) = request else {
+                    shutdown_received = true;
+                    continue;
+                };
+                if request.requests_restart(control.current_lifecycle()) {
+                    control.launch_demand = true;
+                }
+            }
+            acquired = &mut exclusive => return Ok(QuiescenceOutcome {
+                exclusive: acquired,
+                child_status,
+                shutdown_received,
+            }),
+            () = sleep_until(deadline) => {
+                anyhow::bail!("exclusive backend-use acquisition timed out after runtime quiescence");
+            }
+        }
+    }
+}
+
+async fn stop_explicit_server(
+    mut child: OwnedProcess,
+    control: &mut SupervisorControl,
+    config: &SupervisorConfig,
+    backend_use: &BackendUseCoordinator,
+) -> Result<CycleOutcome> {
+    assert_eq!(control.stopping_reason, Some(StoppingReason::Explicit));
+    let quiescence =
+        match quiesce_runtime_and_acquire_exclusive(&mut child, control, config, backend_use).await
+        {
+            Ok(quiescence) => quiescence,
+            Err(error) => {
+                let fatal = error.context("explicit stop could not safely quiesce proxy use");
+                if control.fatal_error.is_none() {
+                    control.fatal_error = Some(fatal);
+                }
+                control.fatal.raise();
+                return stop_for_shutdown(child, control, config, backend_use).await;
+            }
+        };
+    let QuiescenceOutcome {
+        exclusive,
+        child_status,
+        mut shutdown_received,
+    } = quiescence;
+
+    let child_already_reaped = child_status.is_some();
+    if let Some(status) = child_status {
+        match status {
+            Ok(status) => log_process_exit(config, status),
+            Err(wait_error) => {
+                let cleanup = force_and_reap(&mut child, config).await;
+                control.fatal.raise();
+                return match cleanup {
+                    Ok(()) => Err(wait_error).context("failed to wait for the server process"),
+                    Err(cleanup_error) => Err(wait_error).context(format!(
+                        "failed to wait for the server process; forced cleanup also failed: {cleanup_error:#}"
+                    )),
+                };
+            }
+        }
+    }
+
+    let cleanup = async {
+        if child_already_reaped {
+            Ok(())
+        } else {
+            stop_and_reap(&mut child, config).await
+        }
+    };
+    let (cleanup_result, observed_shutdown) =
+        wait_for_explicit_cleanup(cleanup, control, config, shutdown_received).await;
+    shutdown_received = observed_shutdown;
+    drop(exclusive);
+    if let Err(error) = cleanup_result {
+        let fatal = error.context("explicit stop cleanup or reap failed");
+        control.fatal.raise();
+        return match force_and_reap(&mut child, config).await {
+            Ok(()) => Err(fatal),
+            Err(cleanup_error) => {
+                Err(fatal.context(format!("forced cleanup also failed: {cleanup_error:#}")))
+            }
+        };
+    }
+    control.publish_clean_stopped_after_reap();
+    Ok(if shutdown_received {
+        CycleOutcome::Shutdown
+    } else if control.launch_demand {
+        control.launch_demand = false;
+        CycleOutcome::Restart
+    } else {
+        CycleOutcome::Stopped
+    })
+}
+
+async fn wait_for_explicit_cleanup<F>(
+    cleanup: F,
+    control: &mut SupervisorControl,
+    config: &SupervisorConfig,
+    mut shutdown_received: bool,
+) -> (Result<()>, bool)
+where
+    F: Future<Output = Result<()>>,
+{
+    tokio::pin!(cleanup);
+    let result = loop {
+        tokio::select! {
+            biased;
+
+            _ = &mut control.shutdown, if !shutdown_received => {
+                shutdown_received = true;
+            }
+            result = &mut cleanup => break result,
+            envelope = control.mutations.recv(), if !control.mutations_closed => {
+                let _ = control.receive_mutation(envelope, config);
+            }
+            request = control.wake_requests.recv() => {
+                if let Some(request) = request
+                    && request.requests_restart(control.current_lifecycle())
+                {
+                    control.launch_demand = true;
+                }
+            }
+        }
+    };
+    (result, shutdown_received)
+}
+
+async fn force_and_reap(child: &mut OwnedProcess, config: &SupervisorConfig) -> Result<()> {
+    let termination_result = process::terminate(child).await;
+    match timeout(Duration::from_secs(5), child.wait()).await {
+        Ok(Ok(status)) => log_process_exit(config, status),
+        Ok(Err(error)) => return Err(error).context("failed to reap the server process"),
+        Err(_) => anyhow::bail!("server process did not exit after forced termination"),
+    }
+    termination_result
 }
 
 async fn stop_for_shutdown(
     mut child: OwnedProcess,
     control: &mut SupervisorControl,
     config: &SupervisorConfig,
+    backend_use: &BackendUseCoordinator,
 ) -> Result<CycleOutcome> {
+    control.stopping_reason = Some(StoppingReason::DaemonShutdown);
     control.set_phase(ServerPhase::Stopping);
-    stop_and_reap(&mut child, config).await?;
+    if control.fatal_error.is_some() {
+        let deadline = Instant::now() + config.command_timeout;
+        let drain_result = async {
+            while !*control.runtime_drained.borrow_and_update() {
+                control
+                    .runtime_drained
+                    .changed()
+                    .await
+                    .context("fatal runtime-drain indication closed")?;
+            }
+            Result::<()>::Ok(())
+        };
+        let drain_confirmed = timeout_at(deadline, drain_result).await;
+        let exclusive = timeout_at(deadline, backend_use.acquire_exclusive()).await;
+        if !matches!(drain_confirmed, Ok(Ok(()))) || exclusive.is_err() {
+            let original = control
+                .fatal_error
+                .take()
+                .expect("fatal cleanup must retain its original cause");
+            control.fatal_error = Some(original.context(
+                "runtime drain or backend-use exclusivity remained uncertain during fatal cleanup",
+            ));
+        }
+        if let Err(cleanup_error) = force_and_reap(&mut child, config).await {
+            let original = control
+                .fatal_error
+                .take()
+                .expect("fatal cleanup must retain its original cause");
+            return Err(original.context(format!(
+                "forced process cleanup failed during fatal shutdown: {cleanup_error:#}"
+            )));
+        }
+        return Ok(CycleOutcome::Shutdown);
+    }
+    if let Err(cleanup_error) = stop_and_reap(&mut child, config).await {
+        return match force_and_reap(&mut child, config).await {
+            Ok(()) => Err(cleanup_error).context("server shutdown cleanup initially failed"),
+            Err(forced_error) => Err(cleanup_error).context(format!(
+                "server shutdown cleanup failed; forced cleanup also failed: {forced_error:#}"
+            )),
+        };
+    }
     Ok(CycleOutcome::Shutdown)
 }
 
@@ -1984,53 +3127,71 @@ async fn stop_failed_server(
     failure: FailureCategory,
 ) -> Result<CycleOutcome> {
     let retry_delay = control.begin_failure_cleanup(failure);
-    let cleanup = stop_and_reap(&mut child, config);
-    finish_failed_cleanup(cleanup, control, retry_delay).await
+    let outcome = {
+        let cleanup = stop_and_reap(&mut child, config);
+        finish_failed_cleanup(cleanup, control, config, retry_delay).await
+    };
+    match outcome {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => {
+            control.fatal.raise();
+            match force_and_reap(&mut child, config).await {
+                Ok(()) => Err(error),
+                Err(forced_error) => Err(error.context(format!(
+                    "forced cleanup also failed after failure cleanup: {forced_error:#}"
+                ))),
+            }
+        }
+    }
 }
 
 async fn finish_failed_cleanup<F>(
     cleanup: F,
     control: &mut SupervisorControl,
+    config: &SupervisorConfig,
     retry_delay: Duration,
 ) -> Result<CycleOutcome>
 where
     F: Future<Output = Result<()>>,
 {
     tokio::pin!(cleanup);
-    let mut retry_pending = false;
-
-    let shutdown_received = loop {
+    let mut shutdown_received = false;
+    loop {
         tokio::select! {
             biased;
 
-            _ = &mut control.shutdown => break true,
-            request = control.wake_requests.recv(), if !retry_pending => {
-                let Some(request) = request else {
-                    break true;
-                };
-                if request.requests_retry(control.current_lifecycle()) {
-                    retry_pending = true;
-                }
+            _ = &mut control.shutdown, if !shutdown_received => {
+                shutdown_received = true;
             }
             result = &mut cleanup => {
                 result?;
-                break false;
+                break;
+            }
+            envelope = control.mutations.recv(), if !control.mutations_closed => {
+                let _ = control.receive_mutation(envelope, config);
+            }
+            request = control.wake_requests.recv(), if !control.launch_demand && !shutdown_received => {
+                let Some(request) = request else {
+                    shutdown_received = true;
+                    continue;
+                };
+                if request.requests_retry(control.current_lifecycle()) {
+                    control.launch_demand = true;
+                }
             }
         }
-    };
-
-    if shutdown_received {
-        cleanup.await?;
+    }
+    if shutdown_received || control.shutdown_pending() {
         return Ok(CycleOutcome::Shutdown);
     }
-    if control.shutdown_pending() {
-        return Ok(CycleOutcome::Shutdown);
-    }
-
+    assert_eq!(
+        control.stopping_reason,
+        Some(StoppingReason::FailureCleanup)
+    );
     let retry_at = control.finish_failure_cleanup(retry_delay);
     Ok(CycleOutcome::Failed {
         retry_at,
-        retry_pending,
+        retry_pending: control.launch_demand,
     })
 }
 
@@ -2044,34 +3205,16 @@ async fn stop_committed_idle_server(
     assert_eq!(stopping.failure, None);
     assert_eq!(stopping.failure_streak, 0);
     let cleanup = stop_and_reap(&mut child, config);
-    tokio::pin!(cleanup);
-
-    let mut restart = false;
-    let shutdown_received = loop {
-        tokio::select! {
-            biased;
-
-            _ = &mut control.shutdown => break true,
-            request = control.wake_requests.recv(), if !restart => {
-                let Some(request) = request else {
-                    break true;
-                };
-                if request.requests_restart(control.current_lifecycle()) {
-                    restart = true;
-                } else {
-                    server_debug!(config, "Ignoring stale server wake-up request while stopping");
-                }
-            }
-            result = &mut cleanup => {
-                result?;
-                break false;
-            }
-        }
-    };
-
-    if shutdown_received {
-        cleanup.await?;
-        return Ok(CycleOutcome::Shutdown);
+    let (cleanup_result, mut restart, _shutdown_received) =
+        wait_for_idle_cleanup(cleanup, control, config).await;
+    if let Err(error) = cleanup_result {
+        control.fatal.raise();
+        return match force_and_reap(&mut child, config).await {
+            Ok(()) => Err(error),
+            Err(forced_error) => Err(error.context(format!(
+                "forced cleanup also failed after automatic idle cleanup: {forced_error:#}"
+            ))),
+        };
     }
 
     if control.shutdown_pending() {
@@ -2080,53 +3223,129 @@ async fn stop_committed_idle_server(
 
     loop {
         match control.wake_requests.try_recv() {
-            Ok(request) if request.requests_restart(control.current_lifecycle()) => restart = true,
-            Ok(_) => server_debug!(
+            Some(request) if request.requests_restart(control.current_lifecycle()) => {
+                restart = true;
+            }
+            Some(_) => server_debug!(
                 config,
                 "Ignoring stale server wake-up request while stopping"
             ),
-            Err(mpsc::error::TryRecvError::Empty) => break,
-            Err(mpsc::error::TryRecvError::Disconnected) => {
-                return Ok(CycleOutcome::Shutdown);
-            }
+            None => break,
         }
     }
 
-    Ok(if restart {
+    Ok(if restart || control.launch_demand {
+        control.launch_demand = false;
         CycleOutcome::Restart
     } else {
         CycleOutcome::Stopped
     })
 }
 
+async fn wait_for_idle_cleanup<F>(
+    cleanup: F,
+    control: &mut SupervisorControl,
+    config: &SupervisorConfig,
+) -> (Result<()>, bool, bool)
+where
+    F: Future<Output = Result<()>>,
+{
+    tokio::pin!(cleanup);
+    let mut restart = false;
+    let mut shutdown_received = false;
+    let result = loop {
+        tokio::select! {
+            biased;
+
+            _ = &mut control.shutdown, if !shutdown_received => {
+                shutdown_received = true;
+            }
+            result = &mut cleanup => break result,
+            envelope = control.mutations.recv(), if !control.mutations_closed => {
+                let _ = control.receive_mutation(envelope, config);
+                restart = control.launch_demand;
+            }
+            request = control.wake_requests.recv(), if !restart && !shutdown_received => {
+                let Some(request) = request else {
+                    shutdown_received = true;
+                    continue;
+                };
+                if request.requests_restart(control.current_lifecycle()) {
+                    restart = true;
+                    control.launch_demand = true;
+                } else {
+                    server_debug!(config, "Ignoring stale server wake-up request while stopping");
+                }
+            }
+        }
+    };
+    (result, restart, shutdown_received)
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum GracefulStopDelivery {
+    NotSent,
+    Sent,
+    Uncertain,
+}
+
 async fn stop_and_reap(child: &mut OwnedProcess, config: &SupervisorConfig) -> Result<()> {
     let mut wait_error = None;
     let command_deadline = Instant::now() + config.command_timeout;
-    let graceful_stop_sent = if let Some(rcon_config) = &config.rcon {
-        let rcon_stop = async {
-            let mut client =
-                RconClient::connect(&rcon_config.endpoint, rcon_config.password.expose()).await?;
-            client.stop().await
-        };
-        match timeout_at(command_deadline, rcon_stop).await {
-            Ok(Ok(())) => true,
+    let graceful_stop = if let Some(rcon_config) = &config.rcon {
+        match timeout_at(
+            command_deadline,
+            RconClient::connect(&rcon_config.endpoint, rcon_config.password.expose()),
+        )
+        .await
+        {
+            Ok(Ok(mut client)) => match timeout_at(command_deadline, client.stop()).await {
+                Ok(Ok(())) => GracefulStopDelivery::Sent,
+                Ok(Err(error)) => {
+                    server_warn!(
+                        config,
+                        "RCON stop delivery became uncertain; not sending a duplicate console command: {error:#}"
+                    );
+                    GracefulStopDelivery::Uncertain
+                }
+                Err(_) => {
+                    server_warn!(
+                        config,
+                        "RCON stop delivery timed out and is uncertain; not sending a duplicate console command"
+                    );
+                    GracefulStopDelivery::Uncertain
+                }
+            },
             Ok(Err(error)) => {
                 server_warn!(
                     config,
-                    "Failed to send the RCON stop command; trying the owned console: {error:#}"
+                    "Failed to establish the RCON stop session; trying the owned console: {error:#}"
                 );
-                send_console_stop_before(child, config, command_deadline).await
+                if send_console_stop_before(child, config, command_deadline).await {
+                    GracefulStopDelivery::Sent
+                } else {
+                    GracefulStopDelivery::NotSent
+                }
             }
             Err(_) => {
-                server_warn!(config, "Sending the RCON stop command timed out");
-                false
+                server_warn!(
+                    config,
+                    "Establishing the RCON stop session timed out; trying the owned console"
+                );
+                if send_console_stop_before(child, config, command_deadline).await {
+                    GracefulStopDelivery::Sent
+                } else {
+                    GracefulStopDelivery::NotSent
+                }
             }
         }
+    } else if send_console_stop_before(child, config, command_deadline).await {
+        GracefulStopDelivery::Sent
     } else {
-        send_console_stop_before(child, config, command_deadline).await
+        GracefulStopDelivery::NotSent
     };
 
-    if graceful_stop_sent {
+    if graceful_stop != GracefulStopDelivery::NotSent {
         match timeout(config.shutdown_timeout, child.wait()).await {
             Ok(Ok(status)) => {
                 log_process_exit(config, status);
@@ -2365,27 +3584,35 @@ mod tests {
             .expect("test RCON packet should arrive")
     }
 
-    async fn write_test_rcon_packet(stream: &mut TcpStream, id: i32, kind: i32, body: &[u8]) {
+    async fn try_write_test_rcon_packet(
+        stream: &mut TcpStream,
+        id: i32,
+        kind: i32,
+        body: &[u8],
+    ) -> std::io::Result<()> {
         stream
             .write_i32_le(i32::try_from(body.len() + 10).unwrap())
+            .await?;
+        stream.write_i32_le(id).await?;
+        stream.write_i32_le(kind).await?;
+        stream.write_all(body).await?;
+        stream.write_all(&[0, 0]).await
+    }
+
+    async fn write_test_rcon_packet(stream: &mut TcpStream, id: i32, kind: i32, body: &[u8]) {
+        try_write_test_rcon_packet(stream, id, kind, body)
             .await
-            .expect("test RCON packet length should be written");
-        stream
-            .write_i32_le(id)
-            .await
-            .expect("test RCON packet ID should be written");
-        stream
-            .write_i32_le(kind)
-            .await
-            .expect("test RCON packet kind should be written");
-        stream
-            .write_all(body)
-            .await
-            .expect("test RCON packet body should be written");
-        stream
-            .write_all(&[0, 0])
-            .await
-            .expect("test RCON packet terminators should be written");
+            .expect("test RCON packet should be written");
+    }
+
+    fn expected_test_peer_close(error: &std::io::Error) -> bool {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+        )
     }
 
     async fn accept_authenticated_test_rcon_client(listener: &TcpListener) -> TcpStream {
@@ -2537,7 +3764,7 @@ mod tests {
 
     async fn spawn_player_count_rcon_server(
         player_count: u32,
-    ) -> (Endpoint, oneshot::Receiver<()>, JoinHandle<()>) {
+    ) -> (Endpoint, oneshot::Receiver<()>, ScriptedRconServer) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test RCON listener should bind");
@@ -2561,14 +3788,7 @@ mod tests {
             loop {
                 let packet = match try_read_test_rcon_packet(&mut stream).await {
                     Ok(packet) => packet,
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::UnexpectedEof
-                                | std::io::ErrorKind::ConnectionReset
-                                | std::io::ErrorKind::BrokenPipe
-                        ) =>
-                    {
+                    Err(error) if expected_test_peer_close(&error) => {
                         break;
                     }
                     Err(error) => panic!("test RCON packet read failed: {error}"),
@@ -2579,24 +3799,50 @@ mod tests {
                 }
                 assert_eq!(packet.body, b"list");
 
-                let end_marker = read_test_rcon_packet(&mut stream).await;
+                let end_marker = match try_read_test_rcon_packet(&mut stream).await {
+                    Ok(packet) => packet,
+                    Err(error) if expected_test_peer_close(&error) => {
+                        break;
+                    }
+                    Err(error) => panic!("test RCON end-marker read failed: {error}"),
+                };
                 assert_eq!(end_marker.kind, TEST_EXEC_COMMAND);
                 assert!(end_marker.body.is_empty());
                 let response = format!("There are {player_count} of a max of 20 players online:");
-                write_test_rcon_packet(
+                if let Err(error) = try_write_test_rcon_packet(
                     &mut stream,
                     packet.id,
                     TEST_RESPONSE_VALUE,
                     response.as_bytes(),
                 )
-                .await;
-                write_test_rcon_packet(&mut stream, end_marker.id, TEST_RESPONSE_VALUE, b"").await;
+                .await
+                {
+                    assert!(
+                        expected_test_peer_close(&error),
+                        "test RCON response write failed: {error}"
+                    );
+                    break;
+                }
+                if let Err(error) =
+                    try_write_test_rcon_packet(&mut stream, end_marker.id, TEST_RESPONSE_VALUE, b"")
+                        .await
+                {
+                    assert!(
+                        expected_test_peer_close(&error),
+                        "test RCON end-marker response write failed: {error}"
+                    );
+                    break;
+                }
                 if let Some(sender) = first_poll_sender.take() {
                     let _ = sender.send(());
                 }
             }
         });
-        (address, first_poll_receiver, server)
+        (
+            address,
+            first_poll_receiver,
+            ScriptedRconServer { task: Some(server) },
+        )
     }
 
     async fn spawn_blocked_player_count_rcon_server() -> (
@@ -2790,21 +4036,33 @@ mod tests {
     fn failed_lifecycle(phase: ServerPhase, failure_streak: u32) -> LifecycleState {
         LifecycleState {
             phase,
+            command_revision: 0,
             launch_generation: 1,
             failure: Some(FailureCategory::ExitedUnexpectedly),
             failure_streak,
-            ..LifecycleState::stopped()
+            phase_started_at: Instant::now(),
+            retry_at: None,
+            reconciliation_evidence: ReconciliationEvidence::None,
         }
     }
 
     fn running_lifecycle(failure_streak: u32) -> LifecycleState {
         LifecycleState {
             phase: ServerPhase::Running,
+            command_revision: 0,
             launch_generation: 1,
             failure: (failure_streak > 0).then_some(FailureCategory::ExitedUnexpectedly),
             failure_streak,
-            ..LifecycleState::stopped()
+            phase_started_at: Instant::now(),
+            retry_at: None,
+            reconciliation_evidence: ReconciliationEvidence::None,
         }
+    }
+
+    fn lifecycle_with_generation(phase: ServerPhase, launch_generation: u64) -> LifecycleState {
+        let mut lifecycle = LifecycleState::test_phase(phase);
+        lifecycle.launch_generation = launch_generation;
+        lifecycle
     }
 
     fn test_backend_use() -> Arc<BackendUseCoordinator> {
@@ -2815,43 +4073,143 @@ mod tests {
         BackendEndpoint::network(Endpoint::new("127.0.0.1", 9), Duration::from_secs(1))
     }
 
+    async fn run_test(
+        wake_requests: WakeLatchReceiver,
+        shutdown: oneshot::Receiver<()>,
+        lifecycle: watch::Sender<LifecycleState>,
+        config: SupervisorConfig,
+        backend: BackendEndpoint,
+        backend_use: Arc<BackendUseCoordinator>,
+    ) -> Result<()> {
+        let (_mutations, mutation_receiver) = mpsc::channel(MUTATION_QUEUE_CAPACITY);
+        run_test_with_mutations(
+            wake_requests,
+            mutation_receiver,
+            shutdown,
+            lifecycle,
+            config,
+            backend,
+            backend_use,
+        )
+        .await
+    }
+
+    async fn run_test_with_mutations(
+        wake_requests: WakeLatchReceiver,
+        mutation_receiver: mpsc::Receiver<MutationEnvelope>,
+        shutdown: oneshot::Receiver<()>,
+        lifecycle: watch::Sender<LifecycleState>,
+        config: SupervisorConfig,
+        backend: BackendEndpoint,
+        backend_use: Arc<BackendUseCoordinator>,
+    ) -> Result<()> {
+        let (quiescence, _quiescence_receiver) = mpsc::channel(1);
+        let (fatal, _fatal_receiver) = FatalSignal::new();
+        let (_runtime_drained, runtime_drained) = watch::channel(false);
+        run(
+            wake_requests,
+            mutation_receiver,
+            quiescence,
+            fatal,
+            runtime_drained,
+            shutdown,
+            lifecycle,
+            config,
+            backend,
+            backend_use,
+        )
+        .await
+    }
+
     fn test_control(
         initial: LifecycleState,
     ) -> (
         SupervisorControl,
-        mpsc::Sender<WakeRequest>,
+        WakeLatchSender,
         oneshot::Sender<()>,
         watch::Receiver<LifecycleState>,
     ) {
-        let (wake_sender, wake_requests) = mpsc::channel(1);
+        let (_wake_root, wake_sender, wake_requests) = wake_latch();
         let (shutdown_sender, shutdown) = oneshot::channel();
         let (lifecycle, lifecycle_receiver) = watch::channel(initial);
         (
-            SupervisorControl {
-                wake_requests,
-                shutdown,
-                lifecycle,
-            },
+            test_control_from_parts(wake_requests, shutdown, lifecycle),
             wake_sender,
             shutdown_sender,
             lifecycle_receiver,
         )
     }
 
+    fn test_control_with_mutations(
+        initial: LifecycleState,
+    ) -> (
+        SupervisorControl,
+        mpsc::Sender<MutationEnvelope>,
+        WakeLatchSender,
+        oneshot::Sender<()>,
+        watch::Receiver<LifecycleState>,
+    ) {
+        let (mut control, wake_sender, shutdown_sender, lifecycle) = test_control(initial);
+        let (mutations, mutation_receiver) = mpsc::channel(MUTATION_QUEUE_CAPACITY);
+        control.mutations = mutation_receiver;
+        (control, mutations, wake_sender, shutdown_sender, lifecycle)
+    }
+
+    fn test_control_from_parts(
+        wake_requests: WakeLatchReceiver,
+        shutdown: oneshot::Receiver<()>,
+        lifecycle: watch::Sender<LifecycleState>,
+    ) -> SupervisorControl {
+        let (_mutations, mutation_receiver) = mpsc::channel(MUTATION_QUEUE_CAPACITY);
+        let (quiescence, _quiescence_receiver) = mpsc::channel(1);
+        let (fatal, _fatal_receiver) = FatalSignal::new();
+        let (_runtime_drained, runtime_drained) = watch::channel(false);
+        let initial = *lifecycle.borrow();
+        SupervisorControl {
+            wake_requests,
+            mutations: mutation_receiver,
+            shutdown,
+            lifecycle,
+            last_admission: None,
+            launch_demand: false,
+            stopping_reason: (initial.phase == ServerPhase::Stopping).then_some(
+                if initial.failure.is_some() {
+                    StoppingReason::FailureCleanup
+                } else {
+                    StoppingReason::AutomaticIdle
+                },
+            ),
+            reconciliation_mode: if initial.phase == ServerPhase::Reconciling {
+                ReconciliationMode::Initial
+            } else {
+                ReconciliationMode::FinalGate
+            },
+            fatal,
+            runtime_drained,
+            mutations_closed: false,
+            quiescence,
+            fatal_error: None,
+        }
+    }
+
     struct TestSupervisor {
-        wake_sender: mpsc::Sender<WakeRequest>,
+        wake_root: WakeLatchRoot,
+        wake_sender: WakeLatchSender,
         shutdown_sender: oneshot::Sender<()>,
+        mutations: mpsc::Sender<MutationEnvelope>,
         lifecycle: watch::Receiver<LifecycleState>,
         task: JoinHandle<Result<()>>,
     }
 
     impl TestSupervisor {
         fn spawn(config: SupervisorConfig, backend: BackendEndpoint) -> Self {
-            let (wake_sender, wake_receiver) = mpsc::channel(1);
+            let (wake_root, wake_sender, wake_receiver) = wake_latch();
             let (shutdown_sender, shutdown_receiver) = oneshot::channel();
             let (lifecycle_sender, lifecycle) = watch::channel(LifecycleState::reconciling());
-            let task = tokio::spawn(run(
+            let (mutations, mutation_receiver) = mpsc::channel(MUTATION_QUEUE_CAPACITY);
+            let task = tokio::spawn(run_test_with_mutations(
                 wake_receiver,
+                mutation_receiver,
                 shutdown_receiver,
                 lifecycle_sender,
                 config,
@@ -2859,14 +4217,17 @@ mod tests {
                 test_backend_use(),
             ));
             Self {
+                wake_root,
                 wake_sender,
                 shutdown_sender,
+                mutations,
                 lifecycle,
                 task,
             }
         }
 
         async fn shutdown(self) -> watch::Receiver<LifecycleState> {
+            self.wake_root.close();
             self.shutdown_sender
                 .send(())
                 .expect("supervisor should still await shutdown");
@@ -2904,6 +4265,478 @@ mod tests {
         let mut player_inspection = connected_player_inspection(rcon_endpoint).await;
         poll_player_presence(&mut player_inspection, config).await;
         player_inspection
+    }
+
+    fn test_mutation(
+        operation: MutationOperation,
+        request_id: &str,
+        expected_command_revision: u64,
+        admission: Arc<AdmissionGate>,
+    ) -> (MutationEnvelope, oneshot::Receiver<MutationReply>) {
+        let (reply, receiver) = oneshot::channel();
+        (
+            MutationEnvelope {
+                operation,
+                request_id: request_id.to_owned(),
+                expected_command_revision,
+                reply,
+                admission,
+            },
+            receiver,
+        )
+    }
+
+    async fn process_queued_mutation(
+        control: &mut SupervisorControl,
+        config: &SupervisorConfig,
+    ) -> MutationEffect {
+        let envelope = control.mutations.recv().await;
+        control.receive_mutation(envelope, config)
+    }
+
+    fn ready_cleanup(result: Result<()>) -> impl Future<Output = Result<()>> {
+        let (release, released) = oneshot::channel();
+        release
+            .send(result)
+            .expect("test cleanup receiver should still exist");
+        async move {
+            released
+                .await
+                .expect("test cleanup release should remain available")
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_mutations_increment_once_and_replay_exactly() {
+        let (mut control, _wake_sender, _shutdown_sender, lifecycle) =
+            test_control(LifecycleState::stopped());
+        let config = test_config(&Endpoint::new("127.0.0.1", 9));
+        let first_gate = Arc::new(AdmissionGate::pending());
+        let (first, first_reply) = test_mutation(
+            MutationOperation::Start,
+            "11111111111111111111111111111111",
+            0,
+            Arc::clone(&first_gate),
+        );
+        assert_eq!(
+            control.handle_mutation(first, &config),
+            MutationEffect::None
+        );
+        let success = first_reply.await.unwrap().unwrap();
+        assert_eq!(success.command_revision, 1);
+        assert_eq!(success.disposition, MutationDisposition::Accepted);
+        assert!(first_gate.is_admitted());
+        assert_eq!(lifecycle.borrow().command_revision, 1);
+
+        let replay_gate = Arc::new(AdmissionGate::pending());
+        let (replay, replay_reply) = test_mutation(
+            MutationOperation::Start,
+            "11111111111111111111111111111111",
+            0,
+            Arc::clone(&replay_gate),
+        );
+        control.handle_mutation(replay, &config);
+        assert_eq!(replay_reply.await.unwrap().unwrap(), success);
+        assert_eq!(lifecycle.borrow().command_revision, 1);
+        assert!(!replay_gate.is_admitted());
+
+        let (conflict, conflict_reply) = test_mutation(
+            MutationOperation::Stop,
+            "11111111111111111111111111111111",
+            1,
+            Arc::new(AdmissionGate::pending()),
+        );
+        control.handle_mutation(conflict, &config);
+        assert_eq!(
+            conflict_reply.await.unwrap(),
+            Err(MutationError::RequestIdConflict)
+        );
+        assert_eq!(lifecycle.borrow().command_revision, 1);
+    }
+
+    #[tokio::test]
+    async fn start_phase_table_covers_every_phase_and_stopping_reason() {
+        for (phase, expected) in [
+            (ServerPhase::Reconciling, Ok(MutationDisposition::Accepted)),
+            (ServerPhase::Stopped, Ok(MutationDisposition::Accepted)),
+            (
+                ServerPhase::Starting,
+                Err(MutationError::OperationInProgress),
+            ),
+            (
+                ServerPhase::Running,
+                Ok(MutationDisposition::AlreadySatisfied),
+            ),
+            (ServerPhase::Stopping, Ok(MutationDisposition::Accepted)),
+            (ServerPhase::Cooldown, Ok(MutationDisposition::Accepted)),
+            (
+                ServerPhase::External,
+                Err(MutationError::ExternalBackendNotOwned),
+            ),
+            (ServerPhase::Conflict, Ok(MutationDisposition::Accepted)),
+        ] {
+            let (control, _, _, _) = test_control(LifecycleState::test_phase(phase));
+            let result = control
+                .plan_mutation(MutationOperation::Start, control.current_lifecycle(), 1)
+                .map(|plan| plan.disposition);
+            assert_eq!(result, expected, "unexpected start policy for {phase:?}");
+        }
+
+        for (reason, expected) in [
+            (
+                StoppingReason::AutomaticIdle,
+                Ok(MutationDisposition::Accepted),
+            ),
+            (
+                StoppingReason::FailureCleanup,
+                Ok(MutationDisposition::Accepted),
+            ),
+            (
+                StoppingReason::Explicit,
+                Err(MutationError::OperationInProgress),
+            ),
+            (
+                StoppingReason::DaemonShutdown,
+                Err(MutationError::OperationRejected),
+            ),
+        ] {
+            let (mut control, _, _, _) =
+                test_control(LifecycleState::test_phase(ServerPhase::Stopping));
+            control.stopping_reason = Some(reason);
+            let result = control
+                .plan_mutation(MutationOperation::Start, control.current_lifecycle(), 1)
+                .map(|plan| plan.disposition);
+            assert_eq!(result, expected, "unexpected start policy for {reason:?}");
+        }
+
+        let mut positive_conflict = LifecycleState::test_phase(ServerPhase::Conflict);
+        positive_conflict.reconciliation_evidence = ReconciliationEvidence::Positive;
+        let (control, _, _, _) = test_control(positive_conflict);
+        assert!(matches!(
+            control.plan_mutation(MutationOperation::Start, positive_conflict, 1),
+            Err(MutationError::ConflictingBackendEvidence)
+        ));
+    }
+
+    #[tokio::test]
+    async fn stop_phase_table_covers_every_phase_and_stopping_reason() {
+        for (phase, expected) in [
+            (
+                ServerPhase::Reconciling,
+                Err(MutationError::OperationRejected),
+            ),
+            (
+                ServerPhase::Stopped,
+                Ok(MutationDisposition::AlreadySatisfied),
+            ),
+            (ServerPhase::Starting, Ok(MutationDisposition::Accepted)),
+            (ServerPhase::Running, Ok(MutationDisposition::Accepted)),
+            (ServerPhase::Stopping, Ok(MutationDisposition::Accepted)),
+            (
+                ServerPhase::Cooldown,
+                Ok(MutationDisposition::AlreadySatisfied),
+            ),
+            (
+                ServerPhase::External,
+                Err(MutationError::ExternalBackendNotOwned),
+            ),
+            (
+                ServerPhase::Conflict,
+                Err(MutationError::ConflictingBackendEvidence),
+            ),
+        ] {
+            let (control, _, _, _) = test_control(LifecycleState::test_phase(phase));
+            let result = control
+                .plan_mutation(MutationOperation::Stop, control.current_lifecycle(), 1)
+                .map(|plan| plan.disposition);
+            assert_eq!(result, expected, "unexpected stop policy for {phase:?}");
+        }
+
+        let (mut final_gate, _, _, _) =
+            test_control(LifecycleState::test_phase(ServerPhase::Reconciling));
+        final_gate.reconciliation_mode = ReconciliationMode::FinalGate;
+        assert!(matches!(
+            final_gate.plan_mutation(MutationOperation::Stop, final_gate.current_lifecycle(), 1,),
+            Err(MutationError::OperationInProgress)
+        ));
+
+        for (reason, expected_reason, expected) in [
+            (
+                StoppingReason::AutomaticIdle,
+                Some(StoppingReason::Explicit),
+                Ok(MutationDisposition::Accepted),
+            ),
+            (
+                StoppingReason::FailureCleanup,
+                Some(StoppingReason::FailureCleanup),
+                Ok(MutationDisposition::AlreadySatisfied),
+            ),
+            (
+                StoppingReason::Explicit,
+                Some(StoppingReason::Explicit),
+                Err(MutationError::OperationInProgress),
+            ),
+            (
+                StoppingReason::DaemonShutdown,
+                Some(StoppingReason::DaemonShutdown),
+                Err(MutationError::OperationRejected),
+            ),
+        ] {
+            let (mut control, _, _, _) =
+                test_control(LifecycleState::test_phase(ServerPhase::Stopping));
+            control.stopping_reason = Some(reason);
+            let result =
+                control.plan_mutation(MutationOperation::Stop, control.current_lifecycle(), 1);
+            match (result, expected) {
+                (Ok(plan), Ok(disposition)) => {
+                    assert_eq!(plan.disposition, disposition);
+                    assert_eq!(plan.stopping_reason, expected_reason);
+                }
+                (Err(actual), Err(expected)) => assert_eq!(actual, expected),
+                _ => panic!("unexpected stop policy for {reason:?}"),
+            }
+        }
+
+        let (mut failed_cleanup, _, _, _) =
+            test_control(LifecycleState::test_phase(ServerPhase::Stopping));
+        failed_cleanup.stopping_reason = Some(StoppingReason::FailureCleanup);
+        failed_cleanup.launch_demand = true;
+        let plan = failed_cleanup
+            .plan_mutation(
+                MutationOperation::Stop,
+                failed_cleanup.current_lifecycle(),
+                1,
+            )
+            .unwrap();
+        assert_eq!(plan.disposition, MutationDisposition::Accepted);
+        assert_eq!(plan.stopping_reason, Some(StoppingReason::FailureCleanup));
+        assert!(!plan.launch_demand);
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_rejection_do_not_publish_a_revision() {
+        let (mut control, _wake_sender, _shutdown_sender, lifecycle) =
+            test_control(LifecycleState::test_phase(ServerPhase::External));
+        let config = test_config(&Endpoint::new("127.0.0.1", 9));
+        let cancelled_gate = Arc::new(AdmissionGate::pending());
+        assert!(cancelled_gate.cancel());
+        let (cancelled, cancelled_reply) = test_mutation(
+            MutationOperation::Start,
+            "22222222222222222222222222222222",
+            0,
+            cancelled_gate,
+        );
+        control.handle_mutation(cancelled, &config);
+        assert!(cancelled_reply.await.is_err());
+        assert_eq!(lifecycle.borrow().command_revision, 0);
+
+        let (rejected, rejected_reply) = test_mutation(
+            MutationOperation::Stop,
+            "33333333333333333333333333333333",
+            0,
+            Arc::new(AdmissionGate::pending()),
+        );
+        control.handle_mutation(rejected, &config);
+        assert_eq!(
+            rejected_reply.await.unwrap(),
+            Err(MutationError::ExternalBackendNotOwned)
+        );
+        assert_eq!(lifecycle.borrow().command_revision, 0);
+    }
+
+    #[tokio::test]
+    async fn counter_exhaustion_is_fatal_without_publication() {
+        let mut exhausted = LifecycleState::stopped();
+        exhausted.command_revision = u64::MAX;
+        exhausted.launch_generation = u64::MAX;
+        let (mut control, _wake_sender, _shutdown_sender, lifecycle) = test_control(exhausted);
+        let config = test_config(&Endpoint::new("127.0.0.1", 9));
+        let gate = Arc::new(AdmissionGate::pending());
+        let (mutation, reply) = test_mutation(
+            MutationOperation::Start,
+            "44444444444444444444444444444444",
+            u64::MAX,
+            Arc::clone(&gate),
+        );
+        control.handle_mutation(mutation, &config);
+        assert_eq!(reply.await.unwrap(), Err(MutationError::InternalFailure));
+        assert!(!gate.is_admitted());
+        assert_eq!(lifecycle.borrow().command_revision, u64::MAX);
+        assert_eq!(control.next_launch_generation(), None);
+        assert_eq!(lifecycle.borrow().launch_generation, u64::MAX);
+        assert!(control.fatal_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn wake_latch_is_non_lossy_and_newer_freshness_replaces_stale() {
+        let (root, sender, receiver) = wake_latch();
+        let mut stale = LifecycleState::stopped();
+        stale.command_revision = 7;
+        stale.launch_generation = 3;
+        sender.enqueue(WakeRequest::observed(stale)).unwrap();
+        sender.enqueue(WakeRequest::observed(stale)).unwrap();
+
+        let mut newer_generation = stale;
+        newer_generation.launch_generation = 4;
+        sender
+            .enqueue(WakeRequest::observed(newer_generation))
+            .unwrap();
+        let mut older_revision = stale;
+        older_revision.command_revision = 6;
+        older_revision.launch_generation = u64::MAX;
+        sender
+            .enqueue(WakeRequest::observed(older_revision))
+            .unwrap();
+        assert_eq!(
+            receiver.try_recv(),
+            Some(WakeRequest::observed(newer_generation))
+        );
+
+        sender
+            .enqueue(WakeRequest::observed(newer_generation))
+            .unwrap();
+        assert_eq!(
+            receiver.recv().await,
+            Some(WakeRequest::observed(newer_generation))
+        );
+        root.close();
+        assert_eq!(
+            sender.enqueue(WakeRequest::observed(stale)),
+            Err(WakeLatchError::Closed)
+        );
+        assert_eq!(receiver.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn post_stop_wake_replaces_a_stale_pending_wake() {
+        let (_root, sender, receiver) = wake_latch();
+        let mut before_stop = LifecycleState::stopped();
+        before_stop.command_revision = 12;
+        sender.enqueue(WakeRequest::observed(before_stop)).unwrap();
+        let mut after_stop = before_stop;
+        after_stop.command_revision = 13;
+        sender.enqueue(WakeRequest::observed(after_stop)).unwrap();
+        assert_eq!(
+            receiver.recv().await,
+            Some(WakeRequest::observed(after_stop))
+        );
+        assert!(WakeRequest::observed(after_stop).can_start(after_stop));
+    }
+
+    #[tokio::test]
+    async fn explicit_quiescence_queues_writer_before_request_and_retains_it() {
+        let running = running_lifecycle(0);
+        let backend_use = running_backend_use(running);
+        let initial_reader = backend_use
+            .acquire_shared(running.owned_running_cycle().unwrap())
+            .await;
+        let (mut control, _wake_sender, _shutdown_sender, _lifecycle) = test_control(running);
+        control.stopping_reason = Some(StoppingReason::Explicit);
+        let (quiescence, mut runtime_requests) = mpsc::channel(1);
+        control.quiescence = quiescence;
+        let mut config = test_config(&Endpoint::new("127.0.0.1", 9));
+        config.command_timeout = Duration::from_secs(5);
+        let mut child = process::launch(&config.launch).expect("test server process should launch");
+        let task_backend_use = Arc::clone(&backend_use);
+        let quiescence = tokio::spawn(async move {
+            let result = quiesce_runtime_and_acquire_exclusive(
+                &mut child,
+                &mut control,
+                &config,
+                &task_backend_use,
+            )
+            .await;
+            (result, control, child, config)
+        });
+
+        let request = runtime_requests
+            .recv()
+            .await
+            .expect("supervisor should request runtime quiescence");
+        let later_reader = {
+            let backend_use = Arc::clone(&backend_use);
+            tokio::spawn(async move {
+                backend_use
+                    .acquire_shared(BackendCycle::from_launch_generation(1))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        drop(initial_reader);
+        request.acknowledged.send(Ok(())).unwrap();
+        let (result, _control, mut child, config) = quiescence.await.unwrap();
+        let outcome = result.unwrap();
+        assert!(outcome.child_status.is_none());
+        let writer = outcome.exclusive;
+        assert!(!later_reader.is_finished());
+        drop(writer);
+        drop(later_reader.await.unwrap());
+        force_and_reap(&mut child, &config).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn permanent_runtime_drain_breaks_shutdown_quiescence_wait_without_acknowledgement() {
+        let running = running_lifecycle(0);
+        let backend_use = running_backend_use(running);
+        let (mut control, _wake_sender, shutdown_sender, _lifecycle) = test_control(running);
+        control.stopping_reason = Some(StoppingReason::Explicit);
+        let (quiescence, mut runtime_requests) = mpsc::channel(1);
+        control.quiescence = quiescence;
+        let (runtime_drained, runtime_drain) = watch::channel(false);
+        control.runtime_drained = runtime_drain;
+        let config = no_rcon_config();
+        let mut child = process::launch(&config.launch).unwrap();
+        let task_backend_use = Arc::clone(&backend_use);
+        let quiescence = tokio::spawn(async move {
+            let result = quiesce_runtime_and_acquire_exclusive(
+                &mut child,
+                &mut control,
+                &config,
+                &task_backend_use,
+            )
+            .await;
+            (result, child, config)
+        });
+
+        let request = runtime_requests
+            .recv()
+            .await
+            .expect("supervisor should enqueue quiescence before shutdown");
+        runtime_drained.send_replace(true);
+        shutdown_sender.send(()).unwrap();
+
+        let (result, mut child, config) = quiescence.await.unwrap();
+        let outcome = result.expect("permanent runtime drainage should satisfy shutdown");
+        assert!(outcome.shutdown_received);
+        drop(outcome.exclusive);
+        drop(request);
+        force_and_reap(&mut child, &config).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn genuine_quiescence_failure_is_fatal_and_reaps_the_owned_child() {
+        let running = running_lifecycle(0);
+        let backend_use = running_backend_use(running);
+        let (mut control, _wake_sender, _shutdown_sender, _lifecycle) = test_control(running);
+        control.stopping_reason = Some(StoppingReason::Explicit);
+        let (closed_quiescence, runtime_requests) = mpsc::channel(1);
+        drop(runtime_requests);
+        control.quiescence = closed_quiescence;
+        let (runtime_drained, runtime_drain) = watch::channel(true);
+        control.runtime_drained = runtime_drain;
+        let config = no_rcon_config();
+        let child = process::launch(&config.launch).unwrap();
+        let process_id = child.id().unwrap();
+
+        assert_eq!(
+            stop_explicit_server(child, &mut control, &config, &backend_use)
+                .await
+                .expect("fatal cleanup should still reap the child"),
+            CycleOutcome::Shutdown
+        );
+        assert!(control.fatal_error.is_some());
+        assert!(test_process_has_exited(process_id));
+        drop(runtime_drained);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2948,6 +4781,14 @@ mod tests {
         assert_eq!(Instant::now() - started_at, Duration::from_secs(1));
     }
 
+    #[tokio::test]
+    async fn aborted_player_count_fixture_is_stopped_and_joined() {
+        let (_rcon_address, first_poll, rcon_server) = spawn_player_count_rcon_server(1).await;
+        rcon_server.abort();
+        assert!(rcon_server.join().await.unwrap_err().is_cancelled());
+        assert!(first_poll.await.is_err());
+    }
+
     async fn assert_final_rcon_veto(reply: TestListReply) {
         let (rcon_address, mut events, rcon_server) =
             spawn_scripted_list_rcon_server(vec![player_count_reply(0), reply]).await;
@@ -2955,15 +4796,12 @@ mod tests {
         config.idle_timeout = Duration::from_secs(1);
         config.poll_interval = Duration::from_secs(100);
         let child = process::launch(&config.launch).expect("test server process should launch");
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, wake_receiver) = wake_latch();
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = running_lifecycle(0);
         let (lifecycle_sender, lifecycle) = watch::channel(running);
-        let mut control = SupervisorControl {
-            wake_requests: wake_receiver,
-            shutdown: shutdown_receiver,
-            lifecycle: lifecycle_sender,
-        };
+        let mut control =
+            test_control_from_parts(wake_receiver, shutdown_receiver, lifecycle_sender);
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
         let player_inspection = initially_polled_player_inspection(&config).await;
@@ -2996,7 +4834,7 @@ mod tests {
             .expect("running monitor task should not panic")
             .expect("shutdown after a final RCON veto should succeed");
         assert_eq!(outcome, CycleOutcome::Shutdown);
-        drop(wake_sender);
+        wake_sender.close();
         assert_eq!(events.recv().await, Some(TestRconEvent::Closed));
         assert_eq!(events.recv().await, Some(TestRconEvent::Stop));
         rcon_server
@@ -3214,8 +5052,9 @@ mod tests {
 
     #[test]
     fn transitions_preserve_evidence_invariants() {
-        let (control, _wake_sender, _shutdown_sender, lifecycle) =
-            test_control(LifecycleState::test_phase(ServerPhase::Conflict));
+        let mut initial = LifecycleState::test_phase(ServerPhase::Conflict);
+        initial.command_revision = 77;
+        let (mut control, _wake_sender, _shutdown_sender, lifecycle) = test_control(initial);
 
         assert_eq!(
             control.begin_reconciliation(),
@@ -3227,7 +5066,7 @@ mod tests {
             ReconciliationEvidence::None
         );
         control.begin_reconciliation();
-        control.record_launch_success();
+        control.record_launch_success(1);
         assert_eq!(
             lifecycle.borrow().reconciliation_evidence,
             ReconciliationEvidence::None
@@ -3255,7 +5094,7 @@ mod tests {
         let retry_at = Instant::now() + Duration::from_secs(5);
         let mut cooldown = failed_lifecycle(ServerPhase::Cooldown, 3);
         cooldown.retry_at = Some(retry_at);
-        let (control, _wake_sender, _shutdown_sender, lifecycle) = test_control(cooldown);
+        let (mut control, _wake_sender, _shutdown_sender, lifecycle) = test_control(cooldown);
 
         control.begin_reconciliation();
         let reconciling = *lifecycle.borrow();
@@ -3270,12 +5109,12 @@ mod tests {
     #[tokio::test]
     async fn startup_demand_requires_a_distinct_final_probe() {
         let (probe_sender, backend) = scripted_backend();
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, wake_receiver) = wake_latch();
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let initial = LifecycleState::reconciling();
         let (lifecycle_sender, mut lifecycle) = watch::channel(initial);
         wake_sender
-            .try_send(WakeRequest::observed(initial))
+            .enqueue(WakeRequest::observed(initial))
             .expect("startup wake should fit");
         probe_sender
             .send(test_reconciliation(
@@ -3283,7 +5122,7 @@ mod tests {
                 BackendProbeClassification::Refused,
             ))
             .expect("startup clean result should queue");
-        let supervisor = tokio::spawn(run(
+        let supervisor = tokio::spawn(run_test(
             wake_receiver,
             shutdown_receiver,
             lifecycle_sender,
@@ -3318,16 +5157,507 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initial_reconciliation_keeps_one_authoritative_start_demand() {
+        let (probe_sender, backend) = scripted_backend();
+        let initial = LifecycleState::reconciling();
+        let (mut control, mutations, _wake_sender, _shutdown_sender, mut lifecycle) =
+            test_control_with_mutations(initial);
+        let config = launch_failure_config();
+        let waiter = tokio::spawn(async move {
+            let outcome = wait_for_reconciliation(&mut control, &config, &backend, true).await;
+            (outcome, control)
+        });
+
+        let first_gate = Arc::new(AdmissionGate::pending());
+        let (first, first_reply) = test_mutation(
+            MutationOperation::Start,
+            "10101010101010101010101010101010",
+            0,
+            Arc::clone(&first_gate),
+        );
+        mutations.send(first).await.unwrap();
+        let admitted = first_reply.await.unwrap().unwrap();
+        assert_eq!(admitted.disposition, MutationDisposition::Accepted);
+        assert_eq!(admitted.command_revision, 1);
+        assert!(first_gate.is_admitted());
+        wait_for_lifecycle(&mut lifecycle, |state| state.command_revision == 1).await;
+
+        for (request_id, expected_revision) in [
+            ("20202020202020202020202020202020", 1),
+            ("30303030303030303030303030303030", 1),
+            ("40404040404040404040404040404040", 1),
+        ] {
+            let (distinct, reply) = test_mutation(
+                MutationOperation::Start,
+                request_id,
+                expected_revision,
+                Arc::new(AdmissionGate::pending()),
+            );
+            mutations.send(distinct).await.unwrap();
+            assert_eq!(
+                reply.await.unwrap(),
+                Err(MutationError::OperationInProgress)
+            );
+            assert_eq!(lifecycle.borrow().command_revision, 1);
+        }
+
+        let replay_gate = Arc::new(AdmissionGate::pending());
+        let (replay, replay_reply) = test_mutation(
+            MutationOperation::Start,
+            "10101010101010101010101010101010",
+            0,
+            Arc::clone(&replay_gate),
+        );
+        mutations.send(replay).await.unwrap();
+        assert_eq!(replay_reply.await.unwrap().unwrap(), admitted);
+        assert!(!replay_gate.is_admitted());
+        assert_eq!(lifecycle.borrow().command_revision, 1);
+
+        probe_sender
+            .send(test_reconciliation(
+                RconProbeClassification::Refused,
+                BackendProbeClassification::Refused,
+            ))
+            .unwrap();
+        let (outcome, control) = waiter.await.unwrap();
+        assert!(matches!(outcome, ReconciliationWaitOutcome::Completed(_)));
+        assert!(control.launch_demand);
+        assert_eq!(control.current_lifecycle().command_revision, 1);
+    }
+
+    #[tokio::test]
+    async fn one_initial_start_demand_reaches_one_final_gate_and_launch_attempt() {
+        let (probe_sender, backend) = scripted_backend();
+        let mut supervisor = TestSupervisor::spawn(launch_failure_config(), backend);
+        let initial = *supervisor.lifecycle.borrow();
+
+        let (first, first_reply) = test_mutation(
+            MutationOperation::Start,
+            "41414141414141414141414141414141",
+            0,
+            Arc::new(AdmissionGate::pending()),
+        );
+        supervisor.mutations.send(first).await.unwrap();
+        let admitted = first_reply.await.unwrap().unwrap();
+        assert_eq!(admitted.disposition, MutationDisposition::Accepted);
+
+        for request_id in [
+            "42424242424242424242424242424242",
+            "43434343434343434343434343434343",
+        ] {
+            let (distinct, reply) = test_mutation(
+                MutationOperation::Start,
+                request_id,
+                1,
+                Arc::new(AdmissionGate::pending()),
+            );
+            supervisor.mutations.send(distinct).await.unwrap();
+            assert_eq!(
+                reply.await.unwrap(),
+                Err(MutationError::OperationInProgress)
+            );
+        }
+        let (replay, replay_reply) = test_mutation(
+            MutationOperation::Start,
+            "41414141414141414141414141414141",
+            0,
+            Arc::new(AdmissionGate::pending()),
+        );
+        supervisor.mutations.send(replay).await.unwrap();
+        assert_eq!(replay_reply.await.unwrap().unwrap(), admitted);
+        assert_eq!(supervisor.lifecycle.borrow().command_revision, 1);
+
+        probe_sender
+            .send(test_reconciliation(
+                RconProbeClassification::Refused,
+                BackendProbeClassification::Refused,
+            ))
+            .unwrap();
+        wait_for_lifecycle(&mut supervisor.lifecycle, |state| {
+            state.phase == ServerPhase::Reconciling
+                && state.phase_started_at != initial.phase_started_at
+        })
+        .await;
+        assert_eq!(supervisor.lifecycle.borrow().launch_generation, 0);
+
+        probe_sender
+            .send(test_reconciliation(
+                RconProbeClassification::Refused,
+                BackendProbeClassification::Refused,
+            ))
+            .unwrap();
+        wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Cooldown).await;
+        assert_eq!(supervisor.lifecycle.borrow().launch_generation, 1);
+        assert_eq!(supervisor.lifecycle.borrow().command_revision, 1);
+        tokio::task::yield_now().await;
+        assert_eq!(supervisor.lifecycle.borrow().launch_generation, 1);
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn initial_login_wake_and_operator_start_coalesce_in_both_orders() {
+        for operator_first in [false, true] {
+            let (probe_sender, backend) = scripted_backend();
+            let initial = LifecycleState::reconciling();
+            let (mut control, mutations, wake_sender, _shutdown_sender, lifecycle) =
+                test_control_with_mutations(initial);
+            let config = launch_failure_config();
+            let waiter = tokio::spawn(async move {
+                let outcome = wait_for_reconciliation(&mut control, &config, &backend, true).await;
+                (outcome, control)
+            });
+
+            let (start, start_reply) = test_mutation(
+                MutationOperation::Start,
+                if operator_first {
+                    "50505050505050505050505050505050"
+                } else {
+                    "60606060606060606060606060606060"
+                },
+                0,
+                Arc::new(AdmissionGate::pending()),
+            );
+            if operator_first {
+                mutations.send(start).await.unwrap();
+                assert_eq!(
+                    start_reply.await.unwrap().unwrap().disposition,
+                    MutationDisposition::Accepted
+                );
+                let observed = *lifecycle.borrow();
+                wake_sender
+                    .enqueue(WakeRequest::observed(observed))
+                    .unwrap();
+                wake_sender.wait_until_empty().await.unwrap();
+            } else {
+                wake_sender.enqueue(WakeRequest::observed(initial)).unwrap();
+                wake_sender.wait_until_empty().await.unwrap();
+                mutations.send(start).await.unwrap();
+                assert_eq!(
+                    start_reply.await.unwrap(),
+                    Err(MutationError::OperationInProgress)
+                );
+            }
+
+            probe_sender
+                .send(test_reconciliation(
+                    RconProbeClassification::Refused,
+                    BackendProbeClassification::Refused,
+                ))
+                .unwrap();
+            let (outcome, control) = waiter.await.unwrap();
+            assert!(matches!(outcome, ReconciliationWaitOutcome::Completed(_)));
+            assert!(control.launch_demand);
+            assert_eq!(
+                control.current_lifecycle().command_revision,
+                u64::from(operator_first)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mutation_precedes_ready_final_reconciliation_result() {
+        let (probe_sender, backend) = scripted_backend();
+        probe_sender
+            .send(test_reconciliation(
+                RconProbeClassification::Refused,
+                BackendProbeClassification::Refused,
+            ))
+            .unwrap();
+        let initial = LifecycleState::test_phase(ServerPhase::Reconciling);
+        let (mut control, mutations, _wake_sender, _shutdown_sender, lifecycle) =
+            test_control_with_mutations(initial);
+        control.reconciliation_mode = ReconciliationMode::FinalGate;
+        let (stop, stop_reply) = test_mutation(
+            MutationOperation::Stop,
+            "88888888888888888888888888888888",
+            0,
+            Arc::new(AdmissionGate::pending()),
+        );
+        mutations.send(stop).await.unwrap();
+
+        assert!(matches!(
+            wait_for_reconciliation(&mut control, &launch_failure_config(), &backend, false).await,
+            ReconciliationWaitOutcome::Completed(_)
+        ));
+        assert_eq!(
+            stop_reply.await.unwrap(),
+            Err(MutationError::OperationInProgress)
+        );
+        assert_eq!(lifecycle.borrow().command_revision, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn command_precedes_ready_cooldown_expiry() {
+        let retry_at = Instant::now();
+        let mut initial = failed_lifecycle(ServerPhase::Cooldown, 2);
+        initial.retry_at = Some(retry_at);
+        let (mut control, mutations, _wake_sender, _shutdown_sender, lifecycle) =
+            test_control_with_mutations(initial);
+        let config = test_config(&Endpoint::new("127.0.0.1", 9));
+        let (stop, stop_reply) = test_mutation(
+            MutationOperation::Stop,
+            "99999999999999999999999999999999",
+            0,
+            Arc::new(AdmissionGate::pending()),
+        );
+        mutations.send(stop).await.unwrap();
+
+        assert_eq!(
+            control.wait_for_cooldown(&config, retry_at, true).await,
+            CooldownOutcome::Stopped
+        );
+        assert_eq!(
+            stop_reply.await.unwrap().unwrap().disposition,
+            MutationDisposition::AlreadySatisfied
+        );
+        let stopped = *lifecycle.borrow();
+        assert_eq!(stopped.phase, ServerPhase::Stopped);
+        assert_eq!(stopped.command_revision, 1);
+        assert_eq!(stopped.failure, initial.failure);
+        assert_eq!(stopped.failure_streak, initial.failure_streak);
+    }
+
+    #[tokio::test]
+    async fn explicit_cleanup_completion_precedes_ready_commands_and_errors_win() {
+        for operation in [MutationOperation::Stop, MutationOperation::Start] {
+            let initial = lifecycle_with_generation(ServerPhase::Stopping, 1);
+            let (mut control, mutations, _wake_sender, _shutdown_sender, lifecycle) =
+                test_control_with_mutations(initial);
+            control.stopping_reason = Some(StoppingReason::Explicit);
+            let config = test_config(&Endpoint::new("127.0.0.1", 9));
+            let (envelope, mut reply) = test_mutation(
+                operation,
+                if operation == MutationOperation::Stop {
+                    "81818181818181818181818181818181"
+                } else {
+                    "82828282828282828282828282828282"
+                },
+                0,
+                Arc::new(AdmissionGate::pending()),
+            );
+            mutations.send(envelope).await.unwrap();
+
+            let (cleanup, shutdown) =
+                wait_for_explicit_cleanup(ready_cleanup(Ok(())), &mut control, &config, false)
+                    .await;
+            cleanup.unwrap();
+            assert!(!shutdown);
+            assert!(matches!(
+                reply.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert_eq!(lifecycle.borrow().command_revision, 0);
+
+            control.publish_clean_stopped_after_reap();
+            process_queued_mutation(&mut control, &config).await;
+            let success = reply.await.unwrap().unwrap();
+            assert_eq!(success.command_revision, 1);
+            assert_eq!(
+                success.disposition,
+                if operation == MutationOperation::Stop {
+                    MutationDisposition::AlreadySatisfied
+                } else {
+                    MutationDisposition::Accepted
+                }
+            );
+            assert_eq!(lifecycle.borrow().phase, ServerPhase::Stopped);
+        }
+
+        let initial = lifecycle_with_generation(ServerPhase::Stopping, 1);
+        let (mut control, mutations, _wake_sender, _shutdown_sender, lifecycle) =
+            test_control_with_mutations(initial);
+        control.stopping_reason = Some(StoppingReason::Explicit);
+        let config = test_config(&Endpoint::new("127.0.0.1", 9));
+        let (envelope, mut reply) = test_mutation(
+            MutationOperation::Start,
+            "83838383838383838383838383838383",
+            0,
+            Arc::new(AdmissionGate::pending()),
+        );
+        mutations.send(envelope).await.unwrap();
+        let (cleanup, _) = wait_for_explicit_cleanup(
+            ready_cleanup(Err(anyhow::anyhow!("synthetic cleanup error"))),
+            &mut control,
+            &config,
+            false,
+        )
+        .await;
+        assert_eq!(cleanup.unwrap_err().to_string(), "synthetic cleanup error");
+        assert!(matches!(
+            reply.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(lifecycle.borrow().command_revision, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failure_cleanup_completion_precedes_ready_commands_and_errors_win() {
+        for operation in [MutationOperation::Stop, MutationOperation::Start] {
+            let starting = lifecycle_with_generation(ServerPhase::Starting, 1);
+            let (mut control, mutations, _wake_sender, _shutdown_sender, lifecycle) =
+                test_control_with_mutations(starting);
+            let retry_delay = control.begin_failure_cleanup(FailureCategory::StartupTimedOut);
+            control.launch_demand = operation == MutationOperation::Stop;
+            let config = test_config(&Endpoint::new("127.0.0.1", 9));
+            let (envelope, mut reply) = test_mutation(
+                operation,
+                if operation == MutationOperation::Stop {
+                    "84848484848484848484848484848484"
+                } else {
+                    "85858585858585858585858585858585"
+                },
+                0,
+                Arc::new(AdmissionGate::pending()),
+            );
+            mutations.send(envelope).await.unwrap();
+
+            let outcome =
+                finish_failed_cleanup(ready_cleanup(Ok(())), &mut control, &config, retry_delay)
+                    .await
+                    .unwrap();
+            assert!(matches!(
+                reply.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(matches!(outcome, CycleOutcome::Failed { .. }));
+            assert_eq!(lifecycle.borrow().phase, ServerPhase::Cooldown);
+            assert_eq!(lifecycle.borrow().command_revision, 0);
+
+            process_queued_mutation(&mut control, &config).await;
+            let success = reply.await.unwrap().unwrap();
+            assert_eq!(success.command_revision, 1);
+            assert_eq!(
+                success.disposition,
+                if operation == MutationOperation::Start {
+                    MutationDisposition::Accepted
+                } else {
+                    MutationDisposition::AlreadySatisfied
+                }
+            );
+            assert_eq!(lifecycle.borrow().phase, ServerPhase::Cooldown);
+            assert_eq!(
+                lifecycle.borrow().failure,
+                Some(FailureCategory::StartupTimedOut)
+            );
+            assert_eq!(lifecycle.borrow().failure_streak, 1);
+            assert_eq!(control.launch_demand, operation == MutationOperation::Start);
+        }
+
+        let starting = lifecycle_with_generation(ServerPhase::Starting, 1);
+        let (mut control, mutations, _wake_sender, _shutdown_sender, lifecycle) =
+            test_control_with_mutations(starting);
+        let retry_delay = control.begin_failure_cleanup(FailureCategory::StartupTimedOut);
+        let config = test_config(&Endpoint::new("127.0.0.1", 9));
+        let (envelope, mut reply) = test_mutation(
+            MutationOperation::Stop,
+            "86868686868686868686868686868686",
+            0,
+            Arc::new(AdmissionGate::pending()),
+        );
+        mutations.send(envelope).await.unwrap();
+        let error = finish_failed_cleanup(
+            ready_cleanup(Err(anyhow::anyhow!("synthetic failed cleanup error"))),
+            &mut control,
+            &config,
+            retry_delay,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "synthetic failed cleanup error");
+        assert!(matches!(
+            reply.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(lifecycle.borrow().phase, ServerPhase::Stopping);
+        assert_eq!(lifecycle.borrow().command_revision, 0);
+    }
+
+    #[tokio::test]
+    async fn idle_cleanup_completion_precedes_ready_commands_and_errors_win() {
+        for operation in [MutationOperation::Start, MutationOperation::Stop] {
+            let running = lifecycle_with_generation(ServerPhase::Running, 1);
+            let (mut control, mutations, _wake_sender, _shutdown_sender, lifecycle) =
+                test_control_with_mutations(running);
+            control.begin_idle_stop(running.owned_running_cycle().unwrap());
+            let config = test_config(&Endpoint::new("127.0.0.1", 9));
+            let (envelope, mut reply) = test_mutation(
+                operation,
+                if operation == MutationOperation::Start {
+                    "87878787878787878787878787878787"
+                } else {
+                    "89898989898989898989898989898989"
+                },
+                0,
+                Arc::new(AdmissionGate::pending()),
+            );
+            mutations.send(envelope).await.unwrap();
+
+            let (cleanup, restart, shutdown) =
+                wait_for_idle_cleanup(ready_cleanup(Ok(())), &mut control, &config).await;
+            cleanup.unwrap();
+            assert!(!restart);
+            assert!(!shutdown);
+            assert!(matches!(
+                reply.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+
+            control.set_phase(ServerPhase::Stopped);
+            process_queued_mutation(&mut control, &config).await;
+            let success = reply.await.unwrap().unwrap();
+            assert_eq!(success.command_revision, 1);
+            assert_eq!(lifecycle.borrow().phase, ServerPhase::Stopped);
+            assert_eq!(
+                success.disposition,
+                if operation == MutationOperation::Start {
+                    MutationDisposition::Accepted
+                } else {
+                    MutationDisposition::AlreadySatisfied
+                }
+            );
+        }
+
+        let running = lifecycle_with_generation(ServerPhase::Running, 1);
+        let (mut control, mutations, _wake_sender, _shutdown_sender, lifecycle) =
+            test_control_with_mutations(running);
+        control.begin_idle_stop(running.owned_running_cycle().unwrap());
+        let config = test_config(&Endpoint::new("127.0.0.1", 9));
+        let (envelope, mut reply) = test_mutation(
+            MutationOperation::Start,
+            "90909090909090909090909090909090",
+            0,
+            Arc::new(AdmissionGate::pending()),
+        );
+        mutations.send(envelope).await.unwrap();
+        let (cleanup, _, _) = wait_for_idle_cleanup(
+            ready_cleanup(Err(anyhow::anyhow!("synthetic idle cleanup error"))),
+            &mut control,
+            &config,
+        )
+        .await;
+        assert_eq!(
+            cleanup.unwrap_err().to_string(),
+            "synthetic idle cleanup error"
+        );
+        assert!(matches!(
+            reply.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(lifecycle.borrow().phase, ServerPhase::Stopping);
+        assert_eq!(lifecycle.borrow().command_revision, 0);
+    }
+
+    #[tokio::test]
     async fn blocked_startup_requires_new_demand() {
         let (probe_sender, backend) = scripted_backend();
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, wake_receiver) = wake_latch();
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let initial = LifecycleState::reconciling();
         let (lifecycle_sender, mut lifecycle) = watch::channel(initial);
         wake_sender
-            .try_send(WakeRequest::observed(initial))
+            .enqueue(WakeRequest::observed(initial))
             .expect("startup wake should fit");
-        let supervisor = tokio::spawn(run(
+        let supervisor = tokio::spawn(run_test(
             wake_receiver,
             shutdown_receiver,
             lifecycle_sender,
@@ -3335,11 +5665,10 @@ mod tests {
             backend,
             test_backend_use(),
         ));
-        let startup_slot = wake_sender
-            .reserve()
+        wake_sender
+            .wait_until_empty()
             .await
             .expect("supervisor should accept startup demand");
-        drop(startup_slot);
         probe_sender
             .send(test_reconciliation(
                 RconProbeClassification::Inconclusive,
@@ -3362,8 +5691,7 @@ mod tests {
         assert_eq!(lifecycle.borrow().failure, None);
 
         wake_sender
-            .send(WakeRequest::observed(*lifecycle.borrow()))
-            .await
+            .enqueue(WakeRequest::observed(*lifecycle.borrow()))
             .expect("later conflict wake should queue");
         wait_for_phase(&mut lifecycle, ServerPhase::Cooldown).await;
         assert_eq!(lifecycle.borrow().launch_generation, 2);
@@ -3397,15 +5725,17 @@ mod tests {
 
         supervisor
             .wake_sender
-            .send(WakeRequest::observed(initial))
-            .await
+            .enqueue(WakeRequest::observed(initial))
             .expect("stale startup wake should queue");
-        let permit = supervisor
+        supervisor
             .wake_sender
-            .reserve()
+            .wait_until_empty()
             .await
             .expect("supervisor should drain the stale startup wake");
-        permit.send(WakeRequest::observed(*supervisor.lifecycle.borrow()));
+        supervisor
+            .wake_sender
+            .enqueue(WakeRequest::observed(*supervisor.lifecycle.borrow()))
+            .unwrap();
         wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Cooldown).await;
         assert_eq!(supervisor.lifecycle.borrow().launch_generation, 1);
         supervisor.shutdown().await;
@@ -3432,8 +5762,7 @@ mod tests {
         wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Stopped).await;
         supervisor
             .wake_sender
-            .send(WakeRequest::observed(*supervisor.lifecycle.borrow()))
-            .await
+            .enqueue(WakeRequest::observed(*supervisor.lifecycle.borrow()))
             .expect("stopped wake should queue");
         wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Conflict).await;
 
@@ -3472,8 +5801,7 @@ mod tests {
         );
         supervisor
             .wake_sender
-            .send(WakeRequest::observed(*supervisor.lifecycle.borrow()))
-            .await
+            .enqueue(WakeRequest::observed(*supervisor.lifecycle.borrow()))
             .expect("conflict wake should queue");
         wait_for_lifecycle(&mut supervisor.lifecycle, |state| {
             state.launch_generation == 1
@@ -3488,8 +5816,7 @@ mod tests {
         assert_eq!(supervisor.lifecycle.borrow().failure, None);
         supervisor
             .wake_sender
-            .send(WakeRequest::observed(*supervisor.lifecycle.borrow()))
-            .await
+            .enqueue(WakeRequest::observed(*supervisor.lifecycle.borrow()))
             .expect("sticky conflict wake should queue");
         wait_for_phase(&mut supervisor.lifecycle, ServerPhase::External).await;
         assert_eq!(supervisor.lifecycle.borrow().launch_generation, 2);
@@ -3513,15 +5840,13 @@ mod tests {
 
         supervisor
             .wake_sender
-            .send(WakeRequest::observed(initial))
-            .await
+            .enqueue(WakeRequest::observed(initial))
             .expect("stale startup wake should queue");
-        let permit = supervisor
+        supervisor
             .wake_sender
-            .reserve()
+            .wait_until_empty()
             .await
             .expect("external monitor should drain the stale wake");
-        drop(permit);
         probe_sender
             .send(test_reconciliation(
                 RconProbeClassification::Refused,
@@ -3620,12 +5945,12 @@ mod tests {
                 .expect("reconciliation should connect to the backend");
         });
 
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (wake_root, wake_sender, wake_receiver) = wake_latch();
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let (lifecycle_sender, mut lifecycle) = watch::channel(LifecycleState::reconciling());
         let mut config = launch_failure_config();
         config.rcon.as_mut().unwrap().endpoint = rcon_address;
-        let supervisor = tokio::spawn(run(
+        let supervisor = tokio::spawn(run_test(
             wake_receiver,
             shutdown_receiver,
             lifecycle_sender,
@@ -3644,6 +5969,7 @@ mod tests {
             .send(())
             .expect("supervisor should still await shutdown");
         drop(wake_sender);
+        wake_root.close();
         supervisor
             .await
             .expect("supervisor task should not panic")
@@ -3673,8 +5999,7 @@ mod tests {
                 wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Stopped).await;
                 supervisor
                     .wake_sender
-                    .send(WakeRequest::observed(*supervisor.lifecycle.borrow()))
-                    .await
+                    .enqueue(WakeRequest::observed(*supervisor.lifecycle.borrow()))
                     .expect("stopped wake should queue");
                 wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Reconciling).await;
             } else {
@@ -3710,8 +6035,7 @@ mod tests {
         let mut supervisor = spawn_launch_failure_supervisor();
         supervisor
             .wake_sender
-            .send(WakeRequest::observed(*supervisor.lifecycle.borrow()))
-            .await
+            .enqueue(WakeRequest::observed(*supervisor.lifecycle.borrow()))
             .expect("supervisor should accept the initial wake request");
         wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Cooldown).await;
 
@@ -3740,30 +6064,29 @@ mod tests {
         let mut supervisor = spawn_launch_failure_supervisor();
         supervisor
             .wake_sender
-            .send(WakeRequest::observed(*supervisor.lifecycle.borrow()))
-            .await
+            .enqueue(WakeRequest::observed(*supervisor.lifecycle.borrow()))
             .expect("supervisor should accept the initial wake request");
         wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Cooldown).await;
         let first_failure = *supervisor.lifecycle.borrow();
 
         supervisor
             .wake_sender
-            .send(WakeRequest::observed(first_failure))
-            .await
+            .enqueue(WakeRequest::observed(first_failure))
             .expect("one post-failure wake should latch");
-        let permit = supervisor
+        supervisor
             .wake_sender
-            .reserve()
+            .wait_until_empty()
             .await
             .expect("supervisor should consume the latched retry request");
-        permit.send(WakeRequest::observed(first_failure));
+        supervisor
+            .wake_sender
+            .enqueue(WakeRequest::observed(first_failure))
+            .unwrap();
         for _ in 0..16 {
-            assert!(matches!(
-                supervisor
-                    .wake_sender
-                    .try_send(WakeRequest::observed(first_failure)),
-                Err(mpsc::error::TrySendError::Full(_))
-            ));
+            supervisor
+                .wake_sender
+                .enqueue(WakeRequest::observed(first_failure))
+                .expect("equal wake keys should coalesce");
         }
 
         tokio::time::advance(Duration::from_secs(5)).await;
@@ -3787,8 +6110,7 @@ mod tests {
         let mut supervisor = spawn_launch_failure_supervisor();
         supervisor
             .wake_sender
-            .send(WakeRequest::observed(*supervisor.lifecycle.borrow()))
-            .await
+            .enqueue(WakeRequest::observed(*supervisor.lifecycle.borrow()))
             .expect("supervisor should accept the initial wake request");
         wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Cooldown).await;
 
@@ -3797,8 +6119,7 @@ mod tests {
         let expired = *supervisor.lifecycle.borrow();
         supervisor
             .wake_sender
-            .send(WakeRequest::observed(expired))
-            .await
+            .enqueue(WakeRequest::observed(expired))
             .expect("supervisor should accept later demand");
         wait_for_lifecycle(&mut supervisor.lifecycle, |state| state.failure_streak == 2).await;
 
@@ -3821,8 +6142,7 @@ mod tests {
         let mut supervisor = spawn_launch_failure_supervisor();
         supervisor
             .wake_sender
-            .send(WakeRequest::observed(*supervisor.lifecycle.borrow()))
-            .await
+            .enqueue(WakeRequest::observed(*supervisor.lifecycle.borrow()))
             .expect("supervisor should accept the initial wake request");
         wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Cooldown).await;
 
@@ -3837,12 +6157,13 @@ mod tests {
         let mut cooldown = failed_lifecycle(ServerPhase::Cooldown, 5);
         cooldown.retry_at = Some(retry_at);
         let (mut control, wake_sender, shutdown_sender, lifecycle) = test_control(cooldown);
+        let config = test_config(&Endpoint::new("127.0.0.1", 9));
         let (started_sender, started_receiver) = oneshot::channel();
         let waiting = tokio::spawn(async move {
             started_sender
                 .send(())
                 .expect("test should still await cooldown startup");
-            control.wait_for_cooldown(retry_at, true).await
+            control.wait_for_cooldown(&config, retry_at, true).await
         });
 
         started_receiver
@@ -3850,7 +6171,7 @@ mod tests {
             .expect("cooldown task should report startup");
         tokio::task::yield_now().await;
         assert!(!waiting.is_finished());
-        drop(wake_sender);
+        wake_sender.close();
 
         assert_eq!(
             waiting.await.expect("cooldown task should not panic"),
@@ -3863,11 +6184,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn wake_during_failed_cleanup_latches_for_cooldown() {
-        let starting = LifecycleState {
-            phase: ServerPhase::Starting,
-            launch_generation: 1,
-            ..LifecycleState::stopped()
-        };
+        let starting = lifecycle_with_generation(ServerPhase::Starting, 1);
         let (mut control, wake_sender, _shutdown_sender, mut lifecycle) = test_control(starting);
         let retry_delay = control.begin_failure_cleanup(FailureCategory::StartupTimedOut);
         let failed_cleanup = *lifecycle.borrow();
@@ -3881,6 +6198,7 @@ mod tests {
 
         let (cleanup_sender, cleanup_receiver) = oneshot::channel();
         let cooldown = tokio::spawn(async move {
+            let config = test_config(&Endpoint::new("127.0.0.1", 9));
             let outcome = finish_failed_cleanup(
                 async move {
                     cleanup_receiver
@@ -3889,6 +6207,7 @@ mod tests {
                     Ok(())
                 },
                 &mut control,
+                &config,
                 retry_delay,
             )
             .await?;
@@ -3899,18 +6218,23 @@ mod tests {
             else {
                 panic!("successful failed-process cleanup should enter cooldown");
             };
-            Ok::<_, anyhow::Error>(control.wait_for_cooldown(retry_at, retry_pending).await)
+            Ok::<_, anyhow::Error>(
+                control
+                    .wait_for_cooldown(&config, retry_at, retry_pending)
+                    .await,
+            )
         });
 
         wake_sender
-            .send(WakeRequest::observed(failed_cleanup))
-            .await
+            .enqueue(WakeRequest::observed(failed_cleanup))
             .expect("wake during failure cleanup should be accepted");
-        let permit = wake_sender
-            .reserve()
+        wake_sender
+            .wait_until_empty()
             .await
             .expect("failure cleanup should consume and latch the first wake");
-        permit.send(WakeRequest::observed(failed_cleanup));
+        wake_sender
+            .enqueue(WakeRequest::observed(failed_cleanup))
+            .unwrap();
 
         tokio::time::advance(Duration::from_secs(30)).await;
         assert_eq!(lifecycle.borrow().phase, ServerPhase::Stopping);
@@ -3938,12 +6262,355 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn failure_cleanup_without_takeover_enters_original_cooldown() {
+        let starting = lifecycle_with_generation(ServerPhase::Starting, 1);
+        let (mut control, _wake_sender, _shutdown_sender, lifecycle) = test_control(starting);
+        let retry_delay = control.begin_failure_cleanup(FailureCategory::StartupTimedOut);
+        let config = test_config(&Endpoint::new("127.0.0.1", 9));
+
+        let outcome = finish_failed_cleanup(async { Ok(()) }, &mut control, &config, retry_delay)
+            .await
+            .expect("successful failure cleanup should settle");
+        let CycleOutcome::Failed {
+            retry_at,
+            retry_pending,
+        } = outcome
+        else {
+            panic!("failure cleanup without takeover should enter cooldown");
+        };
+        assert!(!retry_pending);
+        let cooldown = *lifecycle.borrow();
+        assert_eq!(cooldown.phase, ServerPhase::Cooldown);
+        assert_eq!(cooldown.failure, Some(FailureCategory::StartupTimedOut));
+        assert_eq!(cooldown.failure_streak, 1);
+        assert_eq!(cooldown.retry_at, Some(retry_at));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_during_failure_cleanup_clears_demand_but_preserves_cooldown() {
+        let starting = lifecycle_with_generation(ServerPhase::Starting, 1);
+        let (mut control, mutations, _wake_sender, _shutdown_sender, lifecycle) =
+            test_control_with_mutations(starting);
+        let retry_delay = control.begin_failure_cleanup(FailureCategory::StartupTimedOut);
+        control.launch_demand = true;
+        let retained = *lifecycle.borrow();
+        let (release_cleanup, cleanup_released) = oneshot::channel();
+        let cleanup = tokio::spawn(async move {
+            let config = test_config(&Endpoint::new("127.0.0.1", 9));
+            let result = finish_failed_cleanup(
+                async move {
+                    cleanup_released
+                        .await
+                        .expect("test should release process cleanup");
+                    Ok(())
+                },
+                &mut control,
+                &config,
+                retry_delay,
+            )
+            .await;
+            (result, control)
+        });
+
+        let first_gate = Arc::new(AdmissionGate::pending());
+        let (first, first_reply) = test_mutation(
+            MutationOperation::Stop,
+            "55555555555555555555555555555555",
+            0,
+            Arc::clone(&first_gate),
+        );
+        mutations.send(first).await.unwrap();
+        let accepted = first_reply.await.unwrap().unwrap();
+        assert_eq!(accepted.disposition, MutationDisposition::Accepted);
+        assert!(first_gate.is_admitted());
+
+        let during_takeover = *lifecycle.borrow();
+        assert_eq!(during_takeover.phase, ServerPhase::Stopping);
+        assert_eq!(during_takeover.command_revision, 1);
+        assert_eq!(during_takeover.failure, retained.failure);
+        assert_eq!(during_takeover.failure_streak, retained.failure_streak);
+        assert_eq!(during_takeover.retry_at, retained.retry_at);
+
+        let replay_gate = Arc::new(AdmissionGate::pending());
+        let (replay, replay_reply) = test_mutation(
+            MutationOperation::Stop,
+            "55555555555555555555555555555555",
+            0,
+            Arc::clone(&replay_gate),
+        );
+        mutations.send(replay).await.unwrap();
+        assert_eq!(replay_reply.await.unwrap().unwrap(), accepted);
+        assert!(!replay_gate.is_admitted());
+        assert_eq!(lifecycle.borrow().command_revision, 1);
+
+        let (distinct, distinct_reply) = test_mutation(
+            MutationOperation::Stop,
+            "66666666666666666666666666666666",
+            1,
+            Arc::new(AdmissionGate::pending()),
+        );
+        mutations.send(distinct).await.unwrap();
+        assert_eq!(
+            distinct_reply.await.unwrap().unwrap().disposition,
+            MutationDisposition::AlreadySatisfied
+        );
+        assert_eq!(lifecycle.borrow().command_revision, 2);
+
+        release_cleanup.send(()).unwrap();
+        let (outcome, control) = cleanup.await.unwrap();
+        let CycleOutcome::Failed {
+            retry_at,
+            retry_pending,
+        } = outcome.unwrap()
+        else {
+            panic!("failure cleanup must retain its cooldown classification");
+        };
+        assert!(!retry_pending);
+        assert!(!control.launch_demand);
+        assert_eq!(
+            control.stopping_reason,
+            Some(StoppingReason::FailureCleanup)
+        );
+        let cooldown = *lifecycle.borrow();
+        assert_eq!(cooldown.phase, ServerPhase::Cooldown);
+        assert_eq!(cooldown.command_revision, 2);
+        assert_eq!(cooldown.failure, retained.failure);
+        assert_eq!(cooldown.failure_streak, retained.failure_streak);
+        assert_eq!(cooldown.retry_at, Some(retry_at));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_then_start_during_failure_cleanup_remains_cooldown_gated() {
+        let starting = lifecycle_with_generation(ServerPhase::Starting, 1);
+        let (mut control, mutations, _wake_sender, _shutdown_sender, lifecycle) =
+            test_control_with_mutations(starting);
+        let retry_delay = control.begin_failure_cleanup(FailureCategory::StartupTimedOut);
+        control.launch_demand = true;
+        let retained = *lifecycle.borrow();
+        let (release_cleanup, cleanup_released) = oneshot::channel();
+        let cleanup = tokio::spawn(async move {
+            let config = test_config(&Endpoint::new("127.0.0.1", 9));
+            let outcome = finish_failed_cleanup(
+                async move {
+                    cleanup_released.await.unwrap();
+                    Ok(())
+                },
+                &mut control,
+                &config,
+                retry_delay,
+            )
+            .await;
+            (outcome, control, config)
+        });
+
+        let (stop, stop_reply) = test_mutation(
+            MutationOperation::Stop,
+            "71717171717171717171717171717171",
+            0,
+            Arc::new(AdmissionGate::pending()),
+        );
+        mutations.send(stop).await.unwrap();
+        assert_eq!(
+            stop_reply.await.unwrap().unwrap().disposition,
+            MutationDisposition::Accepted
+        );
+
+        let (start, start_reply) = test_mutation(
+            MutationOperation::Start,
+            "72727272727272727272727272727272",
+            1,
+            Arc::new(AdmissionGate::pending()),
+        );
+        mutations.send(start).await.unwrap();
+        assert_eq!(
+            start_reply.await.unwrap().unwrap().disposition,
+            MutationDisposition::Accepted
+        );
+        assert_eq!(lifecycle.borrow().phase, ServerPhase::Stopping);
+        assert_eq!(lifecycle.borrow().failure, retained.failure);
+        assert_eq!(lifecycle.borrow().failure_streak, retained.failure_streak);
+
+        release_cleanup.send(()).unwrap();
+        let (outcome, mut control, config) = cleanup.await.unwrap();
+        let CycleOutcome::Failed {
+            retry_at,
+            retry_pending,
+        } = outcome.unwrap()
+        else {
+            panic!("failure cleanup must enter cooldown");
+        };
+        assert!(retry_pending);
+        assert_eq!(lifecycle.borrow().phase, ServerPhase::Cooldown);
+        assert_eq!(lifecycle.borrow().failure, retained.failure);
+        assert_eq!(lifecycle.borrow().failure_streak, retained.failure_streak);
+
+        let cooldown = tokio::spawn(async move {
+            control
+                .wait_for_cooldown(&config, retry_at, retry_pending)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!cooldown.is_finished());
+        tokio::time::advance(retry_delay.checked_sub(Duration::from_millis(1)).unwrap()).await;
+        assert!(!cooldown.is_finished());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(cooldown.await.unwrap(), CooldownOutcome::Launch);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failure_cleanup_stop_barrier_rejects_stale_wake() {
+        let starting = lifecycle_with_generation(ServerPhase::Starting, 1);
+        let (mut control, mutations, wake_sender, _shutdown_sender, lifecycle) =
+            test_control_with_mutations(starting);
+        let retry_delay = control.begin_failure_cleanup(FailureCategory::StartupTimedOut);
+        control.launch_demand = true;
+        let before_stop = *lifecycle.borrow();
+        let (release_cleanup, cleanup_released) = oneshot::channel();
+        let cleanup = tokio::spawn(async move {
+            let config = test_config(&Endpoint::new("127.0.0.1", 9));
+            let outcome = finish_failed_cleanup(
+                async move {
+                    cleanup_released.await.unwrap();
+                    Ok(())
+                },
+                &mut control,
+                &config,
+                retry_delay,
+            )
+            .await;
+            (outcome, control)
+        });
+
+        let (stop, stop_reply) = test_mutation(
+            MutationOperation::Stop,
+            "73737373737373737373737373737373",
+            0,
+            Arc::new(AdmissionGate::pending()),
+        );
+        mutations.send(stop).await.unwrap();
+        stop_reply.await.unwrap().unwrap();
+        assert_eq!(lifecycle.borrow().command_revision, 1);
+
+        wake_sender
+            .enqueue(WakeRequest::observed(before_stop))
+            .unwrap();
+        wake_sender.wait_until_empty().await.unwrap();
+        release_cleanup.send(()).unwrap();
+
+        let (outcome, control) = cleanup.await.unwrap();
+        let CycleOutcome::Failed { retry_pending, .. } = outcome.unwrap() else {
+            panic!("failure cleanup must enter cooldown");
+        };
+        assert!(!retry_pending);
+        assert!(!control.launch_demand);
+        assert_eq!(lifecycle.borrow().phase, ServerPhase::Cooldown);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn genuinely_later_wake_relatched_after_failure_cleanup_stop_is_cooldown_gated() {
+        let starting = lifecycle_with_generation(ServerPhase::Starting, 1);
+        let (mut control, mutations, wake_sender, _shutdown_sender, lifecycle) =
+            test_control_with_mutations(starting);
+        let retry_delay = control.begin_failure_cleanup(FailureCategory::StartupTimedOut);
+        control.launch_demand = true;
+        let (release_cleanup, cleanup_released) = oneshot::channel();
+        let cleanup = tokio::spawn(async move {
+            let config = test_config(&Endpoint::new("127.0.0.1", 9));
+            let outcome = finish_failed_cleanup(
+                async move {
+                    cleanup_released.await.unwrap();
+                    Ok(())
+                },
+                &mut control,
+                &config,
+                retry_delay,
+            )
+            .await;
+            (outcome, control)
+        });
+
+        let (stop, stop_reply) = test_mutation(
+            MutationOperation::Stop,
+            "74747474747474747474747474747474",
+            0,
+            Arc::new(AdmissionGate::pending()),
+        );
+        mutations.send(stop).await.unwrap();
+        stop_reply.await.unwrap().unwrap();
+        let after_stop = *lifecycle.borrow();
+        assert_eq!(after_stop.command_revision, 1);
+
+        wake_sender
+            .enqueue(WakeRequest::observed(after_stop))
+            .unwrap();
+        wake_sender.wait_until_empty().await.unwrap();
+        release_cleanup.send(()).unwrap();
+
+        let (outcome, control) = cleanup.await.unwrap();
+        let CycleOutcome::Failed { retry_pending, .. } = outcome.unwrap() else {
+            panic!("failure cleanup must enter cooldown");
+        };
+        assert!(retry_pending);
+        assert!(control.launch_demand);
+        assert_eq!(lifecycle.borrow().phase, ServerPhase::Cooldown);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failure_cleanup_error_after_stop_never_publishes_cooldown_or_stopped() {
+        let starting = lifecycle_with_generation(ServerPhase::Starting, 1);
+        let (mut control, mutations, _wake_sender, _shutdown_sender, lifecycle) =
+            test_control_with_mutations(starting);
+        let retry_delay = control.begin_failure_cleanup(FailureCategory::StartupTimedOut);
+        control.launch_demand = true;
+        let (release_cleanup, cleanup_released) = oneshot::channel();
+        let cleanup = tokio::spawn(async move {
+            let config = test_config(&Endpoint::new("127.0.0.1", 9));
+            let result = finish_failed_cleanup(
+                async move {
+                    cleanup_released
+                        .await
+                        .expect("test should release uncertain cleanup");
+                    Err(anyhow::anyhow!("test cleanup remained uncertain"))
+                },
+                &mut control,
+                &config,
+                retry_delay,
+            )
+            .await;
+            (result, control)
+        });
+
+        let (stop, stop_reply) = test_mutation(
+            MutationOperation::Stop,
+            "77777777777777777777777777777777",
+            0,
+            Arc::new(AdmissionGate::pending()),
+        );
+        mutations.send(stop).await.unwrap();
+        assert_eq!(
+            stop_reply.await.unwrap().unwrap().disposition,
+            MutationDisposition::Accepted
+        );
+        release_cleanup.send(()).unwrap();
+
+        let (result, control) = cleanup.await.unwrap();
+        assert!(result.is_err());
+        assert_eq!(
+            control.stopping_reason,
+            Some(StoppingReason::FailureCleanup)
+        );
+        let uncertain = *lifecycle.borrow();
+        assert_eq!(uncertain.phase, ServerPhase::Stopping);
+        assert_eq!(uncertain.failure, Some(FailureCategory::StartupTimedOut));
+        assert_eq!(uncertain.failure_streak, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn demand_at_cooldown_expiry_launches_once() {
         let mut supervisor = spawn_launch_failure_supervisor();
         supervisor
             .wake_sender
-            .send(WakeRequest::observed(*supervisor.lifecycle.borrow()))
-            .await
+            .enqueue(WakeRequest::observed(*supervisor.lifecycle.borrow()))
             .expect("supervisor should accept the initial wake request");
         wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Cooldown).await;
         let failure = *supervisor.lifecycle.borrow();
@@ -3952,8 +6619,7 @@ mod tests {
         let demand = tokio::spawn(async move {
             sleep_until(retry_at).await;
             racing_sender
-                .send(WakeRequest::observed(failure))
-                .await
+                .enqueue(WakeRequest::observed(failure))
                 .expect("racing demand should reach the supervisor");
         });
 
@@ -3978,8 +6644,7 @@ mod tests {
 
         supervisor
             .wake_sender
-            .send(WakeRequest::observed(*supervisor.lifecycle.borrow()))
-            .await
+            .enqueue(WakeRequest::observed(*supervisor.lifecycle.borrow()))
             .expect("supervisor should accept the initial wake request");
         wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Starting).await;
         wait_for_phase(&mut supervisor.lifecycle, ServerPhase::Cooldown).await;
@@ -3999,18 +6664,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_precedes_ready_startup_timeout() {
+        let mut config = no_rcon_config();
+        config.startup_timeout = Duration::ZERO;
+        let mut child = process::launch(&config.launch).unwrap();
+        let starting = lifecycle_with_generation(ServerPhase::Starting, 1);
+        let (mut control, mutations, _wake_sender, _shutdown_sender, lifecycle) =
+            test_control_with_mutations(starting);
+        let (stop, stop_reply) = test_mutation(
+            MutationOperation::Stop,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            0,
+            Arc::new(AdmissionGate::pending()),
+        );
+        mutations.send(stop).await.unwrap();
+
+        assert!(matches!(
+            wait_for_readiness(&mut child, &mut control, &config, &test_backend_endpoint()).await,
+            ReadinessOutcome::ExplicitStop
+        ));
+        assert_eq!(
+            stop_reply.await.unwrap().unwrap().disposition,
+            MutationDisposition::Accepted
+        );
+        assert_eq!(lifecycle.borrow().phase, ServerPhase::Stopping);
+        assert_eq!(lifecycle.borrow().command_revision, 1);
+        force_and_reap(&mut child, &config).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn child_exit_precedes_ready_mutation() {
+        let mut config = rapid_exit_config(&Endpoint::new("127.0.0.1", 9));
+        config.startup_timeout = Duration::ZERO;
+        let mut child = process::launch(&config.launch).unwrap();
+        let process_id = child.id().unwrap();
+        wait_for_test_process_exit(process_id);
+        let starting = lifecycle_with_generation(ServerPhase::Starting, 1);
+        let (mut control, mutations, _wake_sender, _shutdown_sender, lifecycle) =
+            test_control_with_mutations(starting);
+        let gate = Arc::new(AdmissionGate::pending());
+        let (stop, mut stop_reply) = test_mutation(
+            MutationOperation::Stop,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            0,
+            Arc::clone(&gate),
+        );
+        mutations.send(stop).await.unwrap();
+
+        assert!(matches!(
+            wait_for_readiness(&mut child, &mut control, &config, &test_backend_endpoint()).await,
+            ReadinessOutcome::Exited(_)
+        ));
+        assert_eq!(stop_reply.try_recv(), Err(TryRecvError::Empty));
+        assert!(!gate.is_admitted());
+        assert_eq!(lifecycle.borrow().command_revision, 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_precedes_ready_mutation() {
+        let config = no_rcon_config();
+        let mut child = process::launch(&config.launch).unwrap();
+        let starting = lifecycle_with_generation(ServerPhase::Starting, 1);
+        let (mut control, mutations, _wake_sender, shutdown_sender, lifecycle) =
+            test_control_with_mutations(starting);
+        let gate = Arc::new(AdmissionGate::pending());
+        let (stop, mut stop_reply) = test_mutation(
+            MutationOperation::Stop,
+            "cccccccccccccccccccccccccccccccc",
+            0,
+            Arc::clone(&gate),
+        );
+        mutations.send(stop).await.unwrap();
+        drop(shutdown_sender);
+
+        assert!(matches!(
+            wait_for_readiness(&mut child, &mut control, &config, &test_backend_endpoint()).await,
+            ReadinessOutcome::Shutdown
+        ));
+        assert_eq!(stop_reply.try_recv(), Err(TryRecvError::Empty));
+        assert!(!gate.is_admitted());
+        assert_eq!(lifecycle.borrow().command_revision, 0);
+        force_and_reap(&mut child, &config).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn successful_exit_before_readiness_is_retryable() {
         let config = rapid_exit_config(&Endpoint::new("127.0.0.1", 9));
         let child = process::launch(&config.launch).expect("short-lived test server should launch");
-        let (_wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, _wake_sender, wake_receiver) = wake_latch();
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let (lifecycle_sender, lifecycle) = watch::channel(LifecycleState::reconciling());
-        let mut control = SupervisorControl {
-            wake_requests: wake_receiver,
-            shutdown: shutdown_receiver,
-            lifecycle: lifecycle_sender,
-        };
-        control.record_launch_success();
+        let mut control =
+            test_control_from_parts(wake_receiver, shutdown_receiver, lifecycle_sender);
+        control.record_launch_success(1);
 
         let outcome = run_server_cycle(
             child,
@@ -4046,21 +6792,14 @@ mod tests {
         let backend_accept = tokio::spawn(async move { backend_listener.accept().await.unwrap() });
         let config = no_rcon_config();
         let child = process::launch(&config.launch).unwrap();
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, wake_receiver) = wake_latch();
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let starting = LifecycleState {
-            phase: ServerPhase::Starting,
-            launch_generation: 1,
-            ..LifecycleState::stopped()
-        };
+        let starting = lifecycle_with_generation(ServerPhase::Starting, 1);
         let (lifecycle_sender, mut lifecycle) = watch::channel(starting);
         let backend_use = test_backend_use();
         let cycle = tokio::spawn(async move {
-            let mut control = SupervisorControl {
-                wake_requests: wake_receiver,
-                shutdown: shutdown_receiver,
-                lifecycle: lifecycle_sender,
-            };
+            let mut control =
+                test_control_from_parts(wake_receiver, shutdown_receiver, lifecycle_sender);
             run_server_cycle(child, &mut control, &config, &backend, &backend_use).await
         });
 
@@ -4084,19 +6823,12 @@ mod tests {
         config.retry_interval = Duration::from_millis(10);
         config.command_timeout = Duration::from_millis(10);
         let child = process::launch(&config.launch).unwrap();
-        let (_wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, _wake_sender, wake_receiver) = wake_latch();
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let starting = LifecycleState {
-            phase: ServerPhase::Starting,
-            launch_generation: 1,
-            ..LifecycleState::stopped()
-        };
+        let starting = lifecycle_with_generation(ServerPhase::Starting, 1);
         let (lifecycle_sender, lifecycle) = watch::channel(starting);
-        let mut control = SupervisorControl {
-            wake_requests: wake_receiver,
-            shutdown: shutdown_receiver,
-            lifecycle: lifecycle_sender,
-        };
+        let mut control =
+            test_control_from_parts(wake_receiver, shutdown_receiver, lifecycle_sender);
 
         let cycle = tokio::spawn(async move {
             run_server_cycle(child, &mut control, &config, &backend, &test_backend_use()).await
@@ -4122,15 +6854,12 @@ mod tests {
         let mut config = no_rcon_config();
         config.launch.arguments[2] = "supervisor::tests::rapid_exit_fixture".into();
         let child = process::launch(&config.launch).unwrap();
-        let (_wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, _wake_sender, wake_receiver) = wake_latch();
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = running_lifecycle(0);
         let (lifecycle_sender, lifecycle) = watch::channel(running);
-        let mut control = SupervisorControl {
-            wake_requests: wake_receiver,
-            shutdown: shutdown_receiver,
-            lifecycle: lifecycle_sender,
-        };
+        let mut control =
+            test_control_from_parts(wake_receiver, shutdown_receiver, lifecycle_sender);
         let backend_use = running_backend_use(running);
 
         let outcome = monitor_running_server(
@@ -4156,15 +6885,12 @@ mod tests {
         let mut config = no_rcon_config();
         config.idle_timeout = Duration::from_secs(1);
         let child = process::launch(&config.launch).unwrap();
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, wake_receiver) = wake_latch();
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = running_lifecycle(0);
         let (lifecycle_sender, lifecycle) = watch::channel(running);
-        let mut control = SupervisorControl {
-            wake_requests: wake_receiver,
-            shutdown: shutdown_receiver,
-            lifecycle: lifecycle_sender,
-        };
+        let mut control =
+            test_control_from_parts(wake_receiver, shutdown_receiver, lifecycle_sender);
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
         let active_session = backend_use
@@ -4204,30 +6930,31 @@ mod tests {
     #[tokio::test]
     async fn rcon_stop_failure_falls_back_to_console() {
         let mut config = no_rcon_config();
-        let refused_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let refused_address = endpoint(refused_listener.local_addr().unwrap());
-        drop(refused_listener);
+        let unavailable_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable_address = endpoint(unavailable_listener.local_addr().unwrap());
+        let rcon_server = tokio::spawn(async move {
+            let (connection, _) = unavailable_listener.accept().await.unwrap();
+            drop(connection);
+        });
         config.rcon = Some(RconConfig {
-            endpoint: refused_address,
+            endpoint: unavailable_address,
             password: RconSecret::new("secret".to_owned()).unwrap(),
         });
         let child = process::launch(&config.launch).unwrap();
-        let (_wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, _wake_sender, wake_receiver) = wake_latch();
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = running_lifecycle(0);
         let (lifecycle_sender, _lifecycle) = watch::channel(running);
-        let mut control = SupervisorControl {
-            wake_requests: wake_receiver,
-            shutdown: shutdown_receiver,
-            lifecycle: lifecycle_sender,
-        };
+        let mut control =
+            test_control_from_parts(wake_receiver, shutdown_receiver, lifecycle_sender);
 
         assert_eq!(
-            stop_for_shutdown(child, &mut control, &config)
+            stop_for_shutdown(child, &mut control, &config, &running_backend_use(running),)
                 .await
                 .unwrap(),
             CycleOutcome::Shutdown
         );
+        rcon_server.await.unwrap();
     }
 
     #[tokio::test]
@@ -4256,15 +6983,12 @@ mod tests {
 
     #[tokio::test]
     async fn rapid_exits_increase_failure_streak() {
-        let (_wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, _wake_sender, wake_receiver) = wake_latch();
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let initial = failed_lifecycle(ServerPhase::Stopped, 1);
         let (lifecycle_sender, lifecycle) = watch::channel(initial);
-        let mut control = SupervisorControl {
-            wake_requests: wake_receiver,
-            shutdown: shutdown_receiver,
-            lifecycle: lifecycle_sender,
-        };
+        let mut control =
+            test_control_from_parts(wake_receiver, shutdown_receiver, lifecycle_sender);
 
         for (expected_streak, expected_delay) in [(2, 10), (3, 20)] {
             let (rcon_address, _first_poll, rcon_server) = spawn_player_count_rcon_server(1).await;
@@ -4272,7 +6996,7 @@ mod tests {
             let child =
                 process::launch(&config.launch).expect("short-lived test server should launch");
             control.begin_reconciliation();
-            control.record_launch_success();
+            control.record_launch_success(1);
 
             let outcome = run_server_cycle(
                 child,
@@ -4296,6 +7020,7 @@ mod tests {
                 Duration::from_secs(expected_delay)
             );
             rcon_server
+                .join()
                 .await
                 .expect("test RCON server should not panic");
             control.set_phase(ServerPhase::Stopped);
@@ -4322,15 +7047,12 @@ mod tests {
             .accept()
             .await
             .expect("test server should connect to its exit signal");
-        let (_wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, _wake_sender, wake_receiver) = wake_latch();
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = failed_lifecycle(ServerPhase::Running, 2);
-        let (lifecycle_sender, lifecycle) = watch::channel(running);
-        let mut control = SupervisorControl {
-            wake_requests: wake_receiver,
-            shutdown: shutdown_receiver,
-            lifecycle: lifecycle_sender,
-        };
+        let (lifecycle_sender, mut lifecycle) = watch::channel(running);
+        let mut control =
+            test_control_from_parts(wake_receiver, shutdown_receiver, lifecycle_sender);
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
         let player_inspection = connected_player_inspection(&rcon_address).await;
@@ -4369,9 +7091,11 @@ mod tests {
             );
         }
         wait_for_test_process_exit(process_id);
+        wait_for_phase(&mut lifecycle, ServerPhase::Cooldown).await;
+        assert_eq!(lifecycle.borrow().failure_streak, 3);
 
         tokio::time::advance(STABILITY_WINDOW).await;
-        assert_eq!(lifecycle.borrow().failure_streak, 2);
+        assert_eq!(lifecycle.borrow().failure_streak, 3);
         release_poll
             .send(())
             .expect("blocked RCON poll should still await release");
@@ -4402,15 +7126,12 @@ mod tests {
         let config = stable_exit_config(&rcon_address);
         let child =
             process::launch(&config.launch).expect("stable-window test server should launch");
-        let (_wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, _wake_sender, wake_receiver) = wake_latch();
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = failed_lifecycle(ServerPhase::Running, 3);
         let (lifecycle_sender, mut lifecycle) = watch::channel(running);
-        let mut control = SupervisorControl {
-            wake_requests: wake_receiver,
-            shutdown: shutdown_receiver,
-            lifecycle: lifecycle_sender,
-        };
+        let mut control =
+            test_control_from_parts(wake_receiver, shutdown_receiver, lifecycle_sender);
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
         let player_inspection = connected_player_inspection(&rcon_address).await;
@@ -4451,6 +7172,7 @@ mod tests {
             Duration::from_secs(5)
         );
         rcon_server
+            .join()
             .await
             .expect("test RCON server should not panic");
     }
@@ -4465,19 +7187,12 @@ mod tests {
         config.idle_timeout = Duration::from_millis(30);
         config.poll_interval = Duration::from_secs(1);
         let mut child = process::launch(&config.launch).unwrap();
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, wake_receiver) = wake_latch();
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let starting = LifecycleState {
-            phase: ServerPhase::Starting,
-            launch_generation: 1,
-            ..LifecycleState::stopped()
-        };
+        let starting = lifecycle_with_generation(ServerPhase::Starting, 1);
         let (lifecycle_sender, lifecycle) = watch::channel(starting);
-        let mut control = SupervisorControl {
-            wake_requests: wake_receiver,
-            shutdown: shutdown_receiver,
-            lifecycle: lifecycle_sender,
-        };
+        let mut control =
+            test_control_from_parts(wake_receiver, shutdown_receiver, lifecycle_sender);
         let backend_use = test_backend_use();
         assert!(matches!(
             wait_for_readiness(&mut child, &mut control, &config, &test_backend_endpoint()).await,
@@ -4535,15 +7250,12 @@ mod tests {
         config.idle_timeout = Duration::from_secs(10);
         config.poll_interval = Duration::from_secs(100);
         let child = process::launch(&config.launch).expect("test server process should launch");
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, wake_receiver) = wake_latch();
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = running_lifecycle(0);
         let (lifecycle_sender, mut lifecycle) = watch::channel(running);
-        let mut control = SupervisorControl {
-            wake_requests: wake_receiver,
-            shutdown: shutdown_receiver,
-            lifecycle: lifecycle_sender,
-        };
+        let mut control =
+            test_control_from_parts(wake_receiver, shutdown_receiver, lifecycle_sender);
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
         let replay_lease = backend_use.acquire_shared(cycle).await;
@@ -4628,15 +7340,12 @@ mod tests {
         config.poll_interval = Duration::from_secs(100);
         config.command_timeout = Duration::from_secs(10);
         let child = process::launch(&config.launch).unwrap();
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, wake_receiver) = wake_latch();
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = running_lifecycle(0);
         let (lifecycle_sender, lifecycle) = watch::channel(running);
-        let mut control = SupervisorControl {
-            wake_requests: wake_receiver,
-            shutdown: shutdown_receiver,
-            lifecycle: lifecycle_sender,
-        };
+        let mut control =
+            test_control_from_parts(wake_receiver, shutdown_receiver, lifecycle_sender);
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
         let player_inspection = initially_polled_player_inspection(&config).await;
@@ -4683,15 +7392,12 @@ mod tests {
         let mut config = test_config(&rcon_address);
         config.idle_timeout = Duration::from_secs(1);
         let mut child = process::launch(&config.launch).unwrap();
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, wake_receiver) = wake_latch();
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = running_lifecycle(0);
         let (lifecycle_sender, lifecycle) = watch::channel(running);
-        let mut control = SupervisorControl {
-            wake_requests: wake_receiver,
-            shutdown: shutdown_receiver,
-            lifecycle: lifecycle_sender,
-        };
+        let mut control =
+            test_control_from_parts(wake_receiver, shutdown_receiver, lifecycle_sender);
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
         let mut state =
@@ -4720,7 +7426,7 @@ mod tests {
         assert_eq!(*zero_anchor, None);
 
         tokio::time::resume();
-        let outcome = stop_for_shutdown(child, &mut control, &config)
+        let outcome = stop_for_shutdown(child, &mut control, &config, &backend_use)
             .await
             .unwrap();
         assert_eq!(outcome, CycleOutcome::Shutdown);
@@ -4744,15 +7450,12 @@ mod tests {
         config.poll_interval = Duration::from_secs(100);
         config.command_timeout = Duration::from_secs(120);
         let child = process::launch(&config.launch).unwrap();
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, wake_receiver) = wake_latch();
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = running_lifecycle(0);
         let (lifecycle_sender, lifecycle) = watch::channel(running);
-        let mut control = SupervisorControl {
-            wake_requests: wake_receiver,
-            shutdown: shutdown_receiver,
-            lifecycle: lifecycle_sender,
-        };
+        let mut control =
+            test_control_from_parts(wake_receiver, shutdown_receiver, lifecycle_sender);
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
         let player_inspection = initially_polled_player_inspection(&config).await;
@@ -4830,15 +7533,12 @@ mod tests {
         config.idle_timeout = Duration::from_secs(1);
         config.poll_interval = Duration::from_secs(100);
         let child = process::launch(&config.launch).unwrap();
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, wake_receiver) = wake_latch();
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = running_lifecycle(2);
         let (lifecycle_sender, mut lifecycle) = watch::channel(running);
-        let mut control = SupervisorControl {
-            wake_requests: wake_receiver,
-            shutdown: shutdown_receiver,
-            lifecycle: lifecycle_sender,
-        };
+        let mut control =
+            test_control_from_parts(wake_receiver, shutdown_receiver, lifecycle_sender);
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
         let blocking_reader = backend_use.acquire_shared(cycle).await;
@@ -4892,15 +7592,12 @@ mod tests {
         config.poll_interval = Duration::from_secs(100);
         let child = process::launch(&config.launch).unwrap();
         let (mut exit_signal, _) = exit_listener.accept().await.unwrap();
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, wake_receiver) = wake_latch();
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = running_lifecycle(0);
         let (lifecycle_sender, lifecycle) = watch::channel(running);
-        let mut control = SupervisorControl {
-            wake_requests: wake_receiver,
-            shutdown: shutdown_receiver,
-            lifecycle: lifecycle_sender,
-        };
+        let mut control =
+            test_control_from_parts(wake_receiver, shutdown_receiver, lifecycle_sender);
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
         let blocking_reader = backend_use.acquire_shared(cycle).await;
@@ -4948,15 +7645,12 @@ mod tests {
         config.command_timeout = Duration::from_secs(120);
         let child = process::launch(&config.launch).unwrap();
         let (mut exit_signal, _) = exit_listener.accept().await.unwrap();
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, wake_receiver) = wake_latch();
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = running_lifecycle(0);
         let (lifecycle_sender, lifecycle) = watch::channel(running);
-        let mut control = SupervisorControl {
-            wake_requests: wake_receiver,
-            shutdown: shutdown_receiver,
-            lifecycle: lifecycle_sender,
-        };
+        let mut control =
+            test_control_from_parts(wake_receiver, shutdown_receiver, lifecycle_sender);
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
         let player_inspection = initially_polled_player_inspection(&config).await;
@@ -4992,15 +7686,12 @@ mod tests {
         let (rcon_address, rcon_ready, rcon_server) = spawn_test_rcon_server().await;
         let config = test_config(&rcon_address);
         let child = process::launch(&config.launch).expect("test server process should launch");
-        let (_wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, _wake_sender, wake_receiver) = wake_latch();
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let running = failed_lifecycle(ServerPhase::Running, 3);
         let (lifecycle_sender, lifecycle) = watch::channel(running);
-        let mut control = SupervisorControl {
-            wake_requests: wake_receiver,
-            shutdown: shutdown_receiver,
-            lifecycle: lifecycle_sender,
-        };
+        let mut control =
+            test_control_from_parts(wake_receiver, shutdown_receiver, lifecycle_sender);
 
         control.begin_idle_stop(running.owned_running_cycle().unwrap());
         let outcome = stop_committed_idle_server(child, &mut control, &config)
@@ -5021,19 +7712,12 @@ mod tests {
     async fn wait_error_is_fatal_after_cleanup() {
         let config = test_config(&Endpoint::new("127.0.0.1", 9));
         let child = process::launch(&config.launch).expect("test server process should launch");
-        let (_wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, _wake_sender, wake_receiver) = wake_latch();
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let running = LifecycleState {
-            phase: ServerPhase::Running,
-            launch_generation: 1,
-            ..LifecycleState::stopped()
-        };
+        let running = lifecycle_with_generation(ServerPhase::Running, 1);
         let (lifecycle_sender, lifecycle) = watch::channel(running);
-        let mut control = SupervisorControl {
-            wake_requests: wake_receiver,
-            shutdown: shutdown_receiver,
-            lifecycle: lifecycle_sender,
-        };
+        let mut control =
+            test_control_from_parts(wake_receiver, shutdown_receiver, lifecycle_sender);
 
         let error = reap_after_wait_error(
             child,
@@ -5055,24 +7739,19 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn failed_cleanup_error_is_fatal() {
-        let (_wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, _wake_sender, wake_receiver) = wake_latch();
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let starting = LifecycleState {
-            phase: ServerPhase::Starting,
-            launch_generation: 1,
-            ..LifecycleState::stopped()
-        };
+        let starting = lifecycle_with_generation(ServerPhase::Starting, 1);
         let (lifecycle_sender, lifecycle) = watch::channel(starting);
-        let mut control = SupervisorControl {
-            wake_requests: wake_receiver,
-            shutdown: shutdown_receiver,
-            lifecycle: lifecycle_sender,
-        };
+        let mut control =
+            test_control_from_parts(wake_receiver, shutdown_receiver, lifecycle_sender);
         let retry_delay = control.begin_failure_cleanup(FailureCategory::StartupTimedOut);
 
+        let config = test_config(&Endpoint::new("127.0.0.1", 9));
         let error = finish_failed_cleanup(
             async { Err(anyhow::anyhow!("synthetic cleanup failure")) },
             &mut control,
+            &config,
             retry_delay,
         )
         .await
@@ -5088,34 +7767,26 @@ mod tests {
 
     #[test]
     fn active_phase_wakes_cannot_start_new_cycle() {
-        let stopped = LifecycleState {
-            phase: ServerPhase::Stopped,
-            launch_generation: 1,
-            ..LifecycleState::stopped()
-        };
+        let stopped = lifecycle_with_generation(ServerPhase::Stopped, 1);
 
         for phase in [ServerPhase::Starting, ServerPhase::Running] {
-            let request = WakeRequest::observed(LifecycleState {
-                phase,
-                launch_generation: 1,
-                ..stopped
-            });
+            let request = WakeRequest::observed(lifecycle_with_generation(phase, 1));
             assert!(!request.can_start(stopped));
         }
     }
 
     #[tokio::test]
     async fn closed_shutdown_source_precedes_queued_startup_wake() {
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, wake_receiver) = wake_latch();
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let (lifecycle_sender, lifecycle) = watch::channel(LifecycleState::reconciling());
         wake_sender
-            .try_send(WakeRequest::observed(*lifecycle.borrow()))
+            .enqueue(WakeRequest::observed(*lifecycle.borrow()))
             .expect("first wake request should fit");
         drop(shutdown_sender);
 
         let (rcon_address, backend) = refused_endpoints();
-        run(
+        run_test(
             wake_receiver,
             shutdown_receiver,
             lifecycle_sender,
@@ -5132,11 +7803,11 @@ mod tests {
 
     #[tokio::test]
     async fn closed_wake_source_stops_and_reaps_an_active_child() {
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (wake_root, wake_sender, wake_receiver) = wake_latch();
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let (lifecycle_sender, mut lifecycle) = watch::channel(LifecycleState::reconciling());
         let (rcon_address, backend) = refused_endpoints();
-        let supervisor = tokio::spawn(run(
+        let supervisor = tokio::spawn(run_test(
             wake_receiver,
             shutdown_receiver,
             lifecycle_sender,
@@ -5146,11 +7817,11 @@ mod tests {
         ));
 
         wake_sender
-            .send(WakeRequest::observed(*lifecycle.borrow()))
-            .await
+            .enqueue(WakeRequest::observed(*lifecycle.borrow()))
             .expect("supervisor should accept the initial wake request");
         wait_for_phase(&mut lifecycle, ServerPhase::Starting).await;
         drop(wake_sender);
+        wake_root.close();
 
         timeout(Duration::from_secs(10), supervisor)
             .await
@@ -5163,24 +7834,20 @@ mod tests {
 
     #[tokio::test]
     async fn wake_bursts_launch_one_child() {
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, wake_receiver) = wake_latch();
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
         let (lifecycle_sender, mut lifecycle) = watch::channel(LifecycleState::reconciling());
         let initial = *lifecycle.borrow();
         wake_sender
-            .try_send(WakeRequest::observed(initial))
+            .enqueue(WakeRequest::observed(initial))
             .expect("first wake request should fit");
         for _ in 0..32 {
-            assert!(
-                matches!(
-                    wake_sender.try_send(WakeRequest::observed(initial)),
-                    Err(mpsc::error::TrySendError::Full(_))
-                ),
-                "a stopped-phase wake burst should occupy one pending slot"
-            );
+            wake_sender
+                .enqueue(WakeRequest::observed(initial))
+                .expect("equal wake keys should coalesce");
         }
         let (rcon_address, backend) = refused_endpoints();
-        let supervisor = tokio::spawn(run(
+        let supervisor = tokio::spawn(run_test(
             wake_receiver,
             shutdown_receiver,
             lifecycle_sender,
@@ -5193,8 +7860,7 @@ mod tests {
         let starting = *lifecycle.borrow();
         for _ in 0..16 {
             wake_sender
-                .send(WakeRequest::observed(starting))
-                .await
+                .enqueue(WakeRequest::observed(starting))
                 .expect("supervisor should drain startup wake requests");
         }
         shutdown_sender
@@ -5215,25 +7881,18 @@ mod tests {
         let (rcon_address, rcon_ready, rcon_server) = spawn_test_rcon_server().await;
         let config = test_config(&rcon_address);
         let child = process::launch(&config.launch).expect("test server process should launch");
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, wake_receiver) = wake_latch();
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let running = LifecycleState {
-            phase: ServerPhase::Running,
-            launch_generation: 1,
-            ..LifecycleState::stopped()
-        };
+        let running = lifecycle_with_generation(ServerPhase::Running, 1);
         let (lifecycle_sender, lifecycle) = watch::channel(running);
         wake_sender
-            .try_send(WakeRequest::observed(running))
+            .enqueue(WakeRequest::observed(running))
             .expect("running-phase wake request should fit");
         shutdown_sender
             .send(())
             .expect("running monitor should still await shutdown");
-        let mut control = SupervisorControl {
-            wake_requests: wake_receiver,
-            shutdown: shutdown_receiver,
-            lifecycle: lifecycle_sender,
-        };
+        let mut control =
+            test_control_from_parts(wake_receiver, shutdown_receiver, lifecycle_sender);
         let backend_use = running_backend_use(running);
         let cycle = running.owned_running_cycle().unwrap();
 
@@ -5268,16 +7927,13 @@ mod tests {
         let (rcon_address, rcon_ready, rcon_server) = spawn_test_rcon_server().await;
         let config = test_config(&rcon_address);
         let child = process::launch(&config.launch).expect("test server process should launch");
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, wake_receiver) = wake_latch();
         let (_shutdown_sender, shutdown_receiver) = oneshot::channel();
         let active = failed_lifecycle(ServerPhase::Running, 3);
         let (lifecycle_sender, mut lifecycle) = watch::channel(active);
         let stop = tokio::spawn(async move {
-            let mut control = SupervisorControl {
-                wake_requests: wake_receiver,
-                shutdown: shutdown_receiver,
-                lifecycle: lifecycle_sender,
-            };
+            let mut control =
+                test_control_from_parts(wake_receiver, shutdown_receiver, lifecycle_sender);
             control.begin_idle_stop(active.owned_running_cycle().unwrap());
             stop_committed_idle_server(child, &mut control, &config).await
         });
@@ -5291,11 +7947,10 @@ mod tests {
                 let wake_sender = wake_sender.clone();
                 tokio::spawn(async move {
                     let mut sent = 0usize;
-                    while wake_sender
-                        .send(WakeRequest::observed(stopping))
-                        .await
-                        .is_ok()
-                    {
+                    for _ in 0..32 {
+                        wake_sender
+                            .enqueue(WakeRequest::observed(stopping))
+                            .expect("wake latch should remain open");
                         sent += 1;
                     }
                     sent
@@ -5334,28 +7989,20 @@ mod tests {
         let (rcon_address, rcon_ready, rcon_server) = spawn_test_rcon_server().await;
         let config = test_config(&rcon_address);
         let child = process::launch(&config.launch).expect("test server process should launch");
-        let (wake_sender, wake_receiver) = mpsc::channel(1);
+        let (_wake_root, wake_sender, wake_receiver) = wake_latch();
         let (shutdown_sender, shutdown_receiver) = oneshot::channel();
-        let active = LifecycleState {
-            phase: ServerPhase::Running,
-            launch_generation: 1,
-            ..LifecycleState::stopped()
-        };
+        let active = lifecycle_with_generation(ServerPhase::Running, 1);
         let (lifecycle_sender, mut lifecycle) = watch::channel(active);
         let stop = tokio::spawn(async move {
-            let mut control = SupervisorControl {
-                wake_requests: wake_receiver,
-                shutdown: shutdown_receiver,
-                lifecycle: lifecycle_sender,
-            };
+            let mut control =
+                test_control_from_parts(wake_receiver, shutdown_receiver, lifecycle_sender);
             control.begin_idle_stop(active.owned_running_cycle().unwrap());
             stop_committed_idle_server(child, &mut control, &config).await
         });
 
         wait_for_phase(&mut lifecycle, ServerPhase::Stopping).await;
         wake_sender
-            .send(WakeRequest::observed(*lifecycle.borrow()))
-            .await
+            .enqueue(WakeRequest::observed(*lifecycle.borrow()))
             .expect("supervisor should accept one stopping-phase wake request");
         shutdown_sender
             .send(())
