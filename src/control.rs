@@ -376,7 +376,7 @@ enum Response {
 enum SuccessResult {
     List { servers: Vec<String> },
     Status { server: ReceivedStatus },
-    Operation { operation: ReceivedOperation },
+    Operation(ReceivedOperation),
 }
 
 #[derive(Deserialize)]
@@ -817,62 +817,82 @@ where
             .await
             .map_err(|_| ExchangeError::Client)?,
         Request::Status { server_id } => {
-            let Some(handle) = registry.0.handles.get(&server_id) else {
-                let response = constant_error_frame(WireErrorCode::UnknownServerId);
-                stream
-                    .write_all(&response)
-                    .await
-                    .map_err(|_| ExchangeError::Client)?;
-                return Ok(());
-            };
-            let Some(snapshot) = handle.snapshot() else {
-                return Err(ExchangeError::Client);
-            };
-            let response = status_frame(handle.server_id(), snapshot, Instant::now());
-            stream
-                .write_all(&response)
-                .await
-                .map_err(|_| ExchangeError::Client)?;
+            serve_status(stream, registry, &server_id).await?;
         }
-        Request::Restart { .. } => {
-            let response = constant_error_frame(WireErrorCode::UnsupportedOperation);
-            stream
-                .write_all(&response)
-                .await
-                .map_err(|_| ExchangeError::Client)?;
-        }
-        Request::Start {
-            server_id,
-            request_id,
-            expected_command_revision,
-        } => {
+        mutation @ (Request::Start { .. } | Request::Stop { .. } | Request::Restart { .. }) => {
+            let (server_id, request_id, expected_command_revision, operation) = match mutation {
+                Request::Start {
+                    server_id,
+                    request_id,
+                    expected_command_revision,
+                } => (
+                    server_id,
+                    request_id,
+                    expected_command_revision,
+                    MutationOperation::Start,
+                ),
+                Request::Stop {
+                    server_id,
+                    request_id,
+                    expected_command_revision,
+                } => (
+                    server_id,
+                    request_id,
+                    expected_command_revision,
+                    MutationOperation::Stop,
+                ),
+                Request::Restart {
+                    server_id,
+                    request_id,
+                    expected_command_revision,
+                } => (
+                    server_id,
+                    request_id,
+                    expected_command_revision,
+                    MutationOperation::Restart,
+                ),
+                Request::List | Request::Status { .. } => {
+                    unreachable!("matched only mutation operations")
+                }
+            };
             serve_mutation(
                 stream,
                 registry,
                 server_id,
                 request_id,
                 expected_command_revision,
-                MutationOperation::Start,
-            )
-            .await?;
-        }
-        Request::Stop {
-            server_id,
-            request_id,
-            expected_command_revision,
-        } => {
-            serve_mutation(
-                stream,
-                registry,
-                server_id,
-                request_id,
-                expected_command_revision,
-                MutationOperation::Stop,
+                operation,
             )
             .await?;
         }
     }
     Ok(())
+}
+
+async fn serve_status<S>(
+    stream: &mut S,
+    registry: &Registry,
+    server_id: &str,
+) -> Result<(), ExchangeError>
+where
+    S: AsyncWrite + Unpin,
+{
+    let Some(handle) = registry.0.handles.get(server_id) else {
+        let response = constant_error_frame(WireErrorCode::UnknownServerId);
+        stream
+            .write_all(&response)
+            .await
+            .map_err(|_| ExchangeError::Client)?;
+        return Ok(());
+    };
+    let Some(snapshot) = handle.snapshot() else {
+        return Err(ExchangeError::Client);
+    };
+    let response = status_frame(handle.server_id(), snapshot, Instant::now());
+    stream
+        .write_all(&response)
+        .await
+        .map_err(|_| ExchangeError::Client)
 }
 
 struct AdmissionCancellation {
@@ -1137,7 +1157,7 @@ where
 pub async fn list() -> std::result::Result<Vec<String>, ClientError> {
     match request(Request::List).await? {
         SuccessResult::List { servers } => validate_server_list(servers),
-        SuccessResult::Status { .. } | SuccessResult::Operation { .. } => {
+        SuccessResult::Status { .. } | SuccessResult::Operation(_) => {
             Err(ClientError::DaemonUnavailable)
         }
     }
@@ -1163,9 +1183,9 @@ pub async fn status(server_id: String) -> std::result::Result<ServerStatus, Clie
                 command_revision: server.command_revision,
             })
         }
-        SuccessResult::Status { .. }
-        | SuccessResult::List { .. }
-        | SuccessResult::Operation { .. } => Err(ClientError::DaemonUnavailable),
+        SuccessResult::Status { .. } | SuccessResult::List { .. } | SuccessResult::Operation(_) => {
+            Err(ClientError::DaemonUnavailable)
+        }
     }
 }
 
@@ -1211,6 +1231,27 @@ pub async fn stop(
     .await
 }
 
+pub async fn restart(
+    server_id: String,
+    request_id: String,
+    expected_command_revision: u64,
+) -> std::result::Result<OperationStatus, ClientError> {
+    let expected_result_revision = expected_command_revision.checked_add(1);
+    mutate(
+        Request::Restart {
+            server_id: server_id.clone(),
+            request_id: RequestId::new(request_id.clone())
+                .ok_or_else(|| ClientError::Operation("invalid request ID".to_owned()))?,
+            expected_command_revision,
+        },
+        server_id,
+        request_id,
+        "restart",
+        expected_result_revision,
+    )
+    .await
+}
+
 async fn mutate(
     request: Request,
     expected_server_id: String,
@@ -1232,7 +1273,7 @@ async fn mutate(
         Err(_) => return Err(ClientError::SubmissionUncertain),
     };
     match result {
-        SuccessResult::Operation { operation } => validate_mutation_success(
+        SuccessResult::Operation(operation) => validate_mutation_success(
             operation,
             &expected_server_id,
             &expected_request_id,
@@ -1254,10 +1295,13 @@ fn validate_mutation_success(
         || operation.request_id != expected_request_id
         || operation.operation != expected_operation
         || Some(operation.command_revision) != expected_result_revision
-        || !matches!(
-            operation.disposition.as_str(),
-            "accepted" | "already_satisfied"
-        )
+        || match expected_operation {
+            "restart" => operation.disposition != "accepted",
+            _ => !matches!(
+                operation.disposition.as_str(),
+                "accepted" | "already_satisfied"
+            ),
+        }
     {
         return Err(ClientError::SubmissionUncertain);
     }
@@ -1598,6 +1642,24 @@ mod tests {
         let mut expected = vec![0, 0, 0, 17, 0, 2];
         expected.extend_from_slice(br#"{"type":"list"}"#);
         assert_eq!(frame, expected);
+
+        let restart = Request::Restart {
+            server_id: "survival".to_owned(),
+            request_id: RequestId::new("11111111111111111111111111111111".to_owned()).unwrap(),
+            expected_command_revision: 12,
+        };
+        assert_eq!(
+            encode_frame(&restart).unwrap(),
+            raw_frame(
+                PROTOCOL_VERSION,
+                br#"{"type":"restart","server_id":"survival","request_id":"11111111111111111111111111111111","expected_command_revision":12}"#,
+            )
+        );
+        assert!(WireErrorCode::ALL.contains(&WireErrorCode::UnsupportedOperation));
+        assert_eq!(
+            response_code(&constant_error_frame(WireErrorCode::UnsupportedOperation)),
+            WireErrorCode::UnsupportedOperation
+        );
     }
 
     #[test]
@@ -1758,19 +1820,111 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn valid_restart_is_unsupported_without_supervisor_admission() {
-        let (registry, _authority) =
-            one_server_registry(LifecycleState::test_phase(ServerPhase::Stopped));
+    async fn valid_restart_is_dispatched_through_supervisor_admission() {
+        let prepared = PreparedRegistry::new([&"survival".to_owned()].into_iter()).unwrap();
+        let (handle, _authority, mut mutations) = RuntimeStatusHandle::test_with_mutations(
+            "survival",
+            LifecycleState::test_phase(ServerPhase::Running),
+        );
+        let registry = prepared
+            .activate(BTreeMap::from([("survival".to_owned(), handle)]))
+            .unwrap();
         let request = Request::Restart {
             server_id: "survival".to_owned(),
             request_id: RequestId::new("11111111111111111111111111111111".to_owned()).unwrap(),
             expected_command_revision: 0,
         };
-        let response = exchange(&encode_frame(&request).unwrap(), registry).await;
+        let permits = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&permits).try_acquire_owned().unwrap();
+        let (mut client, server) = tokio::io::duplex(70_000);
+        let exchange = tokio::spawn(serve_accepted(server, registry, permit));
+        client
+            .write_all(&encode_frame(&request).unwrap())
+            .await
+            .unwrap();
+        let envelope = mutations.recv().await.unwrap();
+        assert_eq!(envelope.operation, MutationOperation::Restart);
+        assert_eq!(envelope.expected_command_revision, 0);
+        assert_eq!(envelope.request_id, "11111111111111111111111111111111");
+        envelope
+            .reply
+            .send(Ok(MutationSuccess {
+                server_id: "survival".to_owned(),
+                operation: MutationOperation::Restart,
+                request_id: "11111111111111111111111111111111".to_owned(),
+                command_revision: 1,
+                disposition: crate::supervisor::MutationDisposition::Accepted,
+            }))
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        exchange.await.unwrap();
+        assert_eq!(permits.available_permits(), 1);
+        let Response::Success {
+            result: SuccessResult::Operation(operation),
+        } = serde_json::from_slice(frame_body(&response)).unwrap()
+        else {
+            panic!("restart should return an operation response");
+        };
+        assert_eq!(operation.operation, "restart");
+        assert_eq!(operation.command_revision, 1);
+    }
+
+    #[test]
+    fn restart_client_validation_requires_exact_identity_disposition_and_next_revision() {
+        let valid = ReceivedOperation {
+            server_id: "survival".to_owned(),
+            operation: "restart".to_owned(),
+            request_id: "11111111111111111111111111111111".to_owned(),
+            command_revision: 13,
+            disposition: "accepted".to_owned(),
+        };
         assert_eq!(
-            response_code(&response),
-            WireErrorCode::UnsupportedOperation
+            validate_mutation_success(
+                valid,
+                "survival",
+                "11111111111111111111111111111111",
+                "restart",
+                Some(13),
+            )
+            .unwrap()
+            .operation(),
+            "restart"
         );
+
+        for corrupt in [
+            "server_id",
+            "operation",
+            "request_id",
+            "revision",
+            "disposition",
+        ] {
+            let mut invalid = ReceivedOperation {
+                server_id: "survival".to_owned(),
+                operation: "restart".to_owned(),
+                request_id: "11111111111111111111111111111111".to_owned(),
+                command_revision: 13,
+                disposition: "accepted".to_owned(),
+            };
+            match corrupt {
+                "server_id" => invalid.server_id = "creative".to_owned(),
+                "operation" => invalid.operation = "stop".to_owned(),
+                "request_id" => invalid.request_id = "22222222222222222222222222222222".to_owned(),
+                "revision" => invalid.command_revision = 12,
+                "disposition" => invalid.disposition = "already_satisfied".to_owned(),
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                validate_mutation_success(
+                    invalid,
+                    "survival",
+                    "11111111111111111111111111111111",
+                    "restart",
+                    Some(13),
+                ),
+                Err(ClientError::SubmissionUncertain)
+            ));
+        }
     }
 
     #[tokio::test]

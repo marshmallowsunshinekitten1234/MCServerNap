@@ -63,6 +63,8 @@ enum ServerCommand {
     Start { server_id: String },
     /// Explicitly stop one owned server process.
     Stop { server_id: String },
+    /// Asynchronously stop, reap, reconcile, and relaunch one owned server process.
+    Restart { server_id: String },
 }
 
 #[tokio::main]
@@ -104,6 +106,9 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Server {
             command: ServerCommand::Stop { server_id },
         } => mutate_server(server_id, "stop").await,
+        Commands::Server {
+            command: ServerCommand::Restart { server_id },
+        } => mutate_server(server_id, "restart").await,
         Commands::Stop {
             rcon_host,
             rcon_port,
@@ -160,12 +165,14 @@ async fn mutate_server(server_id: String, operation: &'static str) -> Result<()>
     let result = match operation {
         "start" => control::start(server_id.clone(), request_id.clone(), expected_revision).await,
         "stop" => control::stop(server_id.clone(), request_id.clone(), expected_revision).await,
-        _ => unreachable!("CLI exposes only start and stop mutations"),
+        "restart" => {
+            control::restart(server_id.clone(), request_id.clone(), expected_revision).await
+        }
+        _ => unreachable!("CLI exposes only start, stop, and restart mutations"),
     };
     match result {
         Ok(result) => {
-            print_output(&format!(
-                "{} {} (request {}, command revision {}). Use `mcservernap server status {}` to observe eventual state.\n",
+            print_output(&format_mutation_result(
                 result.operation(),
                 result.disposition(),
                 result.request_id(),
@@ -190,6 +197,18 @@ async fn mutate_server(server_id: String, operation: &'static str) -> Result<()>
         }
         Err(error) => Err(error.into()),
     }
+}
+
+fn format_mutation_result(
+    operation: &str,
+    disposition: &str,
+    request_id: &str,
+    command_revision: u64,
+    server_id: &str,
+) -> String {
+    format!(
+        "{operation} {disposition} (request {request_id}, command revision {command_revision}). Use `mcservernap server status {server_id}` to observe eventual state.\n"
+    )
 }
 
 fn generate_request_id() -> Result<String, getrandom::Error> {
@@ -249,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_read_only_control_commands_and_retains_clap_usage_exit_two() {
+    fn parses_grouped_control_commands_and_retains_clap_usage_exit_two() {
         let list = Cli::try_parse_from([
             "mcservernap",
             "--config",
@@ -289,8 +308,8 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["mcservernap", "list"]).is_err());
         assert!(Cli::try_parse_from(["mcservernap", "status", "survival"]).is_err());
-        assert!(Cli::try_parse_from(["mcservernap", "server", "restart", "survival"]).is_err());
-        for operation in ["start", "stop"] {
+        assert!(Cli::try_parse_from(["mcservernap", "restart", "survival"]).is_err());
+        for operation in ["start", "stop", "restart"] {
             let cli =
                 Cli::try_parse_from(["mcservernap", "server", operation, "survival"]).unwrap();
             assert!(matches!(
@@ -298,6 +317,7 @@ mod tests {
                 Commands::Server {
                     command: ServerCommand::Start { ref server_id }
                         | ServerCommand::Stop { ref server_id }
+                        | ServerCommand::Restart { ref server_id }
                 } if server_id == "survival"
             ));
         }
@@ -345,6 +365,16 @@ mod tests {
         assert_eq!(
             format_status("creative", "running", None, 0, None, 0),
             "server: creative\nphase: running\nfailure streak: 0\ncommand revision: 0\n"
+        );
+        assert_eq!(
+            format_mutation_result(
+                "restart",
+                "accepted",
+                "11111111111111111111111111111111",
+                13,
+                "survival",
+            ),
+            "restart accepted (request 11111111111111111111111111111111, command revision 13). Use `mcservernap server status survival` to observe eventual state.\n"
         );
     }
 
