@@ -63,9 +63,9 @@ Run control commands as the same operating-system account that started the
 daemon. If a system service runs the daemon under a dedicated account, run
 these commands as that account too.
 
-List configured servers, check their status, or request a start or stop. These
-commands talk to the running MCServerNap process. The daemon uses the
-configuration it loaded at startup, so the commands do not reread the
+List configured servers, check their status, or request a start, stop, or
+restart. These commands talk to the running MCServerNap process. The daemon
+uses the configuration it loaded at startup, so the commands do not reread the
 configuration file:
 
 ```console
@@ -73,12 +73,13 @@ target/release/mcservernap server list
 target/release/mcservernap server status survival
 target/release/mcservernap server start survival
 target/release/mcservernap server stop survival
+target/release/mcservernap server restart survival
 ```
 
 `server status` reports the current phase and recent failure or retry
-information. Start and stop are asynchronous: a successful command means the
-daemon accepted the request or no action was needed, not necessarily that
-Minecraft has finished starting or stopping. Use `server status` to follow
+information. Start, stop, and restart are asynchronous: a successful command
+means the daemon accepted the request or no action was needed, not necessarily
+that Minecraft has finished starting or stopping. Use `server status` to follow
 progress.
 
 If the connection to the daemon fails before the result is known, the CLI
@@ -90,6 +91,16 @@ deciding what to do next.
 started by MCServerNap. It does not disable future wake-ups: a later player can
 start the server again. MCServerNap never stops, restarts, or takes ownership of
 a Minecraft process it did not start.
+
+`server restart` disconnects current players, stops the old Minecraft process
+that MCServerNap started, waits for it to exit, checks the server port again,
+and then starts one replacement. Use `server status` and reconnect after the
+phase returns to `running`. A process that MCServerNap did not start, or whose
+ownership is uncertain, is left untouched.
+
+Sending `server stop` during a restart can cancel it only while the old process
+is still being cleaned up. If the replacement has already begun, wait until its
+phase is `starting` or `running`, then send `server stop` again.
 
 Control commands are available only on the local machine. On Unix, one daemon
 is supported per user account. On Windows, access is controlled by that
