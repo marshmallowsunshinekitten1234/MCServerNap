@@ -16,7 +16,7 @@ const MAX_COMMAND_BYTES: usize = 1_413;
 const MAX_PACKET_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
-pub struct RconSecret(String);
+pub(crate) struct RconSecret(String);
 
 impl RconSecret {
     pub(crate) fn new(value: String) -> Result<Self> {
@@ -89,7 +89,7 @@ impl RconClient {
     }
 
     /// Execute a command and collect all Minecraft response packets.
-    pub async fn command(&mut self, command: &str) -> Result<String> {
+    pub(crate) async fn command(&mut self, command: &str) -> Result<String> {
         validate_body(command, "RCON command")?;
         let command_id = self.send_packet(EXEC_COMMAND, command).await?;
 

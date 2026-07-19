@@ -12,7 +12,7 @@ use tokio::time::{Instant, timeout, timeout_at};
 mod version;
 
 use version::InitialProtocol;
-pub use version::MinecraftVersion;
+pub(crate) use version::MinecraftVersion;
 
 const MAX_PACKET_LENGTH: usize = (1 << 21) - 1;
 const MAX_HANDSHAKE_PACKET_LENGTH: usize = 1_024;
@@ -21,7 +21,7 @@ const MAX_STATUS_PACKET_LENGTH: usize = 32;
 const CONFLICT_DISCONNECT_MESSAGE: &str = "MCServerNap cannot safely start the server because the backend state is uncertain. Try again later or contact the server administrator.";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LoginIntent {
+pub(crate) enum LoginIntent {
     Login,
     Transfer,
 }
@@ -135,26 +135,26 @@ impl ConnectionEnvelope {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ClientRequest {
+pub(crate) enum ClientRequest {
     Status,
     Login { intent: LoginIntent },
     UnsupportedProtocol { protocol_version: i32 },
 }
 
 #[derive(Debug)]
-pub struct MinecraftResponderSettings {
-    pub minecraft_version: MinecraftVersion,
-    pub sleeping_motd_text: String,
-    pub sleeping_motd_color: String,
-    pub sleeping_motd_bold: bool,
-    pub startup_message_text: String,
-    pub startup_message_color: String,
-    pub startup_message_bold: bool,
-    pub server_icon: Option<String>,
+pub(crate) struct MinecraftResponderSettings {
+    pub(crate) minecraft_version: MinecraftVersion,
+    pub(crate) sleeping_motd_text: String,
+    pub(crate) sleeping_motd_color: String,
+    pub(crate) sleeping_motd_bold: bool,
+    pub(crate) startup_message_text: String,
+    pub(crate) startup_message_color: String,
+    pub(crate) startup_message_bold: bool,
+    pub(crate) server_icon: Option<String>,
 }
 
 #[derive(Debug)]
-pub struct MinecraftResponder {
+pub(crate) struct MinecraftResponder {
     minecraft_version: MinecraftVersion,
     status_response: Vec<u8>,
     login_disconnect: Vec<u8>,
@@ -198,7 +198,7 @@ struct StatusDescription<'a> {
 }
 
 impl MinecraftResponder {
-    pub fn new(settings: MinecraftResponderSettings) -> Result<Self> {
+    pub(crate) fn new(settings: MinecraftResponderSettings) -> Result<Self> {
         let MinecraftResponderSettings {
             minecraft_version,
             sleeping_motd_text,
@@ -312,7 +312,7 @@ impl MinecraftResponder {
         }))
     }
 
-    pub async fn send_login_disconnect(
+    pub(crate) async fn send_login_disconnect(
         &self,
         socket: &mut TcpStream,
         operation_timeout: Duration,
@@ -323,7 +323,7 @@ impl MinecraftResponder {
         shutdown_with_timeout(socket, operation_timeout).await
     }
 
-    pub async fn serve_status(
+    pub(crate) async fn serve_status(
         &self,
         socket: &mut TcpStream,
         operation_timeout: Duration,
@@ -363,7 +363,7 @@ impl MinecraftResponder {
         shutdown_with_timeout(socket, operation_timeout).await
     }
 
-    pub async fn send_conflict_disconnect(
+    pub(crate) async fn send_conflict_disconnect(
         &self,
         socket: &mut TcpStream,
         operation_timeout: Duration,
@@ -374,7 +374,7 @@ impl MinecraftResponder {
         shutdown_with_timeout(socket, operation_timeout).await
     }
 
-    pub async fn send_incompatible_disconnect(
+    pub(crate) async fn send_incompatible_disconnect(
         &self,
         socket: &mut TcpStream,
         operation_timeout: Duration,

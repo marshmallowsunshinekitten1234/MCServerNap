@@ -2,7 +2,7 @@ use std::fmt;
 use std::sync::Arc;
 
 #[derive(Clone)]
-pub struct ServerContext {
+pub(crate) struct ServerContext {
     id: Arc<str>,
 }
 
@@ -12,7 +12,7 @@ impl ServerContext {
     }
 
     #[must_use]
-    pub fn id(&self) -> &str {
+    pub(crate) fn id(&self) -> &str {
         &self.id
     }
 }

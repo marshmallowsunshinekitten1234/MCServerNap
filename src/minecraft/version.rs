@@ -60,16 +60,16 @@ const SUPPORTED_VERSIONS: &[VersionProfile] = &[
 ];
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-pub struct MinecraftVersion(VersionProfile);
+pub(crate) struct MinecraftVersion(VersionProfile);
 
 impl MinecraftVersion {
     #[must_use]
-    pub const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         self.0.name
     }
 
     #[must_use]
-    pub const fn protocol(self) -> i32 {
+    pub(crate) const fn protocol(self) -> i32 {
         self.0.protocol
     }
 

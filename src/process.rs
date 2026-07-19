@@ -17,16 +17,20 @@ use nix::unistd::Pid;
 const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 
 #[derive(Debug)]
-pub struct LaunchCommand {
-    pub program: OsString,
-    pub arguments: Vec<OsString>,
-    pub working_directory: PathBuf,
+pub(crate) struct LaunchCommand {
+    pub(crate) program: OsString,
+    pub(crate) arguments: Vec<OsString>,
+    pub(crate) working_directory: PathBuf,
     removed_environment: Arc<[OsString]>,
 }
 
 impl LaunchCommand {
     #[must_use]
-    pub fn new(program: OsString, arguments: Vec<OsString>, working_directory: PathBuf) -> Self {
+    pub(crate) fn new(
+        program: OsString,
+        arguments: Vec<OsString>,
+        working_directory: PathBuf,
+    ) -> Self {
         Self {
             program,
             arguments,
@@ -42,27 +46,27 @@ impl LaunchCommand {
     }
 }
 
-pub struct OwnedProcess {
+pub(crate) struct OwnedProcess {
     child: Child,
     stdin: ChildStdin,
 }
 
 impl OwnedProcess {
-    pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+    pub(crate) async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.child.wait().await
     }
 
-    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         self.child.try_wait()
     }
 
     #[cfg(test)]
     #[must_use]
-    pub fn id(&self) -> Option<u32> {
+    pub(crate) fn id(&self) -> Option<u32> {
         self.child.id()
     }
 
-    pub async fn send_console_stop(&mut self) -> Result<()> {
+    pub(crate) async fn send_console_stop(&mut self) -> Result<()> {
         self.stdin
             .write_all(b"stop\n")
             .await
@@ -78,7 +82,7 @@ impl OwnedProcess {
     clippy::unnecessary_debug_formatting,
     reason = "OS command values need escaped, non-lossy debug logging"
 )]
-pub fn launch(launch: &LaunchCommand) -> Result<OwnedProcess> {
+pub(crate) fn launch(launch: &LaunchCommand) -> Result<OwnedProcess> {
     let mut process = Command::new(&launch.program);
     process
         .args(&launch.arguments)
@@ -109,7 +113,7 @@ pub fn launch(launch: &LaunchCommand) -> Result<OwnedProcess> {
 }
 
 /// Forcefully terminate the server process tree.
-pub async fn terminate(process: &mut OwnedProcess) -> Result<()> {
+pub(crate) async fn terminate(process: &mut OwnedProcess) -> Result<()> {
     let child = &mut process.child;
     if child
         .try_wait()

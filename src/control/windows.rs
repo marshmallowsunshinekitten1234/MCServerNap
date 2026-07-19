@@ -331,7 +331,7 @@ mod tests {
         ControlServer, PreparedRegistry, ReadFrame, Request, Response, SuccessResult, encode_frame,
         read_frame,
     };
-    use crate::runtime::RuntimeStatusHandle;
+    use crate::runtime::RuntimeControlHandle;
     use crate::supervisor::{LifecycleState, ServerPhase};
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -351,7 +351,7 @@ mod tests {
         let id = "survival".to_owned();
         let prepared = PreparedRegistry::new([&id].into_iter()).unwrap();
         let (handle, authority) =
-            RuntimeStatusHandle::test(&id, LifecycleState::test_phase(ServerPhase::Stopped));
+            RuntimeControlHandle::test(&id, LifecycleState::test_phase(ServerPhase::Stopped));
         (
             prepared.activate(BTreeMap::from([(id, handle)])).unwrap(),
             authority,
