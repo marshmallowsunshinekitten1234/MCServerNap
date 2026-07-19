@@ -4,7 +4,7 @@ use std::{fmt::Write as _, io::Write as _};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use mcservernap::control;
+use mcservernap::control::{self, ClientMutationOperation};
 use mcservernap::coordinator::DaemonCoordinator;
 use mcservernap::endpoint::Endpoint;
 use mcservernap::rcon::RconClient;
@@ -102,13 +102,13 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Server {
             command: ServerCommand::Start { server_id },
-        } => mutate_server(server_id, "start").await,
+        } => mutate_server(server_id, ClientMutationOperation::Start).await,
         Commands::Server {
             command: ServerCommand::Stop { server_id },
-        } => mutate_server(server_id, "stop").await,
+        } => mutate_server(server_id, ClientMutationOperation::Stop).await,
         Commands::Server {
             command: ServerCommand::Restart { server_id },
-        } => mutate_server(server_id, "restart").await,
+        } => mutate_server(server_id, ClientMutationOperation::Restart).await,
         Commands::Stop {
             rcon_host,
             rcon_port,
@@ -157,23 +157,18 @@ fn format_status(
     output
 }
 
-async fn mutate_server(server_id: String, operation: &'static str) -> Result<()> {
+async fn mutate_server(server_id: String, operation: ClientMutationOperation) -> Result<()> {
     let status = control::status(server_id.clone()).await?;
     let expected_revision = status.command_revision();
     let request_id =
         generate_request_id().context("failed to obtain OS randomness for request ID")?;
-    let result = match operation {
-        "start" => control::start(server_id.clone(), request_id.clone(), expected_revision).await,
-        "stop" => control::stop(server_id.clone(), request_id.clone(), expected_revision).await,
-        "restart" => {
-            control::restart(server_id.clone(), request_id.clone(), expected_revision).await
-        }
-        _ => unreachable!("CLI exposes only start, stop, and restart mutations"),
-    };
+    let result = operation
+        .submit(server_id.clone(), request_id.clone(), expected_revision)
+        .await;
     match result {
         Ok(result) => {
             print_output(&format_mutation_result(
-                result.operation(),
+                operation,
                 result.disposition(),
                 result.request_id(),
                 result.command_revision(),
@@ -200,7 +195,7 @@ async fn mutate_server(server_id: String, operation: &'static str) -> Result<()>
 }
 
 fn format_mutation_result(
-    operation: &str,
+    operation: ClientMutationOperation,
     disposition: &str,
     request_id: &str,
     command_revision: u64,
@@ -368,7 +363,7 @@ mod tests {
         );
         assert_eq!(
             format_mutation_result(
-                "restart",
+                ClientMutationOperation::Restart,
                 "accepted",
                 "11111111111111111111111111111111",
                 13,

@@ -84,6 +84,104 @@ impl<'de> Deserialize<'de> for RequestId {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientMutationOperation {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl ClientMutationOperation {
+    const ALL: [Self; 3] = [Self::Start, Self::Stop, Self::Restart];
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+        }
+    }
+
+    fn request(
+        self,
+        server_id: String,
+        request_id: RequestId,
+        expected_command_revision: u64,
+    ) -> Request {
+        match self {
+            Self::Start => Request::Start {
+                server_id,
+                request_id,
+                expected_command_revision,
+            },
+            Self::Stop => Request::Stop {
+                server_id,
+                request_id,
+                expected_command_revision,
+            },
+            Self::Restart => Request::Restart {
+                server_id,
+                request_id,
+                expected_command_revision,
+            },
+        }
+    }
+
+    fn accepts_disposition(self, disposition: &str) -> bool {
+        match self {
+            Self::Start | Self::Stop => matches!(disposition, "accepted" | "already_satisfied"),
+            Self::Restart => disposition == "accepted",
+        }
+    }
+
+    fn from_wire_name(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|operation| operation.as_str() == value)
+    }
+
+    pub async fn submit(
+        self,
+        server_id: String,
+        request_id: String,
+        expected_command_revision: u64,
+    ) -> std::result::Result<OperationStatus, ClientError> {
+        let request_id = RequestId::new(request_id)
+            .ok_or_else(|| ClientError::Operation("invalid request ID".to_owned()))?;
+        let request = self.request(
+            server_id.clone(),
+            request_id.clone(),
+            expected_command_revision,
+        );
+        mutate(
+            request,
+            server_id,
+            request_id.into_string(),
+            self,
+            expected_command_revision.checked_add(1),
+        )
+        .await
+    }
+}
+
+impl<'de> Deserialize<'de> for ClientMutationOperation {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_wire_name(&value)
+            .ok_or_else(|| serde::de::Error::custom("unknown mutation operation"))
+    }
+}
+
+impl fmt::Display for ClientMutationOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RequestDocument {
@@ -394,7 +492,7 @@ struct ReceivedStatus {
 #[serde(deny_unknown_fields)]
 struct ReceivedOperation {
     server_id: String,
-    operation: String,
+    operation: ClientMutationOperation,
     request_id: String,
     command_revision: u64,
     disposition: String,
@@ -468,7 +566,7 @@ impl ServerStatus {
 
 pub struct OperationStatus {
     server_id: String,
-    operation: String,
+    operation: ClientMutationOperation,
     request_id: String,
     command_revision: u64,
     disposition: String,
@@ -481,7 +579,7 @@ impl OperationStatus {
     }
     #[must_use]
     pub fn operation(&self) -> &str {
-        &self.operation
+        self.operation.as_str()
     }
     #[must_use]
     pub fn request_id(&self) -> &str {
@@ -572,13 +670,13 @@ impl PreparedRegistry {
         })?;
 
         let request_id = "ffffffffffffffffffffffffffffffff";
-        for operation in ["start", "stop", "restart"] {
+        for operation in ClientMutationOperation::ALL {
             let worst_case = SuccessEnvelope {
                 response_type: "success",
                 result: OperationResult {
                     result_type: "operation",
                     server_id: longest_id,
-                    operation,
+                    operation: operation.as_str(),
                     request_id,
                     command_revision: u64::MAX,
                     disposition: "already_satisfied",
@@ -1194,20 +1292,9 @@ pub async fn start(
     request_id: String,
     expected_command_revision: u64,
 ) -> std::result::Result<OperationStatus, ClientError> {
-    let expected_result_revision = expected_command_revision.checked_add(1);
-    mutate(
-        Request::Start {
-            server_id: server_id.clone(),
-            request_id: RequestId::new(request_id.clone())
-                .ok_or_else(|| ClientError::Operation("invalid request ID".to_owned()))?,
-            expected_command_revision,
-        },
-        server_id,
-        request_id,
-        "start",
-        expected_result_revision,
-    )
-    .await
+    ClientMutationOperation::Start
+        .submit(server_id, request_id, expected_command_revision)
+        .await
 }
 
 pub async fn stop(
@@ -1215,20 +1302,9 @@ pub async fn stop(
     request_id: String,
     expected_command_revision: u64,
 ) -> std::result::Result<OperationStatus, ClientError> {
-    let expected_result_revision = expected_command_revision.checked_add(1);
-    mutate(
-        Request::Stop {
-            server_id: server_id.clone(),
-            request_id: RequestId::new(request_id.clone())
-                .ok_or_else(|| ClientError::Operation("invalid request ID".to_owned()))?,
-            expected_command_revision,
-        },
-        server_id,
-        request_id,
-        "stop",
-        expected_result_revision,
-    )
-    .await
+    ClientMutationOperation::Stop
+        .submit(server_id, request_id, expected_command_revision)
+        .await
 }
 
 pub async fn restart(
@@ -1236,27 +1312,16 @@ pub async fn restart(
     request_id: String,
     expected_command_revision: u64,
 ) -> std::result::Result<OperationStatus, ClientError> {
-    let expected_result_revision = expected_command_revision.checked_add(1);
-    mutate(
-        Request::Restart {
-            server_id: server_id.clone(),
-            request_id: RequestId::new(request_id.clone())
-                .ok_or_else(|| ClientError::Operation("invalid request ID".to_owned()))?,
-            expected_command_revision,
-        },
-        server_id,
-        request_id,
-        "restart",
-        expected_result_revision,
-    )
-    .await
+    ClientMutationOperation::Restart
+        .submit(server_id, request_id, expected_command_revision)
+        .await
 }
 
 async fn mutate(
     request: Request,
     expected_server_id: String,
     expected_request_id: String,
-    expected_operation: &'static str,
+    expected_operation: ClientMutationOperation,
     expected_result_revision: Option<u64>,
 ) -> std::result::Result<OperationStatus, ClientError> {
     let deadline = Instant::now() + EXCHANGE_TIMEOUT;
@@ -1288,20 +1353,14 @@ fn validate_mutation_success(
     operation: ReceivedOperation,
     expected_server_id: &str,
     expected_request_id: &str,
-    expected_operation: &str,
+    expected_operation: ClientMutationOperation,
     expected_result_revision: Option<u64>,
 ) -> std::result::Result<OperationStatus, ClientError> {
     if operation.server_id != expected_server_id
         || operation.request_id != expected_request_id
         || operation.operation != expected_operation
         || Some(operation.command_revision) != expected_result_revision
-        || match expected_operation {
-            "restart" => operation.disposition != "accepted",
-            _ => !matches!(
-                operation.disposition.as_str(),
-                "accepted" | "already_satisfied"
-            ),
-        }
+        || !expected_operation.accepts_disposition(&operation.disposition)
     {
         return Err(ClientError::SubmissionUncertain);
     }
@@ -1476,10 +1535,14 @@ mod tests {
         error.code
     }
 
-    fn received_operation(revision: u64, disposition: &str) -> ReceivedOperation {
+    fn received_operation(
+        operation: ClientMutationOperation,
+        revision: u64,
+        disposition: &str,
+    ) -> ReceivedOperation {
         ReceivedOperation {
             server_id: "survival".to_owned(),
-            operation: "start".to_owned(),
+            operation,
             request_id: "11111111111111111111111111111111".to_owned(),
             command_revision: revision,
             disposition: disposition.to_owned(),
@@ -1488,67 +1551,92 @@ mod tests {
 
     fn validate_test_operation(
         operation: ReceivedOperation,
+        expected_operation: ClientMutationOperation,
         expected_revision: Option<u64>,
     ) -> std::result::Result<OperationStatus, ClientError> {
         validate_mutation_success(
             operation,
             "survival",
             "11111111111111111111111111111111",
-            "start",
+            expected_operation,
             expected_revision,
         )
     }
 
     #[test]
-    fn mutation_success_requires_the_exact_next_revision() {
-        for disposition in ["accepted", "already_satisfied"] {
-            let status = validate_test_operation(received_operation(13, disposition), Some(13))
-                .expect("the exact next revision should be accepted");
-            assert_eq!(status.command_revision(), 13);
-            assert_eq!(status.disposition(), disposition);
+    fn start_and_stop_accept_only_their_two_valid_dispositions() {
+        for operation in [
+            ClientMutationOperation::Start,
+            ClientMutationOperation::Stop,
+        ] {
+            for disposition in ["accepted", "already_satisfied"] {
+                let status = validate_test_operation(
+                    received_operation(operation, 13, disposition),
+                    operation,
+                    Some(13),
+                )
+                .expect("start and stop should accept both contractual dispositions");
+                assert_eq!(status.operation(), operation.as_str());
+                assert_eq!(status.command_revision(), 13);
+                assert_eq!(status.disposition(), disposition);
+            }
+            assert!(matches!(
+                validate_test_operation(
+                    received_operation(operation, 13, "unknown"),
+                    operation,
+                    Some(13),
+                ),
+                Err(ClientError::SubmissionUncertain)
+            ));
         }
+    }
 
-        // An exact server-side replay returns the same originally expected next revision.
-        assert_eq!(
-            validate_test_operation(received_operation(13, "accepted"), Some(13))
-                .unwrap()
-                .command_revision(),
-            13
-        );
-
+    #[test]
+    fn mutation_success_requires_the_exact_next_revision() {
         for revision in [11, 12, 14, u64::MAX] {
             assert!(matches!(
-                validate_test_operation(received_operation(revision, "accepted"), Some(13)),
+                validate_test_operation(
+                    received_operation(ClientMutationOperation::Start, revision, "accepted"),
+                    ClientMutationOperation::Start,
+                    Some(13),
+                ),
                 Err(ClientError::SubmissionUncertain)
             ));
         }
         assert!(matches!(
-            validate_test_operation(received_operation(u64::MAX, "accepted"), None),
+            validate_test_operation(
+                received_operation(ClientMutationOperation::Start, u64::MAX, "accepted"),
+                ClientMutationOperation::Start,
+                None,
+            ),
             Err(ClientError::SubmissionUncertain)
         ));
     }
 
     #[test]
-    fn mutation_success_identity_and_disposition_remain_strict() {
+    fn mismatched_returned_operation_is_submission_uncertain() {
+        let returned = received_operation(ClientMutationOperation::Stop, 13, "accepted");
+        assert!(matches!(
+            validate_test_operation(returned, ClientMutationOperation::Start, Some(13),),
+            Err(ClientError::SubmissionUncertain)
+        ));
+    }
+
+    #[test]
+    fn mutation_success_server_and_request_identity_remain_strict() {
         let mut cases = Vec::new();
 
-        let mut wrong_server = received_operation(13, "accepted");
+        let mut wrong_server = received_operation(ClientMutationOperation::Start, 13, "accepted");
         wrong_server.server_id = "creative".to_owned();
         cases.push(wrong_server);
 
-        let mut wrong_request = received_operation(13, "accepted");
+        let mut wrong_request = received_operation(ClientMutationOperation::Start, 13, "accepted");
         wrong_request.request_id = "22222222222222222222222222222222".to_owned();
         cases.push(wrong_request);
 
-        let mut wrong_operation = received_operation(13, "accepted");
-        wrong_operation.operation = "stop".to_owned();
-        cases.push(wrong_operation);
-
-        cases.push(received_operation(13, "unknown"));
-
         for operation in cases {
             assert!(matches!(
-                validate_test_operation(operation, Some(13)),
+                validate_test_operation(operation, ClientMutationOperation::Start, Some(13),),
                 Err(ClientError::SubmissionUncertain)
             ));
         }
@@ -1643,23 +1731,67 @@ mod tests {
         expected.extend_from_slice(br#"{"type":"list"}"#);
         assert_eq!(frame, expected);
 
-        let restart = Request::Restart {
-            server_id: "survival".to_owned(),
-            request_id: RequestId::new("11111111111111111111111111111111".to_owned()).unwrap(),
-            expected_command_revision: 12,
-        };
-        assert_eq!(
-            encode_frame(&restart).unwrap(),
-            raw_frame(
-                PROTOCOL_VERSION,
-                br#"{"type":"restart","server_id":"survival","request_id":"11111111111111111111111111111111","expected_command_revision":12}"#,
-            )
-        );
+        for (operation, body) in [
+            (
+                ClientMutationOperation::Start,
+                br#"{"type":"start","server_id":"survival","request_id":"11111111111111111111111111111111","expected_command_revision":12}"#.as_slice(),
+            ),
+            (
+                ClientMutationOperation::Stop,
+                br#"{"type":"stop","server_id":"survival","request_id":"11111111111111111111111111111111","expected_command_revision":12}"#.as_slice(),
+            ),
+            (
+                ClientMutationOperation::Restart,
+                br#"{"type":"restart","server_id":"survival","request_id":"11111111111111111111111111111111","expected_command_revision":12}"#.as_slice(),
+            ),
+        ] {
+            let request = operation.request(
+                "survival".to_owned(),
+                RequestId::new("11111111111111111111111111111111".to_owned()).unwrap(),
+                12,
+            );
+            assert_eq!(
+                encode_frame(&request).unwrap(),
+                raw_frame(PROTOCOL_VERSION, body)
+            );
+        }
         assert!(WireErrorCode::ALL.contains(&WireErrorCode::UnsupportedOperation));
         assert_eq!(
             response_code(&constant_error_frame(WireErrorCode::UnsupportedOperation)),
             WireErrorCode::UnsupportedOperation
         );
+    }
+
+    #[tokio::test]
+    async fn exact_success_responses_decode_typed_mutation_operations() {
+        for (name, expected) in [
+            ("start", ClientMutationOperation::Start),
+            ("stop", ClientMutationOperation::Stop),
+            ("restart", ClientMutationOperation::Restart),
+        ] {
+            let body = format!(
+                r#"{{"type":"success","result":{{"type":"operation","server_id":"survival","operation":"{name}","request_id":"11111111111111111111111111111111","command_revision":13,"disposition":"accepted"}}}}"#
+            );
+            let result = client_receives(raw_frame(PROTOCOL_VERSION, body.as_bytes()))
+                .await
+                .expect("exact operation success should decode");
+            let SuccessResult::Operation(operation) = result else {
+                panic!("expected an operation success");
+            };
+            assert_eq!(operation.operation, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_success_operation_is_not_accepted_as_typed() {
+        let response = raw_frame(
+            PROTOCOL_VERSION,
+            br#"{"type":"success","result":{"type":"operation","server_id":"survival","operation":"unknown","request_id":"11111111111111111111111111111111","command_revision":13,"disposition":"accepted"}}"#,
+        );
+        assert!(matches!(
+            client_receives(response).await,
+            Err(ClientError::DaemonUnavailable)
+        ));
     }
 
     #[test]
@@ -1866,7 +1998,7 @@ mod tests {
         else {
             panic!("restart should return an operation response");
         };
-        assert_eq!(operation.operation, "restart");
+        assert_eq!(operation.operation, ClientMutationOperation::Restart);
         assert_eq!(operation.command_revision, 1);
     }
 
@@ -1874,7 +2006,7 @@ mod tests {
     fn restart_client_validation_requires_exact_identity_disposition_and_next_revision() {
         let valid = ReceivedOperation {
             server_id: "survival".to_owned(),
-            operation: "restart".to_owned(),
+            operation: ClientMutationOperation::Restart,
             request_id: "11111111111111111111111111111111".to_owned(),
             command_revision: 13,
             disposition: "accepted".to_owned(),
@@ -1884,7 +2016,7 @@ mod tests {
                 valid,
                 "survival",
                 "11111111111111111111111111111111",
-                "restart",
+                ClientMutationOperation::Restart,
                 Some(13),
             )
             .unwrap()
@@ -1901,14 +2033,14 @@ mod tests {
         ] {
             let mut invalid = ReceivedOperation {
                 server_id: "survival".to_owned(),
-                operation: "restart".to_owned(),
+                operation: ClientMutationOperation::Restart,
                 request_id: "11111111111111111111111111111111".to_owned(),
                 command_revision: 13,
                 disposition: "accepted".to_owned(),
             };
             match corrupt {
                 "server_id" => invalid.server_id = "creative".to_owned(),
-                "operation" => invalid.operation = "stop".to_owned(),
+                "operation" => invalid.operation = ClientMutationOperation::Stop,
                 "request_id" => invalid.request_id = "22222222222222222222222222222222".to_owned(),
                 "revision" => invalid.command_revision = 12,
                 "disposition" => invalid.disposition = "already_satisfied".to_owned(),
@@ -1919,7 +2051,7 @@ mod tests {
                     invalid,
                     "survival",
                     "11111111111111111111111111111111",
-                    "restart",
+                    ClientMutationOperation::Restart,
                     Some(13),
                 ),
                 Err(ClientError::SubmissionUncertain)

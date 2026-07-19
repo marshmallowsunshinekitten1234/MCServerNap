@@ -692,6 +692,9 @@ struct SupervisorControl {
     mutations: mpsc::Receiver<MutationEnvelope>,
     shutdown: oneshot::Receiver<()>,
     lifecycle: watch::Sender<LifecycleState>,
+    // Replay is limited to the last admitted (request ID, expected revision, operation).
+    // Older retries become stale after another admission; conflicts apply only to this
+    // replay slot, so reusing an older ID at the current revision is a new request.
     last_admission: Option<MutationSuccess>,
     launch_demand: bool,
     stopping_reason: Option<StoppingReason>,
@@ -4575,7 +4578,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_mutations_increment_once_and_replay_exactly() {
+    async fn exact_last_admitted_tuple_replays_without_revision_or_action() {
         let (mut control, _wake_sender, _shutdown_sender, lifecycle) =
             test_control(LifecycleState::stopped());
         let config = test_config(&Endpoint::new("127.0.0.1", 9));
@@ -4603,10 +4606,28 @@ mod tests {
             0,
             Arc::clone(&replay_gate),
         );
-        control.handle_mutation(replay, &config);
+        assert_eq!(
+            control.handle_mutation(replay, &config),
+            MutationEffect::None
+        );
         assert_eq!(replay_reply.await.unwrap().unwrap(), success);
         assert_eq!(lifecycle.borrow().command_revision, 1);
         assert!(!replay_gate.is_admitted());
+    }
+
+    #[tokio::test]
+    async fn conflicting_reuse_of_last_admitted_request_id_is_rejected() {
+        let (mut control, _wake_sender, _shutdown_sender, lifecycle) =
+            test_control(LifecycleState::stopped());
+        let config = test_config(&Endpoint::new("127.0.0.1", 9));
+        let (first, first_reply) = test_mutation(
+            MutationOperation::Start,
+            "11111111111111111111111111111111",
+            0,
+            Arc::new(AdmissionGate::pending()),
+        );
+        control.handle_mutation(first, &config);
+        first_reply.await.unwrap().unwrap();
 
         let (conflict, conflict_reply) = test_mutation(
             MutationOperation::Stop,
@@ -4620,6 +4641,51 @@ mod tests {
             Err(MutationError::RequestIdConflict)
         );
         assert_eq!(lifecycle.borrow().command_revision, 1);
+    }
+
+    #[tokio::test]
+    async fn older_exact_tuple_is_stale_after_an_intervening_admission() {
+        let (mut control, _wake_sender, _shutdown_sender, lifecycle) =
+            test_control(LifecycleState::stopped());
+        let config = test_config(&Endpoint::new("127.0.0.1", 9));
+        let (first, first_reply) = test_mutation(
+            MutationOperation::Start,
+            "11111111111111111111111111111111",
+            0,
+            Arc::new(AdmissionGate::pending()),
+        );
+        control.handle_mutation(first, &config);
+        first_reply.await.unwrap().unwrap();
+
+        let (intervening, intervening_reply) = test_mutation(
+            MutationOperation::Stop,
+            "22222222222222222222222222222222",
+            1,
+            Arc::new(AdmissionGate::pending()),
+        );
+        control.handle_mutation(intervening, &config);
+        assert_eq!(
+            intervening_reply.await.unwrap().unwrap().command_revision,
+            2
+        );
+        assert!(!control.launch_demand);
+
+        let (old_retry, old_retry_reply) = test_mutation(
+            MutationOperation::Start,
+            "11111111111111111111111111111111",
+            0,
+            Arc::new(AdmissionGate::pending()),
+        );
+        assert_eq!(
+            control.handle_mutation(old_retry, &config),
+            MutationEffect::None
+        );
+        assert_eq!(
+            old_retry_reply.await.unwrap(),
+            Err(MutationError::StaleCommandRevision)
+        );
+        assert_eq!(lifecycle.borrow().command_revision, 2);
+        assert!(!control.launch_demand);
     }
 
     #[tokio::test]
