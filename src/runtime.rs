@@ -1,14 +1,16 @@
 use std::future::Future;
+use std::io;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use tokio::io::AsyncWriteExt as _;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, lookup_host};
 use tokio::sync::{Semaphore, TryAcquireError, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::{Instant, sleep, sleep_until, timeout};
+use tokio::time::{Instant, sleep, sleep_until, timeout, timeout_at};
 
 use crate::backend_use::{
     BackendCycle, BackendUseCoordinator, BackendUseLease, LoginTransferProxySession,
@@ -23,6 +25,14 @@ use crate::supervisor::{
 };
 
 const SUPERVISOR_SHUTDOWN_MARGIN: Duration = Duration::from_secs(10);
+const BACKEND_CONNECT_ATTEMPT_LIMIT: Duration = Duration::from_secs(1);
+const BACKEND_CONNECT_ROUND_SPACING: [Duration; 5] = [
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+    Duration::from_millis(800),
+    Duration::from_secs(1),
+];
 
 fn supervisor_shutdown_wait_limit(
     command_timeout: Duration,
@@ -843,35 +853,113 @@ async fn proxy_streams(
 
 async fn connect_backend(endpoint: &Endpoint, connect_timeout: Duration) -> Result<TcpStream> {
     let deadline = Instant::now() + connect_timeout;
-    let mut last_error = None;
+    let resolution = async {
+        lookup_host((endpoint.host(), endpoint.port()))
+            .await
+            .map(Iterator::collect)
+    };
+    connect_backend_with(endpoint, deadline, resolution, TcpStream::connect).await
+}
 
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+async fn connect_backend_with<R, C, F>(
+    endpoint: &Endpoint,
+    deadline: Instant,
+    resolution: R,
+    connect: C,
+) -> Result<TcpStream>
+where
+    R: Future<Output = io::Result<Vec<SocketAddr>>>,
+    C: FnMut(SocketAddr) -> F,
+    F: Future<Output = io::Result<TcpStream>>,
+{
+    let addresses = match timeout_at(deadline, resolution).await {
+        Ok(Ok(addresses)) => addresses,
+        Ok(Err(error)) => {
+            bail!("could not resolve Minecraft backend {endpoint}: {error}")
+        }
+        Err(_) => bail!("could not resolve Minecraft backend {endpoint}: deadline expired"),
+    };
+    let mut unique_addresses = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        if !unique_addresses.contains(&address) {
+            unique_addresses.push(address);
+        }
+    }
+    ensure!(
+        !unique_addresses.is_empty(),
+        "could not resolve Minecraft backend {endpoint}: no addresses returned"
+    );
+    connect_resolved_backend(endpoint, &unique_addresses, deadline, connect).await
+}
+
+enum BackendConnectFailure {
+    Transport(io::Error),
+    TimedOut,
+}
+
+async fn connect_resolved_backend<C, F>(
+    endpoint: &Endpoint,
+    addresses: &[SocketAddr],
+    deadline: Instant,
+    mut connect: C,
+) -> Result<TcpStream>
+where
+    C: FnMut(SocketAddr) -> F,
+    F: Future<Output = io::Result<TcpStream>>,
+{
+    let mut first_address = 0;
+    let mut failed_rounds = 0usize;
+    let mut last_failure = None;
+
+    'rounds: loop {
+        let round_started_at = Instant::now();
+        if round_started_at >= deadline {
             break;
         }
-        let attempt_timeout = remaining.min(Duration::from_secs(1));
-        match timeout(
-            attempt_timeout,
-            TcpStream::connect((endpoint.host(), endpoint.port())),
-        )
-        .await
-        {
-            Ok(Ok(stream)) => return Ok(stream),
-            Ok(Err(error)) => last_error = Some(error.to_string()),
-            Err(_) => last_error = Some("connection attempt timed out".to_owned()),
+
+        for offset in 0..addresses.len() {
+            let attempt_started_at = Instant::now();
+            if attempt_started_at >= deadline {
+                break 'rounds;
+            }
+            let address = addresses[(first_address + offset) % addresses.len()];
+            let attempt_deadline =
+                (attempt_started_at + BACKEND_CONNECT_ATTEMPT_LIMIT).min(deadline);
+            match timeout_at(attempt_deadline, connect(address)).await {
+                Ok(Ok(stream)) => return Ok(stream),
+                Ok(Err(error)) => {
+                    last_failure = Some(BackendConnectFailure::Transport(error));
+                }
+                Err(_) => last_failure = Some(BackendConnectFailure::TimedOut),
+            }
         }
-        let retry_at = (Instant::now() + Duration::from_millis(100)).min(deadline);
-        sleep_until(retry_at).await;
+
+        first_address = (first_address + 1) % addresses.len();
+        let spacing = BACKEND_CONNECT_ROUND_SPACING
+            [failed_rounds.min(BACKEND_CONNECT_ROUND_SPACING.len() - 1)];
+        failed_rounds = failed_rounds.saturating_add(1);
+        let next_round_at = (round_started_at + spacing).min(deadline);
+        if Instant::now() < next_round_at {
+            sleep_until(next_round_at).await;
+        }
     }
 
-    let detail = last_error.unwrap_or_else(|| "timeout elapsed".to_owned());
-    bail!("could not connect to Minecraft backend {endpoint}: {detail}")
+    match last_failure {
+        Some(BackendConnectFailure::Transport(error)) => {
+            bail!("could not connect to Minecraft backend {endpoint}: {error}")
+        }
+        Some(BackendConnectFailure::TimedOut) => {
+            bail!("could not connect to Minecraft backend {endpoint}: connection attempt timed out")
+        }
+        None => bail!("could not connect to Minecraft backend {endpoint}: deadline expired"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use anyhow::anyhow;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -1085,6 +1173,462 @@ mod tests {
             client.expect("test client should connect"),
             accepted.expect("test listener should accept").0,
         )
+    }
+
+    fn scripted_address(host: u8) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, host], 25_566))
+    }
+
+    fn refused_connection() -> io::Error {
+        io::Error::new(io::ErrorKind::ConnectionRefused, "scripted refusal")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backend_resolution_occurs_once_across_retry_rounds() {
+        let endpoint = Endpoint::new("backend.test", 25_566);
+        let address = scripted_address(1);
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let resolution_count = Arc::clone(&resolutions);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempt_count = Arc::clone(&attempts);
+        let deadline = Instant::now() + Duration::from_millis(350);
+
+        let error = connect_backend_with(
+            &endpoint,
+            deadline,
+            async move {
+                resolution_count.fetch_add(1, Ordering::Relaxed);
+                Ok(vec![address])
+            },
+            move |_| {
+                attempt_count.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(Err(refused_connection()))
+            },
+        )
+        .await
+        .expect_err("scripted backend should remain unavailable");
+
+        assert!(error.to_string().contains("scripted refusal"));
+        assert_eq!(resolutions.load(Ordering::Relaxed), 1);
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backend_resolution_failure_is_terminal() {
+        let endpoint = Endpoint::new("backend.test", 25_566);
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let resolution_count = Arc::clone(&resolutions);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempt_count = Arc::clone(&attempts);
+        let started_at = Instant::now();
+
+        let error = connect_backend_with(
+            &endpoint,
+            started_at + Duration::from_secs(10),
+            async move {
+                resolution_count.fetch_add(1, Ordering::Relaxed);
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "scripted resolution failure",
+                ))
+            },
+            move |_| {
+                attempt_count.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(Err(refused_connection()))
+            },
+        )
+        .await
+        .expect_err("resolution failure should be terminal");
+
+        assert!(error.to_string().contains("scripted resolution failure"));
+        assert_eq!(Instant::now(), started_at);
+        assert_eq!(resolutions.load(Ordering::Relaxed), 1);
+        assert_eq!(attempts.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backend_resolution_timeout_uses_the_shared_deadline() {
+        let endpoint = Endpoint::new("backend.test", 25_566);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempt_count = Arc::clone(&attempts);
+        let (resolution_dropped, dropped) = oneshot::channel();
+        let started_at = Instant::now();
+
+        let error = connect_backend_with(
+            &endpoint,
+            started_at + Duration::from_secs(1),
+            async move {
+                let _notice = DropNotice(Some(resolution_dropped));
+                std::future::pending::<io::Result<Vec<SocketAddr>>>().await
+            },
+            move |_| {
+                attempt_count.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(Err(refused_connection()))
+            },
+        )
+        .await
+        .expect_err("resolution should expire at the connection deadline");
+
+        dropped
+            .await
+            .expect("timed-out resolution should be dropped");
+        assert!(error.to_string().contains("deadline expired"));
+        assert_eq!(Instant::now() - started_at, Duration::from_secs(1));
+        assert_eq!(attempts.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backend_empty_resolution_is_rejected() {
+        let endpoint = Endpoint::new("backend.test", 25_566);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempt_count = Arc::clone(&attempts);
+        let started_at = Instant::now();
+
+        let error = connect_backend_with(
+            &endpoint,
+            started_at + Duration::from_secs(10),
+            std::future::ready(Ok(Vec::new())),
+            move |_| {
+                attempt_count.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(Err(refused_connection()))
+            },
+        )
+        .await
+        .expect_err("empty resolution should be terminal");
+
+        assert!(error.to_string().contains("no addresses returned"));
+        assert_eq!(Instant::now(), started_at);
+        assert_eq!(attempts.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backend_resolution_deduplicates_without_reordering() {
+        let endpoint = Endpoint::new("backend.test", 25_566);
+        let first = scripted_address(1);
+        let second = scripted_address(2);
+        let third = scripted_address(3);
+        let attempted = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&attempted);
+
+        connect_backend_with(
+            &endpoint,
+            Instant::now() + Duration::from_millis(1),
+            std::future::ready(Ok(vec![first, second, first, third, second])),
+            move |address| {
+                recorded.lock().unwrap().push(address);
+                std::future::ready(Err(refused_connection()))
+            },
+        )
+        .await
+        .expect_err("every unique address should refuse");
+
+        assert_eq!(*attempted.lock().unwrap(), vec![first, second, third]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backend_first_round_falls_back_without_sleeping() {
+        let endpoint = Endpoint::new("backend.test", 25_566);
+        let first = scripted_address(1);
+        let second = scripted_address(2);
+        let (successful_stream, peer) = connected_pair().await;
+        let mut successful_stream = Some(successful_stream);
+        let attempted = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&attempted);
+
+        let connected = connect_backend_with(
+            &endpoint,
+            Instant::now() + Duration::from_secs(10),
+            std::future::ready(Ok(vec![first, second])),
+            move |address| {
+                recorded.lock().unwrap().push((Instant::now(), address));
+                std::future::ready(if address == first {
+                    Err(refused_connection())
+                } else {
+                    Ok(successful_stream.take().unwrap())
+                })
+            },
+        )
+        .await
+        .expect("the second resolved address should connect");
+
+        let attempts = attempted.lock().unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].1, first);
+        assert_eq!(attempts[1].1, second);
+        assert_eq!(attempts[0].0, attempts[1].0);
+        drop((attempts, connected, peer));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backend_failed_rounds_rotate_the_first_address() {
+        let endpoint = Endpoint::new("backend.test", 25_566);
+        let first = scripted_address(1);
+        let second = scripted_address(2);
+        let third = scripted_address(3);
+        let attempted = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&attempted);
+
+        connect_backend_with(
+            &endpoint,
+            Instant::now() + Duration::from_millis(101),
+            std::future::ready(Ok(vec![first, second, third])),
+            move |address| {
+                recorded.lock().unwrap().push(address);
+                std::future::ready(Err(refused_connection()))
+            },
+        )
+        .await
+        .expect_err("both rounds should fail");
+
+        assert_eq!(
+            *attempted.lock().unwrap(),
+            vec![first, second, third, second, third, first]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backend_immediate_refusal_uses_the_exact_capped_round_schedule() {
+        let endpoint = Endpoint::new("backend.test", 25_566);
+        let address = scripted_address(1);
+        let started_at = Instant::now();
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&attempts);
+
+        connect_backend_with(
+            &endpoint,
+            started_at + Duration::from_secs(10),
+            std::future::ready(Ok(vec![address])),
+            move |_| {
+                recorded.lock().unwrap().push(Instant::now() - started_at);
+                std::future::ready(Err(refused_connection()))
+            },
+        )
+        .await
+        .expect_err("backend should refuse through the deadline");
+
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            vec![
+                Duration::ZERO,
+                Duration::from_millis(100),
+                Duration::from_millis(300),
+                Duration::from_millis(700),
+                Duration::from_millis(1_500),
+                Duration::from_millis(2_500),
+                Duration::from_millis(3_500),
+                Duration::from_millis(4_500),
+                Duration::from_millis(5_500),
+                Duration::from_millis(6_500),
+                Duration::from_millis(7_500),
+                Duration::from_millis(8_500),
+                Duration::from_millis(9_500),
+            ]
+        );
+        assert_eq!(Instant::now() - started_at, Duration::from_secs(10));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backend_timed_out_attempts_do_not_add_expired_round_spacing() {
+        let endpoint = Endpoint::new("backend.test", 25_566);
+        let address = scripted_address(1);
+        let started_at = Instant::now();
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&attempts);
+
+        connect_backend_with(
+            &endpoint,
+            started_at + Duration::from_millis(2_500),
+            std::future::ready(Ok(vec![address])),
+            move |_| {
+                recorded.lock().unwrap().push(Instant::now() - started_at);
+                std::future::pending::<io::Result<TcpStream>>()
+            },
+        )
+        .await
+        .expect_err("pending attempts should consume the deadline");
+
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            vec![
+                Duration::ZERO,
+                Duration::from_secs(1),
+                Duration::from_secs(2)
+            ]
+        );
+        assert_eq!(Instant::now() - started_at, Duration::from_millis(2_500));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backend_resolution_and_attempts_share_one_nonrenewable_deadline() {
+        let endpoint = Endpoint::new("backend.test", 25_566);
+        let address = scripted_address(1);
+        let started_at = Instant::now();
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&attempts);
+
+        connect_backend_with(
+            &endpoint,
+            started_at + Duration::from_secs(1),
+            async move {
+                sleep(Duration::from_millis(600)).await;
+                Ok(vec![address])
+            },
+            move |_| {
+                recorded.lock().unwrap().push(Instant::now() - started_at);
+                std::future::pending::<io::Result<TcpStream>>()
+            },
+        )
+        .await
+        .expect_err("the attempt should receive only the resolution remainder");
+
+        assert_eq!(*attempts.lock().unwrap(), vec![Duration::from_millis(600)]);
+        assert_eq!(Instant::now() - started_at, Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backend_attempt_never_starts_at_the_deadline() {
+        let endpoint = Endpoint::new("backend.test", 25_566);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempt_count = Arc::clone(&attempts);
+
+        connect_resolved_backend(
+            &endpoint,
+            &[scripted_address(1)],
+            Instant::now(),
+            move |_| {
+                attempt_count.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(Err(refused_connection()))
+            },
+        )
+        .await
+        .expect_err("an expired deadline should be terminal");
+
+        assert_eq!(attempts.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backend_success_after_failures_stops_retrying() {
+        let endpoint = Endpoint::new("backend.test", 25_566);
+        let address = scripted_address(1);
+        let (successful_stream, peer) = connected_pair().await;
+        let mut successful_stream = Some(successful_stream);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempt_count = Arc::clone(&attempts);
+
+        let connected = connect_backend_with(
+            &endpoint,
+            Instant::now() + Duration::from_secs(10),
+            std::future::ready(Ok(vec![address])),
+            move |_| {
+                let attempt = attempt_count.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(if attempt == 2 {
+                    Ok(successful_stream.take().unwrap())
+                } else {
+                    Err(refused_connection())
+                })
+            },
+        )
+        .await
+        .expect("the third attempt should succeed");
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+        drop((connected, peer));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backend_cancellation_during_resolution_drops_the_future() {
+        let endpoint = Endpoint::new("backend.test", 25_566);
+        let (started, resolution_started) = oneshot::channel();
+        let (dropped, resolution_dropped) = oneshot::channel();
+
+        let task = tokio::spawn(async move {
+            connect_backend_with(
+                &endpoint,
+                Instant::now() + Duration::from_secs(10),
+                async move {
+                    started.send(()).unwrap();
+                    let _notice = DropNotice(Some(dropped));
+                    std::future::pending::<io::Result<Vec<SocketAddr>>>().await
+                },
+                |_| std::future::ready(Err(refused_connection())),
+            )
+            .await
+        });
+        resolution_started.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        resolution_dropped
+            .await
+            .expect("resolution future should drop on cancellation");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backend_cancellation_during_attempt_drops_the_future() {
+        let endpoint = Endpoint::new("backend.test", 25_566);
+        let address = scripted_address(1);
+        let (started, attempt_started) = oneshot::channel();
+        let (dropped, attempt_dropped) = oneshot::channel();
+        let mut started = Some(started);
+        let mut dropped = Some(dropped);
+
+        let task = tokio::spawn(async move {
+            connect_backend_with(
+                &endpoint,
+                Instant::now() + Duration::from_secs(10),
+                std::future::ready(Ok(vec![address])),
+                move |_| {
+                    let started = started.take().unwrap();
+                    let dropped = dropped.take().unwrap();
+                    async move {
+                        started.send(()).unwrap();
+                        let _notice = DropNotice(Some(dropped));
+                        std::future::pending::<io::Result<TcpStream>>().await
+                    }
+                },
+            )
+            .await
+        });
+        attempt_started.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        attempt_dropped
+            .await
+            .expect("connection attempt should drop on cancellation");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backend_cancellation_during_backoff_drops_the_task() {
+        let endpoint = Endpoint::new("backend.test", 25_566);
+        let address = scripted_address(1);
+        let (started, attempt_started) = oneshot::channel();
+        let (dropped, task_dropped) = oneshot::channel();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempt_count = Arc::clone(&attempts);
+        let mut started = Some(started);
+
+        let task = tokio::spawn(async move {
+            let _notice = DropNotice(Some(dropped));
+            connect_backend_with(
+                &endpoint,
+                Instant::now() + Duration::from_secs(10),
+                std::future::ready(Ok(vec![address])),
+                move |_| {
+                    attempt_count.fetch_add(1, Ordering::Relaxed);
+                    started.take().unwrap().send(()).unwrap();
+                    std::future::ready(Err(refused_connection()))
+                },
+            )
+            .await
+        });
+        attempt_started.await.unwrap();
+        tokio::time::advance(Duration::from_millis(50)).await;
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        task_dropped
+            .await
+            .expect("backoff task should drop on cancellation");
     }
 
     async fn parsed_connection(
