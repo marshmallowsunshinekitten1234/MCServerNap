@@ -10,6 +10,8 @@ use super::*;
 use crate::runtime::RuntimeControlHandle;
 use crate::supervisor::{FailureCategory, LifecycleState};
 
+const INCOMPATIBLE_PROTOCOL_VERSION: u16 = u16::MAX;
+
 fn raw_frame(version: u16, body: &[u8]) -> Vec<u8> {
     let payload_length = u32::try_from(body.len() + 2).unwrap();
     let mut frame = Vec::with_capacity(body.len() + 6);
@@ -260,9 +262,9 @@ fn client_rejects_empty_duplicate_and_unsorted_server_lists() {
 }
 
 #[test]
-fn frame_bytes_are_exact_big_endian_protocol_v2() {
+fn frame_bytes_are_exact_big_endian_protocol_v1() {
     let frame = encode_frame(&Request::List).unwrap();
-    let mut expected = vec![0, 0, 0, 17, 0, 2];
+    let mut expected = vec![0, 0, 0, 17, 0, 1];
     expected.extend_from_slice(br#"{"type":"list"}"#);
     assert_eq!(frame, expected);
 
@@ -659,7 +661,7 @@ async fn thirty_third_mutation_is_rejected_without_waiting() {
 async fn truncated_headers_and_bodies_are_malformed() {
     for request in [
         vec![0, 0, 0],
-        [10_u32.to_be_bytes().as_slice(), &[0, 2], b"{}"].concat(),
+        [10_u32.to_be_bytes().as_slice(), &[0, 1], b"{}"].concat(),
     ] {
         let (registry, _authority) =
             one_server_registry(LifecycleState::test_phase(ServerPhase::Stopped));
@@ -672,16 +674,16 @@ async fn truncated_headers_and_bodies_are_malformed() {
 }
 
 #[tokio::test]
-async fn version_two_succeeds_and_other_versions_skip_json() {
+async fn version_one_succeeds_and_other_versions_skip_json() {
     let (registry, _authority) =
         one_server_registry(LifecycleState::test_phase(ServerPhase::Stopped));
-    let response = exchange(&raw_frame(2, br#"{"type":"list"}"#), registry).await;
+    let response = exchange(&raw_frame(1, br#"{"type":"list"}"#), registry).await;
     assert!(matches!(
         serde_json::from_slice::<Response>(frame_body(&response)).unwrap(),
         Response::Success { .. }
     ));
 
-    for version in [0, 1, 3] {
+    for version in [0, INCOMPATIBLE_PROTOCOL_VERSION] {
         let (registry, _authority) =
             one_server_registry(LifecycleState::test_phase(ServerPhase::Stopped));
         let response = exchange(&raw_frame(version, &[0xff, 0xff]), registry).await;
@@ -696,16 +698,19 @@ async fn version_two_succeeds_and_other_versions_skip_json() {
 async fn incompatible_response_version_is_observed_without_reading_json() {
     let (mut writer, mut reader) = tokio::io::duplex(16);
     writer.write_all(&65_536_u32.to_be_bytes()).await.unwrap();
-    writer.write_all(&1_u16.to_be_bytes()).await.unwrap();
+    writer
+        .write_all(&INCOMPATIBLE_PROTOCOL_VERSION.to_be_bytes())
+        .await
+        .unwrap();
     let ReadFrame::Version { version, body } = read_frame(&mut reader).await.unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version, INCOMPATIBLE_PROTOCOL_VERSION);
     assert!(body.is_empty());
 }
 
 #[tokio::test]
 async fn client_classifies_protocol_unknown_and_malformed_daemon_responses() {
     assert!(matches!(
-        client_receives(raw_frame(1, &[0xff])).await,
+        client_receives(raw_frame(INCOMPATIBLE_PROTOCOL_VERSION, &[0xff])).await,
         Err(ClientError::ProtocolMismatch)
     ));
     assert!(matches!(
@@ -718,10 +723,10 @@ async fn client_classifies_protocol_unknown_and_malformed_daemon_responses() {
     ));
     for malformed in [
         Vec::new(),
-        raw_frame(2, b"not json"),
-        raw_frame(2, br#"{"type":"success","result":{"type":"list"}}"#),
+        raw_frame(1, b"not json"),
+        raw_frame(1, br#"{"type":"success","result":{"type":"list"}}"#),
         raw_frame(
-            2,
+            1,
             br#"{"type":"success","result":{"type":"list","servers":[],"extra":1}}"#,
         ),
     ] {
@@ -733,7 +738,7 @@ async fn client_classifies_protocol_unknown_and_malformed_daemon_responses() {
 }
 
 #[tokio::test]
-async fn client_maps_every_protocol_v2_error_code() {
+async fn client_maps_every_protocol_v1_error_code() {
     for code in WireErrorCode::ALL {
         let Err(error) = client_receives(constant_error_frame(code)).await else {
             panic!("wire errors must not be successful client results");
@@ -801,7 +806,7 @@ fn preflight_rejects_oversized_list_and_worst_case_status() {
         .err()
         .unwrap()
         .to_string();
-    assert!(list_error.contains("control protocol v2 response limit"));
+    assert!(list_error.contains("control protocol v1 response limit"));
     assert!(list_error.contains("complete server list"));
 
     let status_id = format!("a{}", "x".repeat(65_350));
@@ -809,7 +814,7 @@ fn preflight_rejects_oversized_list_and_worst_case_status() {
         .err()
         .unwrap()
         .to_string();
-    assert!(status_error.contains("control protocol v2 response limit"));
+    assert!(status_error.contains("control protocol v1 response limit"));
     assert!(status_error.contains("worst-case server status"));
 }
 
@@ -1007,7 +1012,7 @@ async fn one_absolute_deadline_covers_slow_header_body_and_write() {
 
     let (registry, _authority) =
         one_server_registry(LifecycleState::test_phase(ServerPhase::Stopped));
-    let partial_body = [100_u32.to_be_bytes().as_slice(), &[0, 2], b"{"].concat();
+    let partial_body = [100_u32.to_be_bytes().as_slice(), &[0, 1], b"{"].concat();
     assert_eq!(
         deadline_case(registry, &partial_body, 64)
             .await

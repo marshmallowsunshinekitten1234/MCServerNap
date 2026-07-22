@@ -159,7 +159,7 @@ where
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             bail!(
-                "listener configuration {} is missing; create a schema-v3 configuration from config.example.toml",
+                "listener configuration {} is missing; create a schema-v1 configuration from config.example.toml",
                 absolute_path.display()
             )
         }
@@ -177,7 +177,7 @@ where
         .with_context(|| format!("invalid configuration at {}", absolute_path.display()))?;
     let document: ConfigDocument = toml::from_str(&contents)
         .with_context(|| format!("invalid configuration at {}", absolute_path.display()))?;
-    debug_assert_eq!(document.schema_version, 3);
+    debug_assert_eq!(document.schema_version, 1);
     validate_document(&document)?;
 
     let config_directory = absolute_path
@@ -199,9 +199,9 @@ fn inspect_schema_version(contents: &str) -> Result<()> {
         .get("schema_version")
         .and_then(toml::Value::as_integer)
     {
-        Some(3) => Ok(()),
-        Some(version) => bail!("unsupported schema_version {version}; expected 3"),
-        None => bail!("unsupported schema_version: missing or non-integer; expected 3"),
+        Some(1) => Ok(()),
+        Some(version) => bail!("unsupported schema_version {version}; expected 1"),
+        None => bail!("unsupported schema_version: missing or non-integer; expected 1"),
     }
 }
 
@@ -784,7 +784,7 @@ password_env = "TEST_RCON_PASSWORD"
             ""
         };
         format!(
-            r#"schema_version = 3
+            r#"schema_version = 1
 max_connections = {max_connections}
 
 [servers.survival]
@@ -857,7 +857,7 @@ bold = true
     fn accepts_complete_schema_with_optional_rcon_present_or_absent() {
         for rcon in [false, true] {
             let (directory, path) = write_config(&complete_config(512, rcon));
-            let prepared = load_test(&path).expect("schema v3 should prepare");
+            let prepared = load_test(&path).expect("schema v1 should prepare");
             assert_eq!(prepared.servers.len(), 1);
             assert_eq!(
                 prepared.servers["survival"]
@@ -873,14 +873,10 @@ bold = true
 
     #[test]
     fn schema_version_is_checked_before_complete_deserialization() {
-        for contents in [
-            "max_connections = 1",
-            "schema_version = 2\nunknown = true",
-            "schema_version = 4",
-        ] {
+        for contents in ["max_connections = 1", "schema_version = 0\nunknown = true"] {
             let error = inspect_schema_version(contents).expect_err("version must be rejected");
             assert!(error.to_string().contains("schema_version"));
-            assert!(error.to_string().contains("expected 3"));
+            assert!(error.to_string().contains("expected 1"));
         }
     }
 
@@ -902,7 +898,7 @@ bold = true
     #[test]
     fn rejects_empty_servers_and_invalid_ids() {
         let empty: ConfigDocument =
-            toml::from_str("schema_version=3\nmax_connections=1\nservers={}").unwrap();
+            toml::from_str("schema_version=1\nmax_connections=1\nservers={}").unwrap();
         assert!(validate_document(&empty).is_err());
         for id in ["", "Upper", "-start", "end-", "two--parts", "under_score"] {
             let expected = id != "two--parts";
@@ -930,7 +926,7 @@ bold = true
             .err()
             .expect("missing configuration must fail");
         let message = error.to_string();
-        assert!(message.contains("schema-v3"));
+        assert!(message.contains("schema-v1"));
         assert!(message.contains("config.example.toml"));
         assert!(!directory.exists());
     }

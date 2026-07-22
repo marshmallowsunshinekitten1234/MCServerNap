@@ -137,7 +137,7 @@ process to exit.
 
 ## Configuration notes
 
-Start from the example file and leave `schema_version = 3` unchanged. For
+Start from the example file and leave `schema_version = 1` unchanged. For
 another server, copy the complete `[servers.<id>]` section and use a different
 public listener port, private Minecraft (`backend`) port, and working directory.
 Relative paths start from the directory containing the configuration file.

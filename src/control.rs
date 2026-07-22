@@ -27,7 +27,7 @@ pub(crate) use unix::{BoundEndpoint, InstanceLock};
 #[cfg(windows)]
 pub(crate) use windows::{BoundEndpoint, InstanceLock};
 
-const PROTOCOL_VERSION: u16 = 2;
+const PROTOCOL_VERSION: u16 = 1;
 const MAX_PAYLOAD_LENGTH: u32 = 65_536;
 const MAX_CONTROL_EXCHANGES: usize = 32;
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -641,7 +641,7 @@ impl PreparedRegistry {
         };
         let list_response = encode_frame(&list).map_err(|error| {
             anyhow::anyhow!(
-                "control protocol v2 response limit exceeded by the complete server list: {error}"
+                "control protocol v1 response limit exceeded by the complete server list: {error}"
             )
         })?;
 
@@ -665,7 +665,7 @@ impl PreparedRegistry {
         };
         encode_frame(&worst_case).map_err(|error| {
             anyhow::anyhow!(
-                "control protocol v2 response limit exceeded by a worst-case server status: {error}"
+                "control protocol v1 response limit exceeded by a worst-case server status: {error}"
             )
         })?;
 
@@ -684,7 +684,7 @@ impl PreparedRegistry {
             };
             encode_frame(&worst_case).map_err(|error| {
                 anyhow::anyhow!(
-                    "control protocol v2 response limit exceeded by a worst-case {operation} success: {error}"
+                    "control protocol v1 response limit exceeded by a worst-case {operation} success: {error}"
                 )
             })?;
         }
@@ -698,7 +698,7 @@ impl PreparedRegistry {
             })
             .map_err(|error| {
                 anyhow::anyhow!(
-                    "control protocol v2 response limit exceeded by the {code:?} error: {error}"
+                    "control protocol v1 response limit exceeded by the {code:?} error: {error}"
                 )
             })?;
         }
@@ -1141,7 +1141,7 @@ fn retry_milliseconds(retry_at: Instant, snapshot_now: Instant) -> u64 {
     let remaining = retry_at.saturating_duration_since(snapshot_now);
     let milliseconds = remaining.as_millis();
     let rounded = milliseconds + u128::from(!remaining.subsec_nanos().is_multiple_of(1_000_000));
-    u64::try_from(rounded).expect("supervisor retry delays must fit the v2 millisecond field")
+    u64::try_from(rounded).expect("supervisor retry delays must fit the v1 millisecond field")
 }
 
 fn error_frame(code: WireErrorCode, message: &'static str) -> Vec<u8> {
@@ -1149,7 +1149,7 @@ fn error_frame(code: WireErrorCode, message: &'static str) -> Vec<u8> {
         response_type: "error",
         error: ErrorFields { code, message },
     })
-    .expect("protocol-v2 error responses are bounded constants")
+    .expect("protocol-v1 error responses are bounded constants")
 }
 
 fn constant_error_frame(code: WireErrorCode) -> Vec<u8> {

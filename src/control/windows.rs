@@ -372,7 +372,7 @@ mod tests {
         let locator = directory.join("locator");
         let valid_pipe = random_pipe_name().unwrap();
         let invalid = [
-            br#"{"version":2,"pipe":"\\\\.\\pipe\\mcservernap-control-00000000000000000000000000000000"}"#.as_slice(),
+            br#"{"version":0,"pipe":"\\\\.\\pipe\\mcservernap-control-00000000000000000000000000000000"}"#.as_slice(),
             br#"{"version":1,"pipe":"\\\\server\\pipe\\mcservernap-control-00000000000000000000000000000000"}"#,
             br#"{"version":1,"pipe":"\\\\.\\pipe\\mcservernap-control-ABCDEF00000000000000000000000000"}"#,
             br#"{"version":1,"pipe":"\\\\.\\pipe\\mcservernap-control-short"}"#,
@@ -467,7 +467,7 @@ mod tests {
             .unwrap();
         malformed.write_all(&[0, 0, 0, 1]).await.unwrap();
         let ReadFrame::Version { version, body } = read_frame(&mut malformed).await.unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 1);
         assert!(matches!(
             serde_json::from_slice::<Response>(&body).unwrap(),
             Response::Error { .. }
@@ -482,7 +482,7 @@ mod tests {
             .await
             .unwrap();
         let ReadFrame::Version { version, body } = read_frame(&mut client).await.unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 1);
         assert!(matches!(
             serde_json::from_slice::<Response>(&body).unwrap(),
             Response::Success {

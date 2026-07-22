@@ -17,7 +17,7 @@ use tokio::time::timeout;
     about = "Wake Minecraft Java servers on demand and stop them when idle"
 )]
 struct Cli {
-    /// Schema-v3 configuration file used only by the listener daemon.
+    /// Schema-v1 configuration file used only by the listener daemon.
     #[arg(
         long,
         global = true,

@@ -573,7 +573,7 @@ impl BoundDaemon {
                         ControlServer::new(endpoint, registry)
                             .run(shutdown_receiver, stopped_sender),
                     ));
-                    log::info!("Local control protocol v2 is ready");
+                    log::info!("Local control protocol v1 is ready");
                 }
                 Err(error) => {
                     shutdown.fail(error.context("control registry activation failed"));

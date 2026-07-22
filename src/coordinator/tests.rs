@@ -107,7 +107,7 @@ fn write_two_server_config(
     fs::create_dir_all(directory.join("creative")).unwrap();
     fs::create_dir_all(directory.join("survival")).unwrap();
     let contents = format!(
-        "schema_version = 3\nmax_connections = 1\n{}{}",
+        "schema_version = 1\nmax_connections = 1\n{}{}",
         server_table(
             "creative",
             listener_address,
@@ -139,7 +139,7 @@ fn write_three_server_config(
         fs::create_dir_all(directory.join(server)).unwrap();
     }
     let contents = format!(
-        "schema_version = 3\nmax_connections = 3\n{}{}{}",
+        "schema_version = 1\nmax_connections = 3\n{}{}{}",
         server_table(
             "alpha",
             listener_address,
