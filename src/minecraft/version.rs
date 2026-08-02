@@ -5,6 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum InitialProtocol {
+    NoUuid,
     OptionalUuid,
     RequiredUuid,
     RequiredUuidAndTransfer,
@@ -27,6 +28,7 @@ impl VersionProfile {
     }
 }
 
+const NO_UUID: InitialProtocol = InitialProtocol::NoUuid;
 const OPTIONAL_UUID: InitialProtocol = InitialProtocol::OptionalUuid;
 const REQUIRED_UUID: InitialProtocol = InitialProtocol::RequiredUuid;
 const REQUIRED_UUID_AND_TRANSFER: InitialProtocol = InitialProtocol::RequiredUuidAndTransfer;
@@ -35,6 +37,64 @@ const REQUIRED_UUID_AND_TRANSFER: InitialProtocol = InitialProtocol::RequiredUui
 // Protocol mappings/layouts: https://github.com/PrismarineJS/minecraft-data/tree/master/data/pc
 // Keep entries in release order; the final entry is the default.
 const SUPPORTED_VERSIONS: &[VersionProfile] = &[
+    VersionProfile::new("1.7.2", 4, NO_UUID),
+    VersionProfile::new("1.7.3", 4, NO_UUID),
+    VersionProfile::new("1.7.4", 4, NO_UUID),
+    VersionProfile::new("1.7.5", 4, NO_UUID),
+    VersionProfile::new("1.7.6", 5, NO_UUID),
+    VersionProfile::new("1.7.7", 5, NO_UUID),
+    VersionProfile::new("1.7.8", 5, NO_UUID),
+    VersionProfile::new("1.7.9", 5, NO_UUID),
+    VersionProfile::new("1.7.10", 5, NO_UUID),
+    VersionProfile::new("1.8", 47, NO_UUID),
+    VersionProfile::new("1.8.1", 47, NO_UUID),
+    VersionProfile::new("1.8.2", 47, NO_UUID),
+    VersionProfile::new("1.8.3", 47, NO_UUID),
+    VersionProfile::new("1.8.4", 47, NO_UUID),
+    VersionProfile::new("1.8.5", 47, NO_UUID),
+    VersionProfile::new("1.8.6", 47, NO_UUID),
+    VersionProfile::new("1.8.7", 47, NO_UUID),
+    VersionProfile::new("1.8.8", 47, NO_UUID),
+    VersionProfile::new("1.8.9", 47, NO_UUID),
+    VersionProfile::new("1.9", 107, NO_UUID),
+    VersionProfile::new("1.9.1", 108, NO_UUID),
+    VersionProfile::new("1.9.2", 109, NO_UUID),
+    VersionProfile::new("1.9.3", 110, NO_UUID),
+    VersionProfile::new("1.9.4", 110, NO_UUID),
+    VersionProfile::new("1.10", 210, NO_UUID),
+    VersionProfile::new("1.10.1", 210, NO_UUID),
+    VersionProfile::new("1.10.2", 210, NO_UUID),
+    VersionProfile::new("1.11", 315, NO_UUID),
+    VersionProfile::new("1.11.1", 316, NO_UUID),
+    VersionProfile::new("1.11.2", 316, NO_UUID),
+    VersionProfile::new("1.12", 335, NO_UUID),
+    VersionProfile::new("1.12.1", 338, NO_UUID),
+    VersionProfile::new("1.12.2", 340, NO_UUID),
+    VersionProfile::new("1.13", 393, NO_UUID),
+    VersionProfile::new("1.13.1", 401, NO_UUID),
+    VersionProfile::new("1.13.2", 404, NO_UUID),
+    VersionProfile::new("1.14", 477, NO_UUID),
+    VersionProfile::new("1.14.1", 480, NO_UUID),
+    VersionProfile::new("1.14.2", 485, NO_UUID),
+    VersionProfile::new("1.14.3", 490, NO_UUID),
+    VersionProfile::new("1.14.4", 498, NO_UUID),
+    VersionProfile::new("1.15", 573, NO_UUID),
+    VersionProfile::new("1.15.1", 575, NO_UUID),
+    VersionProfile::new("1.15.2", 578, NO_UUID),
+    VersionProfile::new("1.16", 735, NO_UUID),
+    VersionProfile::new("1.16.1", 736, NO_UUID),
+    VersionProfile::new("1.16.2", 751, NO_UUID),
+    VersionProfile::new("1.16.3", 753, NO_UUID),
+    VersionProfile::new("1.16.4", 754, NO_UUID),
+    VersionProfile::new("1.16.5", 754, NO_UUID),
+    VersionProfile::new("1.17", 755, NO_UUID),
+    VersionProfile::new("1.17.1", 756, NO_UUID),
+    VersionProfile::new("1.18", 757, NO_UUID),
+    VersionProfile::new("1.18.1", 757, NO_UUID),
+    VersionProfile::new("1.18.2", 758, NO_UUID),
+    VersionProfile::new("1.19.3", 761, OPTIONAL_UUID),
+    VersionProfile::new("1.19.4", 762, OPTIONAL_UUID),
+    VersionProfile::new("1.20", 763, OPTIONAL_UUID),
     VersionProfile::new("1.20.1", 763, OPTIONAL_UUID),
     VersionProfile::new("1.20.2", 764, REQUIRED_UUID),
     VersionProfile::new("1.20.3", 765, REQUIRED_UUID),
@@ -183,7 +243,12 @@ mod tests {
     fn catalogue_assigns_initial_protocols_by_protocol_number() {
         for version in MinecraftVersion::supported() {
             match version.initial_protocol() {
-                InitialProtocol::OptionalUuid => assert_eq!(version.protocol(), 763),
+                InitialProtocol::NoUuid => {
+                    assert!(version.protocol() <= 758);
+                }
+                InitialProtocol::OptionalUuid => {
+                    assert!((761..=763).contains(&version.protocol()));
+                }
                 InitialProtocol::RequiredUuid => {
                     assert!((764..=765).contains(&version.protocol()));
                 }

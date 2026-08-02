@@ -425,6 +425,9 @@ fn parse_login_start(packet: &[u8], minecraft_version: MinecraftVersion) -> Resu
         InitialProtocol::RequiredUuid | InitialProtocol::RequiredUuidAndTransfer => {
             cursor.read_bytes(16)?;
         }
+        InitialProtocol::NoUuid => {
+            // no-op on older versions that do not include a UUID
+        }
     }
     cursor.ensure_finished()
 }
@@ -1157,6 +1160,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn minecraft_1_18_2_login_request_accepts_username_only() {
+        let minecraft_version = version_named("1.18.2");
+        let handshake = encode_handshake(minecraft_version.protocol(), "localhost", 25565, 2);
+        let mut exchange = frame_raw_packet(&handshake);
+        exchange.extend_from_slice(&frame_raw_packet(&encode_login_start_prefix("player")));
+
+        assert_eq!(
+            read_sleeping_exchange(&exchange, minecraft_version)
+                .await
+                .expect("1.18.2 login exchange should parse"),
+            Some(ClientRequest::Login {
+                intent: LoginIntent::Login
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn minecraft_1_20_1_login_request_accepts_absent_uuid() {
         let minecraft_version = version_named("1.20.1");
         let handshake = encode_handshake(minecraft_version.protocol(), "localhost", 25565, 2);
@@ -1220,6 +1240,20 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn no_uuid_login_start_accepts_username_only() {
+        let valid = encode_login_start_prefix("player");
+        for minecraft_version in MinecraftVersion::supported()
+            .filter(|version| version.initial_protocol() == InitialProtocol::NoUuid)
+        {
+            assert!(parse_login_start(&valid, minecraft_version).is_ok());
+
+            let mut trailing = valid.clone();
+            trailing.push(0);
+            assert!(parse_login_start(&trailing, minecraft_version).is_err());
+        }
     }
 
     #[test]
