@@ -6,8 +6,10 @@ server-list requests. A player joining that port starts the server and is asked
 to reconnect shortly. Once the backend is ready, MCServerNap proxies connections
 to it and stops servers it started after they have been idle long enough.
 
-It supports stable Java releases from 1.20.1 through 26.2. Multiple servers can
-run under one daemon, but each needs its own public listener port.
+It supports stable Java releases from 1.7.2 through 26.2.
+If any release is causing problems, please open an issue to let me know.
+Multiple servers can run under one daemon,
+but each needs its own public listener port.
 
 ## Requirements
 
