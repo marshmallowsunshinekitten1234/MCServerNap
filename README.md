@@ -1,139 +1,114 @@
 # MCServerNap
 
-*A lightweight, serverless Minecraft server watcher and auto-starter.*
+MCServerNap lets local Minecraft Java servers sleep when nobody is using them.
+While a server is stopped, MCServerNap keeps its public port online and answers
+server-list requests. A player joining that port starts the server and is asked
+to reconnect shortly. Once the backend is ready, MCServerNap proxies connections
+to it and stops servers it started after they have been idle long enough.
 
-## Overview
+It supports stable Java releases from 1.7.2 through 26.2.
+If any release is causing problems, please open an issue to let me know.
+Multiple servers can run under one daemon,
+but each needs its own public listener port.
 
-`mcservernap` monitors incoming Minecraft client connections and automatically launches (and later stops) a local Minecraft server process via RCON. It enables you to avoid running your server 24/7 by:
+## Requirements
 
-* Listening for the first legitimate Minecraft **LoginStart** handshake.
-* Spinning up the server process on-demand when a player attempts to join.
-* Watching the server via RCON for player activity.
-* Stopping the server after an idle timeout.
+- Rust 1.88 or newer to build MCServerNap.
+- An existing Minecraft Java server and a command that starts it.
+- Separate ports for the public listener and the Minecraft backend.
+- Optional RCON access for stronger readiness and player-count checks.
 
-<img width="657" height="94" alt="screenshot of server browser view" src="https://github.com/user-attachments/assets/dae15e22-849e-4469-bae9-df17cc94636b" />
-<img width="966" height="261" alt="screenshot of connect message" src="https://github.com/user-attachments/assets/ca128f11-5e7a-4666-a03c-6d56235385db" />
+Only expose the MCServerNap listener publicly. Keep the backend and RCON ports
+on a trusted local interface.
 
+## Quick start
 
-There is also a `stop` subcommand to immediately send a `/stop` command via RCON.
+Build the release binary:
 
-## Features
+```console
+git clone https://github.com/marshmallowsunshinekitten1234/MCServerNap.git
+cd MCServerNap
+cargo build --locked --release
+```
 
-* **On-demand startup**: server only runs when a player actually joins.
-* **Idle shutdown**: automatically stops server when no players remain for a set duration.
-* **Cross-platform**: spawns a new terminal window on Windows, runs directly on Linux systems.
-* **Extensible**: configure RCON settings, startup command and ports.
+Copy [config.example.toml](config.example.toml) to `config/cfg.toml`, then edit
+the server version, ports, launch command, working directory, messages, and
+timeouts. Also point `icon_path` to a PNG you have, or remove that line.
 
-## Installation
+The example includes RCON. Set its password environment variable before
+starting MCServerNap:
 
-1. Ensure you have Rust and Cargo installed (see [rustup.rs](https://rustup.rs)).
-2. Clone this repository:
-
-   ```bash
-   git clone https://github.com/yourusername/MCServerNap.git
-   cd MCServerNap
-   ```
-3. Build the binary:
-
-   ```bash
-   cargo build --release
-   ```
-
-   The executable can be found under `target/release/mcservernap.exe`
-4. (Optional) If you wish to install globally:
-
-   ```bash
-   cargo install --path .
-   ```
-
-## Usage
+```powershell
+$env:MCSERVERNAP_SURVIVAL_RCON_PASSWORD = "replace-with-your-password"
+target\release\mcservernap.exe listen
+```
 
 ```bash
-mcservernap <COMMAND> [OPTIONS]
+export MCSERVERNAP_SURVIVAL_RCON_PASSWORD='replace-with-your-password'
+target/release/mcservernap listen
 ```
 
-### Subcommands
+If you do not use RCON, remove the complete `[servers.survival.rcon]` table
+instead. Use `--config <path>` or `MCSERVERNAP_CONFIG` when the file is not at
+`config/cfg.toml`.
 
-* `listen` — Listen for incoming connections and start the server on first join.
-* `stop` — Immediately send a `/stop` command via RCON to shut down an already-running server.
+For multiple RCON-enabled servers, give each `rcon` table its own `password_env`
+name and set each named environment variable before starting the daemon.
 
-### `listen` Options
+Stop the daemon with Ctrl+C. On Unix, SIGTERM is also supported.
 
-| Option          | Description                                                            | Required |
-| --------------- | ---------------------------------------------------------------------- | -------- |
-| `host`          | Host or IP to bind (e.g. `0.0.0.0`)                                    | Yes      |
-| `port`          | Port to listen on for Minecraft clients                                | Yes      |
-| `cmd`           | Command or script to launch the Minecraft server                       | Yes      |
-| `args...`       | Arguments passed to the server command                                 | No       |
-| `--server-port` | Port of the actual Minecraft Server that users will get forwarded to   | Yes      |
-| `--rcon-port`   | Port for the server’s RCON interface                                   | Yes      |
-| `--rcon-pass`   | Password for RCON authentication                                       | Yes      |
+## How it behaves
 
-> [!IMPORTANT]
-> When not using a script and instead executing a command with its own arguments, you need to append the command to the end of the line followed by `--` and all the arguments of the command. See below for an example!
+- Server-list status requests show the configured sleeping MOTD and do not wake
+  the backend.
+- A Login or supported Transfer connection wakes a stopped backend. That
+  connection and any further attempts receive the configured startup message;
+  the player reconnects after the server is ready.
+- MCServerNap only stops server processes that it started. An already-running
+  backend can be proxied, but remains under the operator's control.
+- Startup failures are isolated to the affected server. A later player attempt
+  can retry after its cooldown.
 
-> [!NOTE]
-> The port of the Minecraft server does not require port forwarding, only the port of this application.
+With RCON configured, MCServerNap uses it to confirm readiness, check the player
+count, and send the graceful `stop` command. It only stops after both RCON and
+proxy activity indicate that the server is idle.
 
-#### Example
+Without RCON, readiness means that the backend accepted a TCP connection, idle
+tracking relies on connections through the proxy, and graceful shutdown sends
+`stop` to the owned process's standard input. All player traffic must therefore
+go through the public listener. The launch command must stay attached to Java
+and preserve standard input for the server's full lifetime.
 
-```bash
-mcservernap listen 0.0.0.0 25565 --server-port 25566 --rcon-port 25575 --rcon-pass rconpasswordmeow java -- -Xmx5G -Xms5G -jar server.jar nogui
+## Configuration notes
+
+Start from the example file and leave `schema_version = 3` unchanged. For
+another server, copy the complete `[servers.<id>]` section and use a different
+listener port, backend port, and working directory. Relative paths start from
+the directory containing the configuration file.
+
+## Direct RCON stop
+
+MCServerNap also includes a small standalone RCON stop command:
+
+```console
+target/release/mcservernap stop --rcon-port 25575
 ```
 
-#### Script Example
+It uses `127.0.0.1` by default and reads the password from
+`MCSERVERNAP_RCON_PASSWORD`, or from `--rcon-pass`. This command talks directly
+to RCON and does not use the daemon configuration or its per-server
+`password_env` names.
 
-```bash
-mcservernap listen 0.0.0.0 25565 "C:\path\to\your\script\start_server.bat" --server-port 25566 --rcon-port 25575 --rcon-pass rconpasswordmeow
-```
-**IMPORTANT: When using a script, make sure the script closes its window at the end of the script (Windows .bat example: `exit`), or else this application won't detect that the Minecraft server process has shut down!**
+## Troubleshooting
 
-Once a client sends a LoginStart packet, the tool:
+Logging defaults to `info`. Set `RUST_LOG=debug` for connection, startup, and
+reconciliation details. Logs produced by MCServerNap include the server ID;
+Minecraft's own output is inherited unchanged.
 
-1. Drops the listener and launches your server command.
-2. Starts an **idle watchdog** task that polls RCON according to `rcon_poll_interval`.
-3. If no players remain for the defined amount of `rcon_idle_timeout` time, sends `/stop` and exits.
-
-### `stop` Options
-
-| Option        | Description                          | Required |
-| ------------- | ------------------------------------ | -------- |
-| `--rcon-port` | Port for the server’s RCON interface | Yes      |
-| `--rcon-pass` | Password for RCON authentication     | Yes      |
-
-#### Example
-
-```bash
-mcservernap stop --rcon-port 25575 --rcon-pass rconpasswordmeow
-```
-
-This immediately connects via RCON and sends the `/stop` command.
-
-## Configuration & Environment
-
-### **Logging**: Controlled via entry point of `main()`:
-
-```rust
-env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info) // Change this LevelFilter to change logging level (e.g. Debug)
-        .init();
-```
-You need to rebuild the project for the change to take effect.
-
-### The **configuration** will be generated on first time usage of this application under `config/cfg.toml`
-Configuration Options:
-* **Timeouts & Intervals**: set via `rcon_idle_timeout` and `rcon_poll_interval` in <ins>seconds</ins>
-* **Message of the day (MOTD)**: The message shown to the user in the server browser menu. set via `motd_text`, `motd_color` and `motd_bold`
-* **Connection Message**: The message shown to the user when they try to connect. Set via `connection_msg_text`, `connection_msg_color` and `connection_msg_bold`
-* **Server Icon**: The icon of the server within the server browser menu. Set by inserting a `.png` file in the `config/` folder with the name `server-icon.png`. The image must be 64x64 pixels big. If it's not, this application will automatically resize the image to meet this requirement
-* **Configuration Directory**: The location of the `cfg.toml` can be changed from the standard `config/` directory by editing the value of `config_directory_name`. This will delete the previous directory and move the files to the new one
-
-## Contributing
-
-Contributions are welcome! Feel free to open issues or pull requests to:
-
-* Support TLS or SSH tunnels for RCON
+If startup fails, first check the paths relative to the configuration file, the
+backend and listener ports, and any configured RCON password environment
+variable.
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+MIT. See [LICENSE](LICENSE).

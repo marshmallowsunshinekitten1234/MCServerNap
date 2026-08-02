@@ -1,0 +1,44 @@
+schema_version = 3
+max_connections = 512
+
+[servers.survival]
+minecraft_version = "26.2"
+icon_path = "assets/survival-icon.png"
+
+[servers.survival.listener]
+address = "0.0.0.0"
+port = 25565
+
+[servers.survival.backend]
+host = "127.0.0.1"
+port = 25566
+
+[servers.survival.command]
+program = "java"
+arguments = ["-Xms2G", "-Xmx5G", "-jar", "server.jar", "nogui"]
+working_directory = "../servers/survival"
+
+[servers.survival.timeouts]
+poll_interval_seconds = 60
+idle_timeout_seconds = 600
+startup_timeout_seconds = 600
+retry_interval_seconds = 2
+command_timeout_seconds = 10
+shutdown_timeout_seconds = 30
+handshake_timeout_seconds = 5
+proxy_connect_timeout_seconds = 10
+
+[servers.survival.motd]
+text = "Napping... Join to start survival"
+color = "aqua"
+bold = true
+
+[servers.survival.startup_message]
+text = "Survival is starting. Please reconnect shortly."
+color = "light_purple"
+bold = true
+
+[servers.survival.rcon]
+host = "127.0.0.1"
+port = 25575
+password_env = "MCSERVERNAP_SURVIVAL_RCON_PASSWORD"
